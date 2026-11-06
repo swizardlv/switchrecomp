@@ -1,0 +1,135 @@
+SwitchRecomp v190 test - MZ Labs
+
+This is v190 with a second renderer to try out. Everything else is the same as v190.
+
+VULKAN RENDERER (TEST)
+F1 has a new Renderer row: OpenGL or Vulkan. Changing it saves renderer= in the game's .ini and
+restarts the game with the new renderer, because textures, shaders and render targets can't move
+from one renderer to the other while the game runs. renderer=vulkan_native or renderer=opengl can
+also be set in the .ini by hand.
+The Vulkan renderer is the one Metroid Dread Recomp uses: ScarletNX's GPU front end and Vulkan
+renderer (GPL-3.0, source in runtime/snxvk/src), with its shaders translated to SPIR-V. Its GPU
+engines, macro interpreter and ASTC decoder are ported from Eden and yuzu (credits in runtime/snxvk/README.txt).
+Windows only. It needs a Vulkan 1.3 driver; without one the game starts on OpenGL and says so in the log.
+The window title ends in "| Vulkan" when it's on, and the log says "renderer: Vulkan".
+Not with Vulkan yet: F7 recording, F8 captures, the F5 GPU trace, LSFG, fps_limit=30 frame skipping.
+F3 screenshots work.
+Its pipeline cache goes in the vulkan_native folder next to the game.
+Vulkan now shows only the part of the frame the game asks for (vi crop and flip). Tomodachi Life draws
+1280x720 into a 1920x1080 buffer, and Vulkan showed the whole buffer, so the picture didn't fill the screen.
+When something ends the process with ExitProcess outside the game's own exit (a driver, a library), the log
+now says so. A crash with no last line at all is a hard kill or a fast fail: the Windows event log has its code.
+Every runtime thread now reserves at least 8 MB of stack (only the used part takes memory). The Vulkan renderer's
+pipeline threads asked for 1 MB, and the video driver compiles shaders on them. This is the suspected cause of
+Tomodachi Life closing on Intel HD at its first 3D draw. A stack overflow now also gets its line in the log.
+vk_trace=1 in the .ini writes vk_trace.txt next to the game: every shader translation, shader module, pipeline,
+draw, clear and queue submit of the Vulkan renderer, before and after it runs. When the game closes with nothing in
+the log, the last lines of that file show the step it died in. It slows the game down; leave it at 0 normally.
+vk_record_thread=0 records the Vulkan commands on the GPU thread instead of a thread of their own (for tests).
+vk_trace also logs each swapchain acquire and present. vk_gpu_sync=1 waits after each queue submit until the GPU
+has run it (5 s at most) and writes whether it finished, so the trace tells a crash on the CPU side from one while
+the GPU runs the work. Slow; for tests only.
+vk_trace.txt is now a 32 MB ring in a memory-mapped file: it keeps the last steps even when Windows kills the
+process outright, and it also logs every GPU method, every pushbuffer entry and every command the recording thread
+records, at a much lower cost than writing lines to a file.
+Vulkan viewports are checked before a draw: one that isn't finite skips the draw (a NaN height got through
+before), and one outside the GPU's maxViewportDimensions or viewportBoundsRange is moved into them. Vulkan leaves
+an out-of-range viewport undefined, and the Intel driver may crash on one. vk_trace also logs each draw's viewport.
+
+SwitchRecomp v190 - MZ Labs
+
+INSTALL
+Unzip over the SwitchRecomp folder, open SwitchRecomp.exe and hit Update all games.
+GCC is still a separate download. TCC and Python come in the package.
+
+INTERFACE
+The alternate console theme is gone.
+Settings has background music now: pick a WAV, OGG or MP3 file, turn it on or off and set the volume.
+The music is decoded on the PC and loops. No music files come with the package.
+tool/build_tool.bat and build_tool.sh rebuild SwitchRecomp.exe with GCC.
+
+AUDIO
+Games have sound now. audren mixes PCM and DSP-ADPCM voices, audout streams PCM16 (Celeste, Brawlhalla),
+5.1 gets mixed down to stereo, and the output goes through waveOut on Windows and SDL2 on Linux.
+F7 records the sound to a .wav next to the .mp4, on the same clock as the video.
+Some effects, biquad filters and surround virtualization aren't done yet.
+
+GRAPHICS
+1 pixel high/wide render targets stay at native size (the Odyssey table artifacts), scale is per render target.
+Clear rect, scissor and viewport clip flags are separate like on hardware.
+Render enable modes and render override, conditional clears included.
+
+CRASHES
+Xenoblade titles get extra game memory automatically. Game memory can also be set in each game's options.
+
+LATER V190 BUILDS
+Intel on Windows: shaders compile in a second copy of the runtime (a helper process). When the Intel driver crashes
+on one of Odyssey's vertex shaders only the helper closes, a new one starts and tries a simpler version of that
+shader (no precise/invariant). The game keeps running instead of freezing and closing with "The video driver crashed".
+shader_process=1 in the game's ini turns it on for other GPUs, shader_process=0 turns it off.
+Odyssey: the bloom levels are read from their own render targets also when those are wider than the level (they're
+rounded up to 16 pixels). That path used to copy the levels, which came out as garbage on some GPUs: blue screen on
+some, a black screen with only the HUD on others.
+shadows=0 clears the skipped shadow maps to the right "far" value for games with reversed depth (Sonic Frontiers was
+almost black with shadows=0).
+F5 traces: the first line says the GPU, driver and render scale, and the values of small textures (exposure, LUTs)
+are read correctly now (they all read 0 before).
+Linux: SwitchRecomp-v190-x86_64.AppImage. It unpacks itself into ~/.local/share/SwitchRecomp the first time.
+Intel on Windows: Tomodachi Life froze a few seconds after it started using compute shaders. The GL thread checked
+the compute fences without the driver lock while the compile thread was inside the driver. It takes the lock now,
+and a compute result that never comes back can't hold the game's fences for more than 4 s.
+When the image stops for 15 s the log also says what the GPU thread, the GL thread and the compile thread are doing.
+Install.bat (Windows) and Install.sh (Linux) download what's missing into the SwitchRecomp folder, with internet and
+nothing else to do (no admin rights, no password): on Windows Python 3.14 (from NuGet) and GCC (from conda-forge),
+on Linux SDL2 (from PyPI) and GCC. Every download is checked against its SHA-256. The packages stay small (Python
+isn't in the Windows zip anymore). The tool runs them by itself too: Windows opens Install.bat when Python is
+missing, Linux gets SDL2 the first time it opens and GCC on the first recompile.
+Intel on Windows: the shader helper process is off until the video driver crashes on a shader in that game (then
+it's on from the next run). With it always on, Tomodachi Life froze on a loading screen on Intel HD. shader_process=1
+in the ini still forces it on.
+When the image stops, the log dumps the thread state after 6 s instead of 15, and threads.txt also says what the GPU
+thread, the GL thread and the compile thread are doing.
+F1 (Windows): the controls page looks like the recompiler's settings now. Up/Down pick an option, Left/Right or
+Enter change it, a click changes it too, Esc or F1 goes back to the game.
+Sonic Frontiers: the lighting was black (only the HUD and a few emissive bits showed). The game copies its depth
+buffer with the 2D engine right after the gbuffer, and every lighting pass reads that copy. The copy came from
+memory, where the depth buffer never was, so the whole screen read as "far". The 2D engine copies depth buffers on
+the GPU now, as a depth texture with the same format.
+Code cleanup: removed functions and variables nothing used anymore (an old ASTC whole-image decoder, a draw capture
+nothing turned on, an unused audio submit, a GL queue flush and a few leftovers). The audio tests build again.
+performance.txt: every compute shader gets its own line in "GPU time of one frame" (key, workgroups, MB of buffers),
+it used to count for the pass after it.
+Images written by compute or fragment shaders go to the mip level their TIC asks for (res_min_mip_level). Sonic
+Frontiers builds its depth pyramid that way for the light culling, every level used to land in mip 0. F5 traces list
+the images each compute writes. SWR_NO_IMG_LEVEL=1 goes back to mip 0.
+
+LICENSE AND STARTUP SCREEN
+SwitchRecomp is now under the GNU AGPL v3 (LICENSE.txt) with additional terms in NOTICE.txt.
+The recompiler shows the SwitchRECOMP startup screen for 2 seconds and every recompiled game for 1 second (it
+vanishes at the end): white logo on black with the copyright notice in the corner. Under NOTICE.txt, copies and
+forks have to keep it.
+The Launcher is gone, the recompiler already does everything it did.
+Android (APK builds, touch controls, the GLES renderer) is gone from the code.
+
+- SubmitGpfifo with a wait fence no longer blocks the game thread: the GPU thread waits for the fence. Fixes apps that signal the fence from the CPU after submitting (official GBA emulator: 2 s per frame, black screen).
+- Color masks start enabled on a new GPU channel (GBA classics loading UI was invisible).
+- Indexed constant buffer uploads zero-fill the unused tail and track the valid size.
+- Compute image writes now hit the right mip on cubemaps and arrays too, not only 2D. Sonic Frontiers builds its light probe mips that way; they stayed black and the deferred lighting went black on every rough surface.
+- GPU watchdog: every pass gets a fence that the GL thread checks only when the image stops. The stall dump (log and threads.txt) now names the first pass the GPU never finished, with its render target and shaders.
+- performance.txt: the GPU timing of a frame is read only once the GPU is done with it. The GPU thread used to sit in that wait when the GPU was stuck.
+- loop_limit= in the game ini sets how many steps a shader with jumps runs before it gives up (default 16384).
+- F5 traces list the mean and max of every mip of the cubemaps and arrays a frame uses, and min/mean/max per layer of shadow arrays. SWR_IMG_LEVEL_2D_ONLY=1 limits compute image mips to 2D textures.
+- DEVELOPER_GUIDE.md: building, the code layout, reading logs and F5 traces, replaying a draw offline (tool/dev/replay.c), open bugs.
+- Cube map arrays assembled from render targets get their missing mips generated too, like cubemaps and 2D arrays already did. Sonic Frontiers' sky cubemap is a cube array and its lighting reads the upper mips. SWR_NO_CUBE_MIPGEN=1 turns the generation off.
+- Geometry shaders are translated and drawn (with separable programs): input/output primitives, per-vertex inputs, viewport and depth on every emitted vertex. They used to be skipped and the draw went through with VS+FS only.
+- ETC2 and EAC textures are uploaded as compressed 4x4 blocks (formats 0x06, 0x0A, 0x0B, 0x19, 0x1A). 0x19 was read as a depth format before.
+- Guest memory lookups (is a range free, find a free range) use the sorted block list in one pass. Games with large, fragmented address spaces spent a long time there.
+- A render target the GPU wrote isn't dropped anymore when guest memory doesn't match it, until it's flushed (SMO's background RT). SWR_NO_RT_TRUST=1 turns that off.
+- Render targets copied to memory before a DMA/2D copy are read back synchronously, so an old image can't land after the copy (SMO's corner video). SWR_ASYNC_RT_FLUSH=1 goes back to async.
+- Linux runtime builds use -std=gnu17 (GCC 15+ defaults to C23, which made the glibc compatibility wrappers recurse while reading the ini). A single libopenh264.a is accepted for H.264 too.
+- Shader decoding looks up each instruction in a 64K table built once (the patterns only use the top 16 bits) instead of scanning every pattern.
+- Shaders that use more constant buffers than the GPU's per-stage uniform block limit get the extra ones as read-only storage blocks (Xenoblade Chronicles DE on NVIDIA: "no buffers available for bindable uniform cb15").
+- Texture formats G24R8 (0x0E) and RGBX16SN (0x73, X reads as 1).
+- fps_limit=30 shows every other image while the game keeps running 60 steps a second.
+- Linux: copying a game's RomFS uses rsync when it's installed (only new or changed files), the Python copy otherwise.
+- VP9 WebM movies: the runtime indexes the .webm files the game reads and decodes the NVDEC VP9 jobs with libvpx (code adapted from Metroid Dread Recomp, AGPL-3.0; libvpx headers and license in runtime/vp9). libvpx 1.14.0 (VP9 decoder only, built from source with Ubuntu's security patches) is linked into the Linux and Windows runtimes.

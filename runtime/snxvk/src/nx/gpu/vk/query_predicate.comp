@@ -1,0 +1,43 @@
+#version 450
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright 2026 the ScarletNX contributors */
+/* The render enable's comparison of a samples-passed count with zero, made on the GPU (vk/query.c): an invocation per
+   group of reports of one counter's epoch, in their order. Each report's predicate is 1 when any segment up to its end
+   counted a sample, 0 when none did: the group's running result over the segments each report adds, from the predicate
+   of an earlier batch the group goes on from. A draw predicated on it (VK_EXT_conditional_rendering) runs when the
+   count isn't zero, or, inverted, when it is. The counts are 64 bits, read as two words, so a count of exactly 2^32
+   samples isn't taken for zero. CMake compiles it into SPIR-V at build time (cmake/glsl.cmake). */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+/* each segment's count, at its slot of the query ring (query.c's g_qbuf) */
+layout(std430, set = 0, binding = 0) readonly buffer Counts {
+    uvec2 counts[];
+};
+/* the groups: jobs[i] is where group i starts, a group being the predicate it goes on from (~0 for none) and its
+   number of reports, then each report's predicate slot, its number of segments and their slots */
+layout(std430, set = 0, binding = 1) readonly buffer Jobs {
+    uint jobs[];
+};
+layout(std430, set = 0, binding = 2) buffer Predicates {
+    uint predicates[];
+};
+layout(push_constant) uniform Params {
+    uint ngroups;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= ngroups) return;
+    uint at = jobs[i], from = jobs[at], reports = jobs[at + 1u];
+    uint passed = from != 0xFFFFFFFFu ? predicates[from] : 0u;
+    at += 2u;
+    for (uint r = 0u; r < reports; r++) {
+        uint slot = jobs[at], n = jobs[at + 1u];
+        for (uint k = 0u; k < n; k++) {
+            uvec2 c = counts[jobs[at + 2u + k]];
+            passed |= c.x | c.y;
+        }
+        predicates[slot] = passed != 0u ? 1u : 0u;
+        at += 2u + n;
+    }
+}

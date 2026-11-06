@@ -1,0 +1,32 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright 2026 the ScarletNX contributors
+   Ported from Eden (src/video_core/host1x/vic.cpp):
+   SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+   SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project */
+/* The VIC composition as a compute shader (gpu/vk/vic.c runs it, gpu/video/vic.c's compose_cpu is the reference).
+   This file only declares what the body, vic_compose.glsl, reads and writes; the tests run the body on the CPU
+   (tests/glsl/vic_glsl.cpp). CMake compiles it twice at build time (cmake/glsl.cmake): as it is, for planes whose
+   rows are word aligned, and with -DVIC_UNALIGNED for the rest. */
+
+#include "vic_params.glsl"
+
+layout(local_size_x = VIC_GROUP_W, local_size_y = VIC_GROUP_H, local_size_z = 1) in;
+
+/* a uniform buffer, not a storage one: every invocation reads the same few words, which drivers then serve from
+   constant caches or scalar registers */
+layout(std140, binding = 0) uniform Params {
+    VicGpuJob job;
+    VicGpuSlot slots[8];
+};
+/* the slots' planes, byte for byte as guest memory holds them (VicGpuPlane.base is a plane's offset) */
+layout(std430, binding = 1) readonly restrict buffer Inputs {
+    uint inputs[];
+};
+/* the output planes, the same way */
+layout(std430, binding = 2) restrict buffer Outputs {
+    uint outputs[];
+};
+
+#include "vic_compose.glsl"

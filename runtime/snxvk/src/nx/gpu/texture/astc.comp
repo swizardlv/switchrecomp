@@ -1,0 +1,51 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright 2026 the ScarletNX contributors
+   Ported from Eden (src/video_core/host_shaders/astc_decoder.comp):
+   SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+   SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project */
+/* ASTC decoding as a compute shader, a workgroup per tile of 64 blocks. Eden's decoder reads the blocks in
+   block-linear order and stores floats into an image; here texture.c has already deswizzled them into rows of
+   blocks, and the texels go out as packed RGBA8 words (R in the low byte) in rows of width words, which
+   vk/astc.c copies into a UNORM or SRGB image. The byte conversions are integer arithmetic so that the CPU
+   reference (astc.c) produces the same bytes.
+
+   A dispatch decodes a strip: height rows of texels of one slice, or (z > 1) whole slices one after another,
+   each in the input and the output. The decoder itself is astc_decode.glsl, which the tests also run on the CPU
+   (tests/glsl/glsl.hpp); this file only declares what it reads and writes. CMake compiles it into SPIR-V at build
+   time (cmake/glsl.cmake). */
+
+/* 64: a tile of 64 blocks, decoded one an invocation, then written a texel an invocation (astc_decode.glsl) */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+/* the footprint, a constant of each pipeline (vk/astc.c makes one per footprint): the driver folds what depends on
+   it (the infill steps, the texel loops' bounds) however little it optimizes otherwise */
+layout(constant_id = 0) const uint BLOCK_W = 4u;
+layout(constant_id = 1) const uint BLOCK_H = 4u;
+const uvec2 block_dims = uvec2(BLOCK_W, BLOCK_H);
+
+layout(push_constant) uniform PushConstants {
+    uint width;    /* texels in a row of the output */
+    uint height;   /* rows of texels in each slice of this strip */
+    uint blocks_x; /* blocks in a row */
+    uint blocks_y; /* block rows in each slice of this strip */
+    uint srgb;     /* nonzero: the specification's sRGB decode mode for void extents' R, G and B, for SRGB images */
+    uint tile_shift; /* a workgroup's tile is 1 << tile_shift blocks wide and 64 >> tile_shift high */
+};
+
+layout(binding = 0, std430) readonly restrict buffer InputBlocks {
+    uvec4 astc_data[];
+};
+
+layout(binding = 1, std430) writeonly restrict buffer OutputTexels {
+    uint texels[];
+};
+
+/* the tile's 64 decoded blocks, 39 words each (astc_decode.glsl's F_ fields), 9984 bytes: field f of all 64 slots
+   side by side, so the first phase's invocations each keep to their own bank. Shared memory also holds what a
+   block's decoding reads at computed indices, which as a private array would go to scratch memory on many GPUs */
+shared uint astc_tile[39 * 64];
+#define TILE(field, slot) astc_tile[(field) * 64u + (slot)]
+
+#include "astc_decode.glsl"

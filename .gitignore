@@ -1,0 +1,28 @@
+# build output
+bin/
+*.o
+*.a
+*.exe
+*.dll
+*.so
+*.bin
+SwitchRecomp.exe
+anygame.exe
+runtime/snxvk/obj_*/
+runtime/snxvk/deps/
+
+# downloaded by Install.bat / Install.sh / tool/get_deps.py
+python/
+gcc/
+tcc/
+tool/deps/
+
+# games and their output
+games/
+captures/
+*.log
+*.ini
+
+# python
+__pycache__/
+*.pyc

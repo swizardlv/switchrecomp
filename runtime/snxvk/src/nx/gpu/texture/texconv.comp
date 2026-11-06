@@ -1,0 +1,42 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright 2026 the ScarletNX contributors */
+/* Texture formats the host can't take as they are, converted on the GPU (vk/texconv.c runs it): 2 byte RGBA texels,
+   RGB32F, packed depth and stencil, and ETC2 and EAC blocks. The body is texconv.glsl, which the tests also run on
+   the CPU; this file declares what it reads and writes.
+
+   One shader for every conversion, the mode a push constant: a dispatch converts one level of one format, so the
+   branches on it never diverge, and one pipeline is compiled instead of fifteen (on lavapipe each is an LLVM
+   compile) for code that is mostly the same loads and stores. */
+
+#include "texconv_modes.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+/* vk/texconv.c's TcParams, member for member. Pitches, biases and offsets are in 32 bit words */
+layout(push_constant) uniform Params {
+    uint mode;      /* TC_* */
+    uint units;     /* invocations a row: texel pairs, texels, groups of four texels, or blocks */
+    uint rows;      /* rows of units in a slice (rows of texels, or of blocks) */
+    uint in_pitch;  /* from a row of units of the input to the next */
+    uint out_pitch; /* from a row of output texels to the next */
+    uint st_pitch;  /* from a row of stencil bytes to the next */
+    uint in_bias;   /* the input's first row in the bound range */
+    uint out_bias;  /* the output's first row */
+    uint st_bias;   /* the stencil output's first row */
+    uint zfloat;    /* nonzero: 24 bit depth goes out as a float (D32_SFLOAT_S8_UINT) */
+    uint remap;     /* TC_DMA_REMAP: the components and their sources (texconv_modes.glsl) */
+    uint const_a, const_b;
+    uint line_out;  /* TC_DMA_REMAP: a line's bytes out (its last word's bytes past it are left) */
+};
+
+layout(std430, binding = 0) readonly restrict buffer Src {
+    uint src[];
+};
+/* read too: the DMA remap keeps the destination's own bytes where it says to */
+layout(std430, binding = 1) restrict buffer Dst {
+    uint dst[];
+};
+
+#include "texconv.glsl"

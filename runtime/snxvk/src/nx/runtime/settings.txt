@@ -1,0 +1,779 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 the ScarletNX contributors
+#
+# Every setting of ScarletNX: the game's .ini (the runtime's), the launcher's own and the recompiler's. tools/settingsgen
+# reads this file and generates settings.h, the struct Settings that holds every value (g_settings, its members the
+# settings' names in snake_case), and the tables (nx/runtime/ini.h's IniOpt) that read and write them. The format,
+# a line at a time (leading spaces left out, # starts a comment):
+#
+#   include FILE          a header the generated tables include, for a constant they name (a range's)
+#   list NAME id=Label... the instances of an each block: their id in its key, and the label it is shown by (an _ in
+#                         a label is a space)
+#   table NAME [SCOPE]    the settings below go in the IniOpt table NAME. SCOPE is runtime (the game's, the default),
+#                         launcher (the launcher handles them itself), recompile (the recompiler's, which the launcher
+#                         and the driver pass on as --key=value) or llvm (recompile, filled with LLVM's passes and the
+#                         options its C API sets, after what the table declares)
+#   repeat N ... end      the settings between, once for each of N (1 to N in a key's <N>), interleaved: each setting's
+#                         member is an array of N
+#   setting NAME          a setting, named as the menus show it; its member is NAME in snake_case and must be unique.
+#                         In an llvm table, setting @ID gives LLVM's pass (instcombine) or option (LoopVectorization) of
+#                         that ID its name, key and help (name NAME, key KEY, help TEXT, label TEXT under it). An ID
+#                         LLVM doesn't have is left out, and said. LLVM's own fill the rest: a pass is "LLVM pass <its
+#                         name>", key llvm_pass_<name>, int 0 1 default 1; an option "LLVM <its words>", key
+#                         llvm_<option> (the ID in snake_case: key KEY where that reads wrong, FastISel's
+#                         llvm_fast_i_sel), LLVM's own value (SETTINGS_UNSET) until it is set
+#     key KEY             its key in the .ini (<N> in a repeat, <ID> in an each). An LLVM setting's is LLVM's ID's
+#     int LO HI           an int, clamped to LO..HI (C expressions)
+#     float LO HI         a float, clamped
+#     text SIZE           text, up to SIZE - 1 bytes
+#     default VALUE       its value until one is read, as the .ini writes it ("" or none for empty text)
+#     default-if MACRO V  its default where MACRO is defined (#ifdef)
+#     once                written to the .ini only once it is set (the default stays its value until then)
+#     words W|W...        the menus' words (ini.h): an int's for LO, LO + step..., a text's value=word
+#     step N, shift N     the menus' step and shift (ini.h)
+#     label TEXT          the menus' name when it is not NAME (the game's menu shows a page's settings by it)
+#     startup             read when the game starts only
+#     in-game             the game's own (its menu's, or the driver's): the launcher's Settings leave it out
+#     set FUNCTION        called after each read (ini.h's set), declared by settings.h
+#     each LIST           one setting for each instance of LIST, in its order: the member an array
+#     help TEXT           its help, a line each
+#   section NAME: TABLE[/PAGE], ...   [backend] [launcher]
+#                         an .ini section (a launcher one: its Settings' group) and its tables, a page's after /.
+#                         backend: applied under the controls' lock (backend_ini), not by options.c
+#
+# The members' C types: int for int, float for float, char[SIZE] for text; an array for repeat and each.
+
+include "common/utilities/users.h"
+include <limits.h>
+
+list controls l=L r=R zl=ZL zr=ZR minus=- plus=+ capture=Capture home=Home l3=L3 r3=R3 dpad=D-pad stick_l=Left_stick stick_r=Right_stick a=A b=B x=X y=Y
+
+# ---- the game's .ini ----
+
+table g_game_ini
+setting Game dump
+    key source
+    text 2048
+    once
+    startup
+    in-game
+    help The dump the game was made from, which the recompile writes here. Without Extract game container the game
+    help reads its ExeFS and RomFS from it, and Extract to tmpfs extracts it again when tmpfs was emptied. Empty or
+    help left out: the link <name>.source in the game's folder, which older versions made
+setting Game addons
+    key addons
+    text 2048
+    once
+    startup
+    in-game
+    help The game's updates and DLCs played with it, made beside it in its folder: their title IDs, a comma between
+    help two. The launcher's list of them writes it. An update runs from its own program, which plays with this
+    help list's DLCs; the game's own program leaves an update listed out
+setting Game mods off
+    key mods_off
+    text 2048
+    once
+    startup
+    in-game
+    help The game's mods left out of play, folders of mods/ in its data folder: their names, a / between two. Every
+    help other mod there is played, its exefs/ and romfs/ laid over the game's as an update's are, in their names'
+    help order. The launcher's list of updates, DLCs and mods writes it. A mod's exefs/ is recompiled into the game
+
+table g_display_ini
+setting TV mode
+    key docked
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = TV mode (the console in its dock), 0 = handheld mode (1280x720)
+setting Fullscreen
+    key fullscreen
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = starts fullscreen, except in timed test runs. -f or --fullscreen=0 sets it for one run, and F11 or
+    help Alt+Enter switches while the game runs without changing it
+setting Language
+    key language
+    int 0 17
+    default 1
+    startup
+    set options_language_set
+    words Japanese|English (US)|French|German|Italian|Spanish|Chinese|Korean|Dutch|Portuguese|Russian|Taiwanese|English (UK)|French (Canada)|Spanish (Latin America)|Chinese (simplified)|Chinese (traditional)|Portuguese (Brazil)
+    help The game's language: 0 Japanese, 1 English (US), 2 French, 3 German, 4 Italian, 5 Spanish, 6 Chinese, 7 Korean,
+    help 8 Dutch, 9 Portuguese, 10 Russian, 11 Taiwanese, 12 English (UK), 13 French (Canada), 14 Spanish (Latin
+    help America), 15 Chinese (simplified), 16 Chinese (traditional), 17 Portuguese (Brazil)
+setting Showcase
+    key showcase
+    int 0 1
+    default 0
+    words Off|On
+    help 1 = player 1's buttons and sticks, as the game gets them, and the frames a second, drawn in a corner of the
+    help window for a video. F6 turns it on and off
+setting Showcase corner
+    key showcase_corner
+    text 3
+    default br
+    set vpad_showcase_corner_set
+    words tl=Top left|tr=Top right|bl=Bottom left|br=Bottom right
+    help The corner showcase draws in: tl top left, tr top right, bl bottom left, br bottom right
+
+table g_graphics_ini
+setting Resolution scale
+    key resolution
+    float 0.25 4
+    default 1
+    startup
+    help The scale of the game's 3D rendering, 0.25 to 4: 1 = the console's, 2 = double, 0.5 = half
+setting Shadows
+    key shadows
+    int 0 1
+    default 1
+    words Off|On
+    help 0 = skips shadow maps
+setting Vsync
+    key vsync
+    label VSync
+    int 0 1
+    default 1
+    words Off|On
+    help 1 = images wait for the display's refresh, so nothing tears; 0 = the newest is shown at the next refresh
+    help the display allows, else at once
+setting Anisotropic filtering
+    key anisotropy
+    int 0 16
+    default 0
+    startup
+    words Game's|#x
+    help 0 = textures filtered as the game asks, 2 to 16 = sharper surfaces seen at an angle
+setting Vulkan Video decode
+    key vulkan_video
+    label Vulkan Video decode (experimental)
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = H.264 movies decode on the GPU with Vulkan Video (FFmpeg's Vulkan decoder), where the GPU and its driver
+    help have an H.264 decode queue. Experimental and untested. 0 = FFmpeg decodes them on the CPU. VP9 movies always
+    help decode on the CPU
+
+table g_performance_ini
+setting FPS limit
+    key fps_limit
+    text 16
+    default game
+    set options_fps_set
+    help game = the pace the game asks for, as on the console (60 FPS, or 30 for a game made for 30); 0 = no limit;
+    help 10 to 1000 = that many frames a second. F4 turns the limit off and on
+setting Memory (GB)
+    key memory_gb
+    int 0 8
+    default 0
+    startup
+    help The memory the game sees: below 6 the console's 3.2 GB, 6 = 4.8 GB, 8 = 6.8 GB. A game that runs out on
+    help the console's amount needs 6
+setting Heap limit (MB)
+    key heap_max_mb
+    text 32
+    default 0
+    startup
+    set options_heap_max_set
+    help The most heap the game can allocate, in MB; 0 = as much as its memory allows
+setting Pipeline threads
+    key pipeline_threads
+    int 0 32
+    default 0
+    startup
+    words Auto|#
+    help The threads that make the GPU's new pipelines while the game goes on: 0 = a quarter of the computer's
+    help threads, two to six; 1 to 32 = that many. More make a first run's new pipelines sooner, with less CPU left
+    help for the game
+setting Prepare shaders
+    key prepare_shaders
+    int 0 2
+    default 2
+    startup
+    words Off|While playing|Before starting
+    help Prepares the game's shaders ahead of time so it stutters less, and again after ScarletNX, the GPU or its driver
+    help is updated. Off = shaders are made only when the game first draws with them. While playing = prepared in the
+    help background, used once all are ready. Before starting = a loading screen waits for them and for the shader cache
+    help of earlier sessions. Any key, button or tap starts the game at once and the rest is prepared while you play.
+    help Esc quits (on Android, back opens the menu)
+setting JIT threads
+    key jit_threads
+    int 0 8
+    default 0
+    startup
+    words Auto|#
+    help Threads compiling the code the recompiler missed: 0 = every CPU the game may use but two (at most 8).
+    help They yield to the game
+setting JIT optimization
+    key jit_opt
+    text 2
+    default 0
+    startup
+    words 0=O0|1=O1|2=O2|3=O3|s=Os|z=Oz
+    help LLVM's optimization of the code the runtime JIT compiles when the game reaches code the recompiler missed:
+    help 0 none, 3 the most, s or z the smallest. It applies to the next run, which compiles its JIT code again
+
+# the on-screen controls' (platform/vpad.c): their settings in the game's menu's order, then a control's place in the
+# order of SNX_VPAD_ (VPAD_CONTROLS, which the list controls follows)
+table g_vpad_ini
+setting Show controls
+    key controls
+    int 0 1
+    default 0
+    default-if __ANDROID__ 1
+    set vpad_on_set
+    words Off|On
+    help The on-screen controls: 1 = shown, 0 = hidden. The game's menu (Back, Home or F2) sets them
+setting Snap to grid
+    key controls_snap
+    int 0 1
+    default 0
+    words Off|On
+    help 1 = a control dragged in edit mode lands on a grid
+setting Controls scale
+    key controls_scale
+    int 0 100
+    default 50
+    label Scale
+    words #%
+    step 10
+    shift 50
+    help Their size: 0 to 100, for 50% to 150%
+setting Controls opacity
+    key controls_opacity
+    int 0 100
+    default 100
+    label Opacity
+    words #%
+    step 10
+    help Their opacity, in percent
+setting Relative stick center
+    key controls_rel_center
+    int 0 1
+    default 1
+    words Off|On
+    help 1 = a stick's middle is where its finger lands
+setting D-pad slide
+    key controls_dpad_slide
+    int 0 1
+    default 1
+    words Off|On
+    help 1 = a finger sliding on the D-pad changes its direction
+setting Haptics
+    key controls_haptics
+    int 0 1
+    default 1
+    words Off|On
+    help 1 = a short buzz on each press and release (Android)
+setting Control place
+    key controls_<ID>
+    each controls
+    text 32
+    once
+    in-game
+    set vpad_place_set
+    help A control's place, written once it is moved or reset: x y size. Its middle across the screen from 0 to 1,
+    help and its size in percent (50 to 200)
+
+table g_backend_ini
+setting Touch screen
+    key touch
+    int 0 2
+    default 2
+    set backend_touch_mode_set
+    words Off|Fingers|Mouse too
+    help The game's touch screen: 1 = fingers, 2 = fingers and the mouse's left button, 0 = off
+
+table g_vpad_shown_ini
+setting Control shown
+    key controls_<ID>_shown
+    each controls
+    int 0 1
+    default 1
+    once
+    words Hidden|Shown
+    help 1 = a control is drawn, 0 = hidden; written once it is shown or hidden
+
+# the controllers' (platform/backend/gamepad.c)
+table g_gamepad_ini
+setting Swap A/B
+    key gamepad_swap_ab
+    int 0 1
+    default 0
+    words Off|On
+    help 1 = a controller's A and B swapped: 0 = where the console's are (A right, B bottom)
+setting Stick dead zone
+    key gamepad_deadzone
+    int 0 90
+    default 20
+    words #%
+    step 5
+    help The sticks' dead zone, in percent of their travel
+setting Vibration
+    key gamepad_rumble
+    int 0 100
+    default 100
+    words Off|#%
+    step 10
+    help How strongly the controllers vibrate when the game asks, in percent: 0 = never
+setting Background input
+    key gamepad_background
+    int 0 1
+    default 0
+    set gamepad_background_set
+    words Off|On
+    help 1 = the controllers still play the game while its window is not focused
+setting Pair Joy-Cons
+    key gamepad_joycon_pair
+    int 0 1
+    default 1
+    set gamepad_joycon_pair_set
+    words Separate|Together
+    help 1 = a left and right Joy-Con play together; restart the game after changing this
+
+table g_gamepad_map_ini
+setting Button map
+    key gamepad_map
+    text 192
+    once
+    set gamepad_map_set
+    help A control by where it sits and the console's button it sends, as south:B east:A.
+    help Controls south east west north lb rb lt rt ls rs back start up down left right; buttons A B X Y L R ZL
+    help ZR L3 R3 Plus Minus Up Down Left Right None. One left out sends the button in its place
+
+table g_gamepad_players_ini
+repeat 8
+setting Player controller
+    key gamepad_p<N>_device
+    text 64
+    default ""
+    label Controller
+    help Player N's controller (N from 1 to 8): empty = the next to connect, else its SDL GUID, as the log
+    help names it, and /2 after it for the second of two alike
+setting Player connected
+    key gamepad_p<N>_connected
+    int 0 1
+    default 1
+    label Connected
+    words Off|On
+    help 1 = the game sees player N (player 1 it always does: the keyboard drives it)
+setting Player type
+    key gamepad_p<N>_type
+    int 0 4
+    default 0
+    label Type
+    words As it is|Pro Controller|Two Joy-Cons|Left Joy-Con|Right Joy-Con
+    help 0 = the controller as it is; 1 Pro Controller, 2 two Joy-Cons, 3 a left Joy-Con, 4 a right one
+setting Player swap A/B
+    key gamepad_p<N>_swap_ab
+    int -1 1
+    default -1
+    label Swap A/B
+    words As All|Off|On
+    help -1 = as gamepad_swap_ab says; 0 or 1: player N's own
+setting Player vibration
+    key gamepad_p<N>_rumble
+    int -10 100
+    default -10
+    label Vibration
+    words As All|Off|#%
+    step 10
+    help -10 = as gamepad_rumble says; 0 to 100: its own
+setting Player button map
+    key gamepad_p<N>_map
+    text 192
+    default ""
+    label Button map
+    set gamepad_player_map_set
+    help Player N's map, as gamepad_map; empty = gamepad_map's
+end
+
+table g_network_ini
+setting Network
+    key network
+    int 0 1
+    default 0
+    words Offline|Online
+    help 1 = the game uses the computer's connection (known console service domains stay blocked); 0 = offline,
+    help with loopback only (not a sandbox)
+setting Airplane mode
+    key airplane_mode
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = the console is in airplane mode: no network, whatever network says, and no local wireless (the game hears
+    help both are off)
+setting Local wireless
+    key ldn
+    text 8
+    default lan
+    startup
+    set options_ldn_set
+    words lan=LAN|room=Eden room|off=Off
+    help Local wireless: lan = over the LAN with ldn_mitm's protocol (another ScarletNX, Ryujinx, a console running
+    help ldn_mitm); room = through the Eden room that room names (Eden, another ScarletNX); off = the game hears it
+    help is off
+setting Eden room
+    key room
+    text 256
+    default ""
+    startup
+    set options_room_set
+    help The Eden room ldn=room joins: host or host:port (port 24872 without one). The nickname there is the user's,
+    help and a room's password is room_password in users/online.ini
+
+table g_user_ini
+setting User
+    key user
+    int 1 SNX_USERS_MAX
+    default 1
+    startup
+    help The console's user the game plays as: 1 to 8, as users/users.ini of the data folder lists them (1, "Player",
+    help without one). A number with no user stops the game
+
+table g_debug_ini
+setting Log level
+    key log
+    int 0 2
+    default 1
+    help The log's detail, 0 to 2: 2 logs everything, which slows the game down
+setting Answer unknown commands
+    key auto_stub_ipc
+    int 0 1
+    default 1
+    words Off|On
+    help 1 = a service command the runtime doesn't know answers success (logged as [undeclared]); 0 = it answers
+    help the console's UnknownCommandId, which shows the gap where the game makes the call
+setting Shader captures
+    key diag
+    int 0 1
+    default 0
+    words Off|On
+    help 1 = saves each new compute shader's data to captures/compute, and each new shader to captures/shaders
+    help (snx-shaderc's corpus)
+setting Vulkan validation layer
+    key vk_validation
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = the Vulkan validation layer (VK_LAYER_KHRONOS_validation, the Vulkan SDK's) checks every Vulkan call and
+    help logs what it finds. It slows the game down a lot, and a missing layer is only a warning
+setting GDB JIT symbols
+    key gdb_jit
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = with the GDB stub (-S or -s, Linux only), hands the code the JIT compiles at run time to GDB, which
+    help names it. While GDB is attached it stops the whole game to read each compile, which slows a 32-bit game (its
+    help blocks compile one at a time) to a crawl. Each compile's object is also kept in memory for the whole run
+setting Profiler
+    key profile
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = writes profile.txt every 10 seconds (the CPU profiler is Windows only)
+setting NVN trace
+    key nvn_trace
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = logs each NVN function the game resolves, the GPFIFO submissions during each queue call, and at exit
+    help the calls of every function used (gpu/nvn_trace.c). Calls by direct branch are counted only in a game
+    help recompiled with --hook-direct-calls. The game runs slower
+setting Shader corpus
+    key shader_corpus
+    text 1024
+    default ""
+    startup
+    help A folder that keeps each translated shader for snx-shaderc (gpu/shader/corpus.c). With it every shader is
+    help translated, and none is kept for the next run. Empty: none, or captures/shaders with Shader captures
+setting GPU trace target
+    key gpu_trace_target
+    text 64
+    default ""
+    startup
+    help address[:bytes]: logs the clears and draws that write a render target starting in that GPU address range
+    help (0x for hex, one byte without a size), to find what produced a wrong target. Empty: none
+setting GPU profile
+    key vk_gpu_profile
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = the GPU's time per rendering pass, summed per target and logged every 10 seconds (Vulkan timestamps)
+setting Buffer copy stats
+    key vk_buffer_stats
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = logs what the renderer copies between guest memory and its buffers, and why it waits for their results
+setting Vulkan recording thread
+    key vk_record
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = Vulkan commands are recorded on a thread of their own; 0 = on the GPU thread, as they are made
+setting Compute dispatches
+    key compute
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 0 = skips every compute shader dispatch, to see whether a bug is in one
+setting Vulkan allocation cap
+    key vk_max_allocation_mb
+    int 0 INT_MAX
+    default 0
+    startup
+    help The largest Vulkan allocation in MiB, below the device's own (larger images in pieces with sparse binding),
+    help to test the pieces on a driver that takes anything (lavapipe). 0 = the default
+setting Vulkan memory budget
+    key vk_budget_mb
+    int 0 INT_MAX
+    default 0
+    startup
+    help The caches keep within this many MiB of the GPU's heap, below the driver's budget, for testing. 0 = the
+    help driver's budget alone
+setting Native macros
+    key mme_hle
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = the GPU macros the runtime knows run natively (gpu/maxwell/mme_hle.c); 0 = every macro is interpreted
+setting Compiled macros
+    key mme_jit
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = GPU macros without a native version are compiled with LLVM; 0 = they are interpreted
+setting Verify macros
+    key mme_verify
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = runs each native and compiled macro against the interpreter too, and logs where they differ
+setting RenderDoc captures
+    key renderdoc
+    text 1024
+    default ""
+    startup
+    help The path's stem of RenderDoc captures (RenderDoc's library is loaded before the Vulkan instance), of the
+    help presents RenderDoc frames names. Empty: RenderDoc isn't loaded
+setting RenderDoc frames
+    key renderdoc_frames
+    text 512
+    default ""
+    startup
+    help The presents RenderDoc captures takes, a comma between: N is the Nth present, Ns the first after N seconds of
+    help the scripted input's clock. Empty: none
+
+# the unattended runs' (platform/unattended.c): read as the .ini's settings are, from the command line, but in no section,
+# so never written back
+table g_unattended_ini
+setting Seconds
+    key seconds
+    int 0 INT_MAX
+    default 0
+    once
+    help The run ends after this many seconds; 0 = it doesn't
+setting Frames
+    key frames
+    int -1 INT_MAX
+    default -1
+    once
+    help The run ends after this many presents; -1 = it doesn't
+setting Screenshot
+    key shot
+    text 1024
+    default ""
+    once
+    help Where the run's screenshots go: the path's stem
+setting Screenshot every
+    key shot_every
+    int 0 INT_MAX
+    default 0
+    once
+    help A screenshot every this many presents; 0 = at the end only
+setting Press length
+    key press_len
+    int 0 INT_MAX
+    default 300
+    once
+    help How long a scripted press is held, in ms
+setting Script
+    key script
+    text 4096
+    default ""
+    once
+    set unattended_script_set
+    help The scripted input: when:buttons, comma between, when in ms or a present's number and f (300f)
+setting Keyboard text
+    key swkbd_text
+    text 2004
+    default ""
+    once
+    help The text the software keyboard answers instead of asking (shorter than the game's minimum: cancelled)
+
+# ---- the 3DS driver's (scarletnx-3ds --key=value), in no section of the game's .ini ----
+
+table g_ctr_debug_ini
+setting CTR IPC trace
+    key ctr_ipc_trace
+    int 0 1
+    default 0
+    words Off|On
+    help 1 = logs each service request the 3DS game sends, its service and header, in the order sent
+setting CTR SVC trace
+    key ctr_svc_trace
+    int 0 2
+    default 0
+    words Off|Failures|All
+    help 1 = logs each SVC the 3DS game makes that answers a failure (r0 with its top bit set), 2 = every SVC, with
+    help the thread, its pc and r0 to r3 before and after
+setting CTR GPU trace
+    key ctr_gpu_trace
+    int 0 1
+    default 0
+    words Off|On
+    help 1 = logs each GX command the 3DS game queues, and each framebuffer swap the display takes or drops (and why)
+setting CTR run-time compile trace
+    key ctr_jit_trace
+    int 0 1
+    default 0
+    words Off|On
+    help 1 = logs each block the 3DS runtime compiles while the game runs (the static module lacked it), Thumb ones
+    help with the pc's low bit set as the hints file writes them
+setting CTR answer unknown commands
+    key ctr_auto_stub_ipc
+    int 0 1
+    default 1
+    words Off|On
+    help 1 = a command of a 3DS service the runtime doesn't know answers success, and a service it doesn't have is a
+    help stand-in that answers each command so (each logged the first time), as auto_stub_ipc does for a Switch game;
+    help 0 = the run stops at the first, saying which, except for the services --ipc-stubs names
+setting CTR script
+    key ctr_script
+    text 4096
+    default ""
+    help The 3DS game's scripted input (--script= too): when:buttons, comma between, when in ms from the start and
+    help buttons in hex as hid:USER's pad has them (1 A, 2 B, 4 Select, 8 Start, 10 Right, 20 Left, 40 Up, 80 Down,
+    help 100 R, 200 L, 400 X, 800 Y), each held for press_len ms
+
+section Game: g_game_ini
+section Display: g_display_ini
+section Graphics: g_graphics_ini
+section Performance: g_performance_ini
+section On-screen controls: g_vpad_ini, g_backend_ini, g_vpad_shown_ini/Buttons    backend
+section Controllers: g_gamepad_ini, g_gamepad_map_ini/Button map, g_gamepad_players_ini/Player    backend
+section Network: g_network_ini
+section User: g_user_ini
+section Debug: g_debug_ini
+
+# ---- the launcher's own, and the recompiler's ----
+
+# off until picked, as the launcher keeps them: picking one turns it on
+table g_launch_ini launcher
+setting gdbstub
+    key gdbstub
+    text 4
+    default off
+    words on=On
+    help Enables gdbstub on port 1234
+setting Extract to tmpfs
+    key tmpfs
+    text 4
+    default off
+    words on=On
+    help Extract to tmpfs, in memory (the temporary folder's scarletnx/work/<title ID>), which the game reads its RomFS
+    help from
+setting Extract game container
+    key extract
+    text 4
+    default off
+    words on=On
+    help Extract a dump's ExeFS and RomFS into its game's folder. Off, the game reads them from the dump
+
+table g_recompile_ini recompile
+setting Optimization level
+    key opt
+    text 2
+    default 2
+    words 0=0|1=1|2=2|3=3|z=z
+    help LLVM's optimization of the game's code when it is recompiled: 0 none, 3 the most, z the smallest. A game
+    help made already keeps its code until it is recompiled
+setting AOT threads
+    key aot_threads
+    int 0 1024
+    default 0
+    words Auto|#
+    help The threads compiling the game's code when it is recompiled: 0 = one for each of the computer's cores
+
+# LLVM's own: every pass of its pipelines for -O0 to -Oz, on unless turned off, and each option LLVM's C API sets on the
+# pass builder and the target machine, LLVM's own value until it is set
+table g_llvm_ini llvm
+setting @instcombine
+    name Instruction combining
+    help Combines instructions into fewer, simpler ones (instcombine)
+setting @inline
+    name Inlining
+    help Inlines calls into their callers (inline)
+setting @sroa
+    name Scalar replacement of aggregates
+    help Splits stack objects into values kept in registers (sroa)
+setting @gvn
+    name Global value numbering
+    help Removes redundant computations and loads (gvn)
+setting @simplifycfg
+    name Control flow simplification
+    help Merges, removes and simplifies basic blocks (simplifycfg)
+setting @loop-unroll
+    name Loop unrolling
+    help Unrolls loops with known trip counts (loop-unroll)
+setting @loop-vectorize
+    name Loop vectorization pass
+    help Vectorizes loops with SIMD instructions (loop-vectorize)
+setting @slp-vectorizer
+    name SLP vectorization pass
+    help Packs independent scalar instructions into SIMD ones (slp-vectorizer)
+setting @licm
+    name Loop invariant code motion
+    help Hoists computations that do not change across a loop out of it (licm)
+setting @LoopVectorization
+    name Loop vectorization
+    help Whether the pipeline vectorizes loops (LLVMPassBuilderOptionsSetLoopVectorization)
+setting @SLPVectorization
+    name SLP vectorization
+    help Whether the pipeline packs scalar instructions into SIMD ones (LLVMPassBuilderOptionsSetSLPVectorization)
+setting @LoopUnrolling
+    name Loop unrolling option
+    help Whether the pipeline unrolls loops (LLVMPassBuilderOptionsSetLoopUnrolling)
+setting @FastISel
+    name Fast instruction selection
+    key llvm_fast_isel
+    help Whether code generation selects instructions with FastISel, quicker and worse
+    help (LLVMSetTargetMachineFastISel)
+setting @GlobalISel
+    name Global instruction selection
+    key llvm_global_isel
+    help Whether code generation selects instructions with GlobalISel (LLVMSetTargetMachineGlobalISel)
+setting @InlinerThreshold
+    name Inliner threshold
+    help How large a function the inliner inlines; LLVM picks one for the level until it is set
+    help (LLVMPassBuilderOptionsSetInlinerThreshold)
+
+section Launch: g_launch_ini, g_recompile_ini, g_llvm_ini/LLVM Internals    launcher

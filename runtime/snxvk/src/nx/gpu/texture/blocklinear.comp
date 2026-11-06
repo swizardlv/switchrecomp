@@ -1,0 +1,46 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright 2026 the ScarletNX contributors */
+/* Block linear surfaces to linear rows and back on the GPU (vk/blocklinear.c runs it): textures and render targets
+   loaded from guest memory are deswizzled here after their guest bytes are staged as they are, and render targets
+   written back are swizzled here before the copy to the host, so the CPU only copies whole ranges. The body is
+   blocklinear.glsl, which the tests also run on the CPU; this file declares what it reads and writes.
+
+   One shader for both directions: the direction is a push constant that selects which of the two offsets, computed
+   either way, is read and which written. A uniform select per 16 bytes costs nothing measurable, while a second
+   shader, or a specialization constant, would be a second pipeline to compile at startup (on lavapipe each one is
+   an LLVM compile) and to keep in the pipeline cache, for the same instructions. */
+
+/* a GOB's 32 runs on x, two GOBs side by side on y: 64 invocations, the size every vendor runs well */
+layout(local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
+
+/* the move's shape, in 16 byte runs (vk/blocklinear.c's BlParams, member for member) */
+layout(push_constant) uniform Params {
+    uint runs;      /* runs moved in a row */
+    uint rows;      /* rows moved in a slice, from y0 */
+    uint lin_runs;  /* runs from a linear row to the next */
+    uint y0;        /* the first row moved */
+    uint gob_y0;    /* y0 >> 3: the workgroups' first GOB row */
+    uint z0;        /* the first slice moved */
+    uint bh;        /* log2 GOBs a block is high */
+    uint hmask;     /* (1 << bh) - 1 */
+    uint bd;        /* log2 GOBs a block is deep */
+    uint dmask;     /* (1 << bd) - 1 */
+    uint bsh;       /* 5 + bh + bd: log2 runs in a block */
+    uint block_row; /* runs from a row of blocks to the next */
+    uint slab;      /* runs from 2^bd slices to the next */
+    uint bl_bias;   /* added to a block linear offset: where the layout's run 0 is in the bound range (wraps) */
+    uint lin_bias;  /* where the first linear row is in the bound range */
+    uint to_bl;     /* nonzero: linear rows to block linear */
+};
+
+/* binding 0 is the side read, binding 1 the side written: block linear first when deswizzling */
+layout(std430, binding = 0) readonly restrict buffer Src {
+    uvec4 src[];
+};
+layout(std430, binding = 1) writeonly restrict buffer Dst {
+    uvec4 dst[];
+};
+
+#include "blocklinear.glsl"
