@@ -68,6 +68,24 @@ int g_nup_errno = 0; /* errno captured alongside g_nup_err */
 static uint32_t rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint64_t rd64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v; }
 
+/* ---- allocation that NEVER touches the CRT heap ----
+ * PS5's CRT heap cannot grow to large sizes (see plat.c: "CRT heap cannot grow
+ * that far"); malloc() of multi-megabyte / multi-hundred-megabyte blocks fails
+ * or corrupts the allocator and can stall the whole console. The NUP blob is
+ * mmap'd (no heap), and every decompression buffer below is mmap'd anonymous as
+ * well, so the zstd path is 100% heap-free. */
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+static void* nup_alloc(uint64_t sz) {
+    if (sz == 0) sz = 1;
+    void* p = mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return (p == MAP_FAILED) ? NULL : p;
+}
+static void nup_free(void* p, uint64_t sz) {
+    if (p) munmap(p, (size_t)(sz ? sz : 1));
+}
+
 /* ---- zstd decompress cache (LRU, capacity capped) ---- */
 #define ZC_CAP  (512uLL << 20)   /* 512 MiB total decompressed cap */
 #define ZC_MAX  1024             /* max cached entries             */
@@ -106,17 +124,17 @@ static uint8_t* zc_decompress(int node) {
     }
     if (zc_n >= ZC_MAX) return NULL;
 
-    uint8_t* comp = malloc(ext_size ? (size_t)ext_size : 1);
-    uint8_t* out  = malloc(size0 ? (size_t)size0 : 1);
-    if (!comp || !out) { free(comp); free(out); return NULL; }
+    uint8_t* comp = nup_alloc(ext_size ? (size_t)ext_size : 1);
+    uint8_t* out  = nup_alloc(size0 ? (size_t)size0 : 1);
+    if (!comp || !out) { nup_free(comp, ext_size); nup_free(out, size0); return NULL; }
 
         memcpy(comp, (const uint8_t*)G.map + (size_t)(G.blob_offset + ext_off), (size_t)ext_size);
         ssize_t r = (ssize_t)ext_size;
         size_t  d = (r == (ssize_t)ext_size)
                         ? ZSTD_decompress(out, (size_t)size0, comp, (size_t)ext_size)
                         : (size_t)-1;
-    free(comp);
-    if (ZSTD_isError(d) || d != (size_t)size0) { free(out); return NULL; }
+    nup_free(comp, ext_size);
+    if (ZSTD_isError(d) || d != (size_t)size0) { nup_free(out, size0); return NULL; }
 
     zc[zc_n].node = node;
     zc[zc_n].data = out;
@@ -224,7 +242,7 @@ int nup_open(const char* path) {
 void nup_close(void) {
     if (G.fd >= 0) { close(G.fd); G.fd = -1; }
     if (G.map) { munmap(G.map, (size_t)G.map_size); G.map = NULL; }
-    for (int i = 0; i < zc_n; i++) free(zc[i].data);
+    for (int i = 0; i < zc_n; i++) nup_free(zc[i].data, zc[i].size);
     zc_n = 0; zc_bytes = 0;
     memset(&G, 0, sizeof G);
     G.fd = -1;
@@ -307,19 +325,19 @@ int nup_read_file(int file_node, uint64_t offset, void* dst, uint64_t size) {
     if (codec != 1) return -1;               /* unknown codec */
 
     if (size0 > ZC_CAP) {                     /* too big to cache: decompress once */
-        uint8_t* comp = malloc(ext_size ? (size_t)ext_size : 1);
+        uint8_t* comp = nup_alloc(ext_size ? (size_t)ext_size : 1);
         if (!comp) return -1;
-        uint8_t* full = malloc(size0 ? (size_t)size0 : 1);
-        if (!full) { free(comp); return -1; }
+        uint8_t* full = nup_alloc(size0 ? (size_t)size0 : 1);
+        if (!full) { nup_free(comp, ext_size); return -1; }
         memcpy(comp, (const uint8_t*)G.map + (size_t)(G.blob_offset + ext_off), (size_t)ext_size);
         ssize_t r = (ssize_t)ext_size;
         size_t d = (r == (ssize_t)ext_size)
                        ? ZSTD_decompress(full, (size_t)size0, comp, (size_t)ext_size)
                        : (size_t)-1;
-        free(comp);
-        if (ZSTD_isError(d) || d != (size_t)size0) { free(full); return -1; }
+        nup_free(comp, ext_size);
+        if (ZSTD_isError(d) || d != (size_t)size0) { nup_free(full, size0); return -1; }
         memcpy(dst, full + offset, (size_t)n);
-        free(full);
+        nup_free(full, size0);
         return 0;
     }
 

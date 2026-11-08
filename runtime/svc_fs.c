@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 /* fsync-backed diagnostic sink defined in plat.c (independent of the buffered
    log, so it survives a hard crash); declared here for the romfs tracers. */
@@ -160,6 +162,45 @@ static int romfs_build_nup(void){
 extern int g_nup_err;
 extern int g_nup_errno;
 
+/* Stage the NUP container from its (slow, USB-backed) package location to the
+ * fast internal SSD once.  Runtime reads then come from local storage, so we
+ * never thrash the USB bus with random page faults across a ~9 GB mmap, and the
+ * giant container no longer sits on the bottleneck path during gameplay.
+ * Falls back to the original (USB) source if staging fails, so this is safe. */
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+static const char* kLocalNup = "/data/switchrecomp/romfs.nup";
+static int nup_ensure_local(const char* src){
+  u64 srcsz = plat_file_size(src);
+  if(srcsz==0) return 0;
+  u64 dstsz = plat_file_size(kLocalNup);
+  if(dstsz==srcsz){ LOG("RomFS: local NUP cache hit (%llu bytes)\n",(unsigned long long)srcsz); return 1; }
+  LOG("RomFS: staging NUP %s -> %s (%.1f MB; one-time copy)\n", src, kLocalNup, (double)srcsz/1048576.0);
+  plat_mkdir("/data/switchrecomp");
+  int in = open(src, O_RDONLY);
+  if(in<0){ LOG("RomFS: stage src open failed errno=%d\n", errno); return 0; }
+  int out = open(kLocalNup, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+  if(out<0){ LOG("RomFS: stage dst open failed errno=%d\n", errno); close(in); return 0; }
+  /* 1 MB staging buffer allocated via mmap so we never touch the limited CRT heap. */
+  u8* buf = (u8*)mmap(NULL, 1u<<20, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  if(buf==MAP_FAILED){ LOG("RomFS: stage buf mmap failed errno=%d\n", errno); close(in); close(out); return 0; }
+  u64 done=0;
+  while(done<srcsz){
+    u64 chunk = srcsz-done; if(chunk>(1u<<20)) chunk=(1u<<20);
+    ssize_t r = pread(in, buf, (size_t)chunk, (off_t)done);
+    if(r<=0){ LOG("RomFS: stage read error at %llu errno=%d\n",(unsigned long long)done, errno); break; }
+    ssize_t w = write(out, buf, (size_t)r);
+    if(w!=(ssize_t)r){ LOG("RomFS: stage write error at %llu errno=%d\n",(unsigned long long)done, errno); break; }
+    done += (u64)r;
+  }
+  munmap(buf, 1u<<20);
+  close(in); close(out);
+  if(done==srcsz){ LOG("RomFS: staging done (%llu bytes)\n",(unsigned long long)done); return 1; }
+  LOG("RomFS: staging incomplete %llu/%llu\n",(unsigned long long)done,(unsigned long long)srcsz);
+  return 0;
+}
+
 void romfs_init(void){
   pm_init(&g_romlock);
   LOG("RomFS: g_datadir=%s\n", g_datadir);
@@ -182,11 +223,15 @@ void romfs_init(void){
       if(fgets(line,sizeof line,cf)){
         size_t L=strlen(line);
         while(L>0 && (line[L-1]=='\n'||line[L-1]=='\r'||line[L-1]==' '||line[L-1]=='\t')) line[--L]=0;
-        if(line[0] && plat_file_size(line) && nup_open(line) && romfs_build_nup()){
-          LOG("RomFS: loaded from NUP %s (%d folders, %d files, %.1f MB)\n", line, ndn, nfn, (double)rtotal/1048576.0);
-          fclose(cf); return;
+        if(line[0] && plat_file_size(line)){
+          const char* src = line;
+          if(nup_ensure_local(src)) src = kLocalNup;
+          if(nup_open(src) && romfs_build_nup()){
+            LOG("RomFS: loaded from NUP %s (%d folders, %d files, %.1f MB)\n", src, ndn, nfn, (double)rtotal/1048576.0);
+            fclose(cf); return;
+          }
+          nup_close();
         }
-        nup_close();
       }
       fclose(cf);
     }
@@ -208,10 +253,12 @@ void romfs_init(void){
   for(int i=0; cand[i]; i++){
     u64 z=plat_file_size(cand[i]);
     g_nup_err=0;
-    int ok=nup_open(cand[i]);
-    LOG("RomFS: probe[%d] %s size=%llu nup_open=%d nup_err=%d errno=%d\n", i, cand[i], (unsigned long long)z, ok, g_nup_err, g_nup_errno);
+    const char* src = cand[i];
+    if(nup_ensure_local(src)) src = kLocalNup;
+    int ok=nup_open(src);
+    LOG("RomFS: probe[%d] %s (staged=%d) size=%llu nup_open=%d nup_err=%d errno=%d\n", i, src, (src==kLocalNup), (unsigned long long)z, ok, g_nup_err, g_nup_errno);
     if(z && ok && romfs_build_nup()){
-      LOG("RomFS: loaded from NUP %s (%d folders, %d files, %.1f MB)\n", cand[i], ndn, nfn, (double)rtotal/1048576.0);
+      LOG("RomFS: loaded from NUP %s (%d folders, %d files, %.1f MB)\n", src, ndn, nfn, (double)rtotal/1048576.0);
       return;
     }
     nup_close();
