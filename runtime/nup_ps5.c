@@ -24,6 +24,11 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+/* Trace hook: nup_open runs during startup, where plat.c fsync's every line, so
+ * these survive a hard freeze and pinpoint the exact step that stalls. */
+extern void logf_(int lvl, const char* fmt, ...);
+#define NUP_LOG(...) logf_(1, __VA_ARGS__)
+
 #ifdef SWR_PS5
 #include <zstd.h>
 #else
@@ -147,11 +152,12 @@ static uint8_t* zc_decompress(int node) {
 int nup_open(const char* path) {
     nup_close();
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { g_nup_err = errno; g_nup_errno = errno; return 0; }
+    if (fd < 0) { g_nup_err = errno; g_nup_errno = errno; NUP_LOG("nup: open failed %s errno=%d\n", path, errno); return 0; }
 
     struct stat st;
     if (fstat(fd, &st) != 0) { g_nup_err = errno; g_nup_errno = errno; close(fd); return 0; }
     uint64_t fsize = (uint64_t)st.st_size;
+    NUP_LOG("nup: open ok %s size=%llu\n", path, (unsigned long long)fsize);
 
     /* We deliberately do NOT mmap the whole (multi-GB) container: mapping a
        giant file over the ShadowMountPlus (nullfs + exFAT) USB layer makes the
@@ -170,6 +176,9 @@ int nup_open(const char* path) {
     uint64_t file_size   = rd64(hdr + 64);
     uint32_t npkg        = rd32(hdr + 72);
     uint32_t flags       = rd32(hdr + 76);
+    NUP_LOG("nup: superblock toc_off=%llu toc_size=%llu blob_off=%llu file_size=%llu npkg=%u flags=%u\n",
+            (unsigned long long)toc_offset, (unsigned long long)toc_size,
+            (unsigned long long)blob_offset, (unsigned long long)file_size, npkg, flags);
 
     /* Basic sanity so a truncated / corrupt file cannot make us read OOB. */
     if (flags != 0) { g_nup_err = -2; close(fd); return 0; }
@@ -179,10 +188,12 @@ int nup_open(const char* path) {
     if (blob_offset > fsize) { g_nup_err = -10; close(fd); return 0; }
 
     uint8_t* toc = nup_alloc(toc_size ? (size_t)toc_size : 1);
-    if (!toc) { g_nup_err = -20; g_nup_errno = errno; close(fd); return 0; }
+    if (!toc) { g_nup_err = -20; g_nup_errno = errno; NUP_LOG("nup: TOC alloc failed (%llu bytes)\n", (unsigned long long)toc_size); close(fd); return 0; }
+    NUP_LOG("nup: reading TOC %llu bytes @%llu\n", (unsigned long long)toc_size, (unsigned long long)toc_offset);
     if (pread(fd, toc, (size_t)toc_size, (off_t)toc_offset) != (ssize_t)toc_size) {
-        g_nup_err = -13; g_nup_errno = errno; nup_free(toc, toc_size); close(fd); return 0;
+        g_nup_err = -13; g_nup_errno = errno; NUP_LOG("nup: TOC pread failed errno=%d\n", errno); nup_free(toc, toc_size); close(fd); return 0;
     }
+    NUP_LOG("nup: TOC read ok\n");
 
     if (memcmp(toc, "TOC\x01", 4) != 0) { g_nup_err = -7; nup_free(toc, toc_size); close(fd); return 0; }
     uint32_t package_count = rd32(toc + 4);
@@ -237,7 +248,8 @@ int nup_open(const char* path) {
         }
     }
     if (G.base_romfs_dir < 0) G.base_romfs_dir = fallback;
-
+    NUP_LOG("nup: parsed dirs=%u files=%u pool=%u base_romfs=%d\n",
+            (unsigned)dir_count, (unsigned)file_count, G.pool_size, G.base_romfs_dir);
     return 1;
 }
 

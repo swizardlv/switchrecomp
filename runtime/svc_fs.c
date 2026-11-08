@@ -250,6 +250,7 @@ void romfs_init(void){
         while(L>0 && (line[L-1]=='\n'||line[L-1]=='\r'||line[L-1]==' '||line[L-1]=='\t')) line[--L]=0;
         if(line[0] && plat_file_size(line)){
           const char* src = line;
+          LOG("RomFS: pointer-file NUP %s\n", src);
           if(nup_open(src) && romfs_build_nup()){
             LOG("RomFS: loaded from NUP %s (%d folders, %d files, %.1f MB)\n", src, ndn, nfn, (double)rtotal/1048576.0);
             fclose(cf); return;
