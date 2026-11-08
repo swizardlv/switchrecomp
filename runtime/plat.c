@@ -420,6 +420,13 @@ int plat_text_input(const u16* def, u16* out, int max){
 #include <signal.h>
 #include <sched.h>
 #include <errno.h>
+/* OrbisOS (FreeBSD 9 derived) has no MAP_NORESERVE macro. A PROT_NONE anonymous
+   mapping is already lazily backed there, so treating the flag as 0 is correct.
+   Verified against the PS5 payload SDK: sys/mman.h only has the historical
+   MAP_RESERVED0040 comment, no MAP_NORESERVE. */
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
 
 void pm_init(PMutex* m){ pthread_mutex_init(&m->l,NULL); }
 
@@ -465,7 +472,12 @@ u64 plat_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); retur
 
 i64 plat_unix_time(void){ return (i64)time(NULL); }
 
+#ifdef SWR_PS5
+/* OrbisOS stub libs export localtime() but not localtime_r(). */
+i64 plat_tz_offset(void){ time_t t=time(NULL); struct tm* lt=localtime(&t); return lt? (i64)lt->tm_gmtoff : 0; }
+#else
 i64 plat_tz_offset(void){ time_t t=time(NULL); struct tm lt; localtime_r(&t,&lt); return (i64)lt.tm_gmtoff; }
+#endif
 
 int g_ww_ok;
 
@@ -478,9 +490,16 @@ int plat_vm_commit(u8* p, u64 size){ return mprotect(p,size,PROT_READ|PROT_WRITE
 
 void plat_vm_decommit(u8* p, u64 size){ madvise(p,size,MADV_DONTNEED); mprotect(p,size,PROT_NONE); }
 
+#ifdef SWR_PS5
+/* Native titles are statically linked: load_code() takes the swr_module_static
+   branch and never dlopens anything. OrbisOS rejects unsigned dlopen anyway,
+   and no SDK stub exports dlopen/dlsym, so remove the references entirely. */
+void* plat_dl_open(const char* path){ (void)path; return NULL; }
+void* plat_dl_sym(void* h, const char* n){ (void)h; (void)n; return NULL; }
+#else
 void* plat_dl_open(const char* path){ return dlopen(path,RTLD_NOW|RTLD_LOCAL); }
-
 void* plat_dl_sym(void* h, const char* n){ return dlsym(h,n); }
+#endif
 
 int plat_mkdir(const char* p){ return mkdir(p,0755); }
 
@@ -526,7 +545,12 @@ static void sighandler(int sig, siginfo_t* si, void* uc_){
     siglongjmp(*b,1); }
   extern void crash_report(void* host_pc, void* fault_addr, int sig);
   void* pc=NULL;
-#if defined(__x86_64__)
+#if defined(__x86_64__) && (defined(__FreeBSD__) || defined(__PROSPERO__))
+  #include <ucontext.h>
+  /* FreeBSD/OrbisOS mcontext_t has named registers (mc_rip), not Linux's
+     gregs[] + REG_RIP indices. Verified in the PS5 SDK x86/ucontext.h. */
+  ucontext_t* uc=(ucontext_t*)uc_; pc=(void*)uc->uc_mcontext.mc_rip;
+#elif defined(__x86_64__)
   #include <ucontext.h>
   ucontext_t* uc=(ucontext_t*)uc_; pc=(void*)uc->uc_mcontext.gregs[REG_RIP];
 #elif defined(__aarch64__)

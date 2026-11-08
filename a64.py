@@ -528,6 +528,70 @@ def _(g):
     return None
 
 
+# ------------------------------------------------------------------ ARMv8.1 / 8.3 (Switch 2, system 22+)
+# Not part of the original ARMv8.0/A57 table. The patterns below were derived
+# from a full .text census of the Switch 2 dumps and cross-checked against
+# capstone over the whole encoding space; see tools/ps5/pipeline.py, which
+# writes opcode_gaps.json. Register fields are deliberately left as 'x'.
+FIELDS['A'] = (23, 1)       # LSE acquire bit
+FIELDS['Rl'] = (22, 1)      # LSE release bit
+FIELDS['o3'] = (15, 1)      # LSE: 0 = LDADD..LDUMAX, 1 = SWP (opc must be 000)
+FIELDS['aopc'] = (12, 3)    # LSE operation selector
+
+
+# RCpc load-acquire: LDAPR / LDAPRB / LDAPRH. A plain x86 load is already
+# acquire; LDAR_ uses a SEQ_CST atomic load so ARM hosts behave identically.
+# MUST be registered before LSE_ATOMIC: LDAPR is a special case of the same
+# encoding space (Rs=11111, o3=1, opc=100) and would otherwise be swallowed.
+@ins('LDAPR', 'xx 111 000 10 1 11111 110000 xxxxx xxxxx', spec=('size',))
+def _(g):
+    size = g.v('size')
+    e = 'LDAR_(%s,%s)' % (('u8', 'u16', 'u32', 'u64')[size], g.XS('rn'))
+    return g.setX('rt', e) if size == 3 else g.setW('rt', e)
+
+
+# LSE atomic memory operations. Split into two patterns on purpose: an o3=1
+# encoding is only a valid SWP when opc=000. A single wide pattern would also
+# claim reserved encodings (including ST64BV/ST64BV0) and hide them from any
+# future implementation. Rs=31 / Rt=31 store forms are covered too: writing Rt
+# is then a no-op, which is exactly what the store-only variants require.
+def lse_body(g, op):
+    call = 'swr_lse(M,%s,%s,%s,%d)' % (g.XS('rn'), g.X('rs'), g.f('size'), op)
+    return g.setX('rt', call) if g.v('size') == 3 else g.setW('rt', call)
+
+
+@ins('LSE_ATOMIC_RMW', 'xx 111 000 xx 1 xxxxx 0 xxx 00 xxxxx xxxxx',
+     spec=('size', 'A', 'Rl', 'aopc'))
+def _(g):
+    return lse_body(g, g.v('aopc'))      # 0..7 = LDADD/LDCLR/LDEOR/LDSET/SMAX/SMIN/UMAX/UMIN
+
+
+@ins('LSE_ATOMIC_SWP', 'xx 111 000 xx 1 xxxxx 1 000 00 xxxxx xxxxx',
+     spec=('size', 'A', 'Rl'))
+def _(g):
+    return lse_body(g, 8)
+
+
+# Pointer authentication. No PAC keys are emulated on the host, so signing and
+# stripping instructions are no-ops, and RETAA/RETAB are ordinary returns.
+ins('RETAA', '1101011 0010 11111 000010 11111 11111')(lambda g: ('ret', 'c->x[30]'))
+ins('RETAB', '1101011 0010 11111 000011 11111 11111')(lambda g: ('ret', 'c->x[30]'))
+
+
+def _pac_nop(g):
+    return ''
+
+
+for _i, _p in enumerate((
+    '11011010 11000001 00000x xxxxxxxxxx',   # PACIA / PACIB
+    '11011010 11000001 00010x xxxxxxxxxx',   # AUTIA / AUTIB
+    '11011010 11000001 00100x 11111 xxxxx',  # PACIZA / PACIZB
+    '11011010 11000001 00110x 11111 xxxxx',  # AUTIZA / AUTIZB
+    '11011010 11000001 01000x 11111 xxxxx',  # XPACI / XPACD
+)):
+    ins('PAC_NOP%d' % _i, _p)(_pac_nop)
+
+
 # ------------------------------------------------------------------ logical / register arithmetic
 def shifted(g, reg, sf):
     """shifted register operand (LSL/LSR/ASR/ROR #imm6)"""

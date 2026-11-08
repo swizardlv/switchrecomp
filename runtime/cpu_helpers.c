@@ -246,6 +246,49 @@ u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1){
 }
 #endif
 
+/* ---- ARMv8.1 LSE atomic memory operations ----
+   Switch 2 / system 22+ games use these instead of LDXR/STXR loops. One CAS
+   loop covers every variant: no suffix, A (acquire), L (release) and AL, for
+   byte/halfword/word/dword. Sequentially-consistent CAS is a safe superset of
+   the acquire/release orderings, and the host (x86_64) cannot observe the
+   difference in guest-visible behaviour. swr_cas* are already defined for both
+   gcc/clang and tcc above. */
+static u64 swr_lse_sext(u64 x, int size){
+  switch(size){ case 0: return (u64)(i64)(i8)x; case 1: return (u64)(i64)(i16)x;
+                case 2: return (u64)(i64)(i32)x; default: return x; }
+}
+static u64 swr_lse_apply(u64 o, u64 v, int op, int size){
+  switch(op){
+    case 0: return o+v;                                                        /* LDADD */
+    case 1: return o&~v;                                                       /* LDCLR */
+    case 2: return o^v;                                                        /* LDEOR */
+    case 3: return o|v;                                                        /* LDSET */
+    case 4: return (u64)((i64)swr_lse_sext(o,size)>(i64)swr_lse_sext(v,size)?o:v);  /* LDSMAX */
+    case 5: return (u64)((i64)swr_lse_sext(o,size)<(i64)swr_lse_sext(v,size)?o:v);  /* LDSMIN */
+    case 6: return o>v?o:v;                                                    /* LDUMax */
+    case 7: return o<v?o:v;                                                    /* LDUMin */
+    default: return v;                                                         /* SWP */
+  }
+}
+#define SWR_LSE_CASE(T, CASFN) do { \
+    T* p_=(T*)(M+a); T o_=*(volatile T*)p_, n_; \
+    for(;;){ n_=(T)swr_lse_apply(o_,v,op,size); \
+             if(CASFN(p_,o_,n_)) return (u64)o_; \
+             o_=*(volatile T*)p_; } \
+  } while(0)
+u64 swr_lse(u8* M, u64 a, u64 v, int size, int op){
+  static const u64 lse_mask_[4]={0xFFull,0xFFFFull,0xFFFFFFFFull,0xFFFFFFFFFFFFFFFFull};
+  size &= 3; v &= lse_mask_[size];
+  switch(size){
+    case 0: SWR_LSE_CASE(u8,  swr_cas8);
+    case 1: SWR_LSE_CASE(u16, swr_cas16);
+    case 2: SWR_LSE_CASE(u32, swr_cas32);
+    default: SWR_LSE_CASE(u64, swr_cas64);
+  }
+  return 0;
+}
+#undef SWR_LSE_CASE
+
 /* ================================================================ system */
 #define SYSREG(op0,op1,crn,crm,op2) ((((op0)&1)<<14)|((op1)<<11)|((crn)<<7)|((crm)<<3)|(op2))
 

@@ -369,7 +369,10 @@ const SwrModule* swr_module_static(void) __attribute__((weak));
 int g_code_tcc;
 
 static int load_code(void){
-  if(swr_module_static){ g_mod=swr_module_static(); return g_mod? 0 : -1; }
+  if(swr_module_static){
+    g_mod=swr_module_static();
+    LOG("code: statically linked module (swr_module_static, no dlopen)\n");
+    return g_mod? 0 : -1; }
   char p[1200];
 #if defined(_WIN32)
   snprintf(p,sizeof p,"%s%s_code.dll",g_exedir,g_exename);
@@ -378,7 +381,7 @@ static int load_code(void){
 #endif
   void* h=plat_dl_open(p);
   if(!h){
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(SWR_PS5)
     extern char* dlerror(void); WARN("dlopen: %s\n",dlerror());
 #endif
     WARN("Cannot find the recompiled code: %s\n",p); return -1; }
@@ -414,11 +417,26 @@ static void split_path(const char* argv0){
 }
 
 int swr_main(int argc, char** argv){
+#ifdef SWR_PS5
+  /* Native title layout (stage 1): /app0 is the read-only app mount and /data is
+     writable. argv[0] from the OrbisOS loader is not a usable filesystem path,
+     so pin both roots instead of deriving them from it. Game assets live in
+     /app0/swr_data/ (see tools/ps5/ps5build.py stage_package); ini, hints, the
+     crash log and threads.txt go to /data/switchrecomp/. */
+  strncpy(g_exedir,"/data/switchrecomp/",sizeof g_exedir-1); g_exedir[sizeof g_exedir-1]=0;
+  strncpy(g_exename,"swr",sizeof g_exename-1); g_exename[sizeof g_exename-1]=0;
+  plat_mkdir("/data/switchrecomp");
+#else
   split_path(argv[0]);
+#endif
   char ini[1400];
   snprintf(ini,sizeof ini,"%s%s.ini",g_exedir,g_exename); ini_open(ini);
   for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-v")) g_verbose=2; else if(!strncmp(argv[i],"--",2) && strchr(argv[i],'=')){ char k[256]; snprintf(k,sizeof k,"%s",argv[i]+2); char* e=strchr(k,'='); if(!e) continue; *e=0; backend_ini(k,e+1); if(!strcmp(k,"docked")) g_opt_docked=atoi(e+1); if(!strcmp(k,"fps_limit")){ g_opt_fps=atoi(e+1); if(g_opt_fps!=30 && g_opt_fps<60 && g_opt_fps!=0) g_opt_fps=60; } } }
+#ifdef SWR_PS5
+  snprintf(g_datadir,sizeof g_datadir,"/app0/swr_data/");
+#else
   snprintf(g_datadir,sizeof g_datadir,"%s%s_data/",g_exedir,g_exename);
+#endif
   snprintf(g_hints_path,sizeof g_hints_path,"%s%s.hints",g_exedir,g_exename);
   pm_init(&g_hint_lock); pm_init(&g_flock);
   plat_install_crash_handler();
@@ -481,7 +499,10 @@ int swr_main(int argc, char** argv){
   _exit(0);
 }
 
-#if !defined(_WIN32)
+#if defined(SWR_PS5)
+/* OrbisOS has no dladdr(): crash reports show addresses without symbol names. */
+int dladdr_name(void* pc, char* out, int n){ (void)pc; if(n>0) out[0]=0; return 0; }
+#elif !defined(_WIN32)
 #include <dlfcn.h>
 
 int dladdr_name(void* pc, char* out, int n){ Dl_info i; if(dladdr(pc,&i) && i.dli_sname){ snprintf(out,n,"%s+%lx",i.dli_sname,(unsigned long)((u8*)pc-(u8*)i.dli_saddr)); return 1; } return 0; }

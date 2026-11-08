@@ -292,6 +292,10 @@ SWR_INLINE u32 swr_cas8(u8* p, u8 o, u8 n){ return __atomic_compare_exchange_n(p
 u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1);
 #define SWR_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #endif
+/* ARMv8.1 LSE atomic memory operations (LDADD/LDCLR/LDEOR/LDSET/SMAX/SMIN/UMAX/UMIN/SWP).
+   Lives in cpu_helpers.c (linked from module.c); generated code_*.c only sees the declaration.
+   op: 0 add, 1 clr, 2 eor, 3 set, 4 smax, 5 smin, 6 umax, 7 umin, 8 swp. size: 0/1/2/3 = 8/16/32/64 bit. */
+u64 swr_lse(u8* M, u64 a, u64 v, int size, int op);
 /* LDAR/STLR and DMB LD. a volatile access only orders against other volatile accesses, the compiler could still
    move plain loads above an LDAR or stores below an STLR, and arm64 hosts need real acquire/release instructions.
    tcc doesn't reorder anything */
