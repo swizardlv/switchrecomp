@@ -13,6 +13,7 @@ const char* g_runtime_version=SWR_RUNTIME_VERSION;
 #include "rt.h"
 #include "audio.h"
 #include <sys/stat.h>
+#include <errno.h>
 static int g_opt_null_trap;   /* null_trap= in the ini */
 
 const SwrModule* g_mod;
@@ -129,6 +130,13 @@ void crash_report(void* host_pc, void* fault, int sig){
   KThread* t=kthread_cur();
   u64 ga=(u64)((u8*)fault-g_mem);
   logf_(0,"\n*** Crash (signal %d) at host pc=%p, access to %p (game address %llx) ***\n",sig,host_pc,fault,(unsigned long long)ga);
+  /* PIE diagnostics: print an offset relative to a symbol whose ELF address is
+     known from nm. Locally, pc_off = (pc_rel + nm(crash_report)) maps straight
+     into llvm-addr2line, whatever ASLR base the console picked. */
+  { u64 p=(u64)(size_t)host_pc, self=(u64)(size_t)&crash_report;
+    logf_(0,"  diag: &crash_report=%p pc_rel=%s%lld g_mod=%p g_disp=%p g_mem=%p\n",
+          (void*)self, (p>=self? "+" : "-"), (long long)(p>=self? p-self : self-p),
+          (void*)g_mod, (void*)g_disp, (void*)g_mem); }
   { extern void mem_report(char*,int); char mr[200]; mem_report(mr,sizeof mr); logf_(0,"  memory: %s\n",mr);
 #ifdef _WIN32
     { extern char __ImageBase; u64 b=(u64)(size_t)&__ImageBase, p=(u64)(size_t)host_pc; if(p>=b && p<b+0x10000000ull) logf_(0,"  in the runtime itself (exe offset +%llx), thread %s\n",(unsigned long long)(p-b), kthread_cur()? "of the game" : "of the runtime (GPU, audio or window)"); }
@@ -398,9 +406,21 @@ static int load_code(void){
 static void build_dispatch(void){
   g_code_lo=g_mod->code_lo; g_code_hi=g_mod->code_hi;
   u64 n=(g_code_hi-g_code_lo)/4;
+  LOG("dispatch: code=%llx..%llx slots=%llu (%.1f MiB) nentries=%u entry_addr=%p entry_fn=%p interp=%p\n",
+      (unsigned long long)g_code_lo,(unsigned long long)g_code_hi,(unsigned long long)n,
+      (double)(n*sizeof(GuestFn))/1048576.0,g_mod->nentries,
+      (void*)(size_t)g_mod->entry_addr,(void*)(size_t)g_mod->entry_fn,
+      (void*)(size_t)g_mod->interp);
   g_disp=calloc(n?n:1,sizeof(GuestFn));
-  for(u32 i=0;i<g_mod->nentries;i++){ u64 a=g_mod->entry_addr[i]; if(a>=g_code_lo && a<g_code_hi) g_disp[(a-g_code_lo)/4]=g_mod->entry_fn[i]; }
+  LOG("dispatch: calloc -> %p errno=%d\n",(void*)g_disp,errno);
+  if(!g_disp) fatal("Could not allocate the dispatch table (%llu slots / %.1f MiB).",
+                    (unsigned long long)n,(double)(n*sizeof(GuestFn))/1048576.0);
+  u64 filled=0;
+  for(u32 i=0;i<g_mod->nentries;i++){ u64 a=g_mod->entry_addr[i];
+    if(a>=g_code_lo && a<g_code_hi){ g_disp[(a-g_code_lo)/4]=g_mod->entry_fn[i]; ++filled; } }
   swr_interp_entry=g_mod->interp;
+  LOG("dispatch: filled %llu/%u entries, interp_entry=%p\n",
+      (unsigned long long)filled,g_mod->nentries,(void*)(size_t)swr_interp_entry);
 }
 
 void services_init(void){
@@ -442,25 +462,35 @@ int swr_main(int argc, char** argv){
   plat_install_crash_handler();
   g_t0=plat_ns();
   LOG("SwitchRecomp - %s (runtime %s, built %s)\n",g_exename,SWR_RUNTIME_VERSION,__DATE__);
+  LOG("stage: load_code\n");
   if(load_code()) fatal("Could not load the game's recompiled code.");
   if(g_mod->abi!=1) fatal("The recompiled code is from another SwitchRecomp version.");
   g_title_id=g_mod->title_id;
+  LOG("stage: npdm_mmu_flags (datadir=%s)\n",g_datadir);
   { /* npdm MMU flags: bits 1-3 = address space type, 1 = the old 36-bit one */
     char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");
     if(f){ u8 h[0x10]; if(fread(h,1,0x10,f)==0x10 && !memcmp(h,"META",4) && ((h[0x0C]>>1)&7)==1){ mem_layout_36bit(); LOG("npdm: 36-bit address space (stack and TLS kept below 64 GB)\n"); } fclose(f); } }
+  LOG("stage: mem_init\n");
   mem_init(); if(g_opt_null_trap){ plat_vm_readonly(g_mem,0x10000); LOG("null_trap: writes to page 0 crash with a log\n"); }
-  kernel_init(); build_dispatch();
-  if(g_mod->init) g_mod->init(&g_rtapi);
-  load_hints();
+  LOG("stage: kernel_init\n"); kernel_init();
+  LOG("stage: build_dispatch\n"); build_dispatch();
+  LOG("stage: mod_init\n"); if(g_mod->init) g_mod->init(&g_rtapi);
+  LOG("stage: load_hints\n"); load_hints();
+  LOG("stage: loader_load\n");
   if(loader_load()) fatal("Could not load the game executables from %sexefs/",g_datadir);
+  LOG("stage: npdm_sysres\n");
   { /* npdm SystemResourceSize; newer SDKs only init their VM allocator when > 0 */
     extern u64 g_sysres_size; char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");
     if(f){ u8 h[0x20]; if(fread(h,1,0x20,f)==0x20 && !memcmp(h,"META",4)){ u32 v; memcpy(&v,h+0x14,4); g_sysres_size=v; } fclose(f); }
     LOG("npdm: system resource %.1f MB\n",g_sysres_size/1048576.0); }
-  services_init(); romfs_init(); gpu_init(); { extern void snxvk_gpu_init(void); snxvk_gpu_init(); }
-  { extern void hle_install(void); hle_install(); }
-  video_init(g_mod->title? g_mod->title : g_exename);
+  LOG("stage: services_init\n"); services_init();
+  LOG("stage: romfs_init\n"); romfs_init();
+  LOG("stage: gpu_init\n"); gpu_init();
+  LOG("stage: snxvk_gpu_init\n"); { extern void snxvk_gpu_init(void); snxvk_gpu_init(); }
+  LOG("stage: hle_install\n"); { extern void hle_install(void); hle_install(); }
+  LOG("stage: video_init\n"); video_init(g_mod->title? g_mod->title : g_exename);
   { extern void plat_prof_start(int); if(g_opt_prof){ plat_prof_start(0); LOG("profile: active (profile.txt every 10 s)\n"); } }
+  LOG("stage: kernel_run_main\n");
   kernel_run_main(g_mod->mods[0].base+g_mod->mods[0].text_off,g_mod->main_stack?g_mod->main_stack:0x100000,(int)g_mod->main_prio,(int)g_mod->main_core);
   /* 60Hz frontend loop */
   u64 next=plat_ns(); int tick=0;
