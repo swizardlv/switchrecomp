@@ -158,6 +158,7 @@ static int romfs_build_nup(void){
 }
 
 extern int g_nup_err;
+extern int g_nup_errno;
 
 void romfs_init(void){
   pm_init(&g_romlock);
@@ -208,7 +209,7 @@ void romfs_init(void){
     u64 z=plat_file_size(cand[i]);
     g_nup_err=0;
     int ok=nup_open(cand[i]);
-    LOG("RomFS: probe[%d] %s size=%llu nup_open=%d nup_err=%d\n", i, cand[i], (unsigned long long)z, ok, g_nup_err);
+    LOG("RomFS: probe[%d] %s size=%llu nup_open=%d nup_err=%d errno=%d\n", i, cand[i], (unsigned long long)z, ok, g_nup_err, g_nup_errno);
     if(z && ok && romfs_build_nup()){
       LOG("RomFS: loaded from NUP %s (%d folders, %d files, %.1f MB)\n", cand[i], ndn, nfn, (double)rtotal/1048576.0);
       return;
