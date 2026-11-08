@@ -282,6 +282,9 @@ int  buf_cs(IpcCtx* c, int idx, u64* addr, u64* size);
 #define RC(mod,desc) ((mod)|((desc)<<9))
 #define RC_OK 0
 int stub_ok(SvcObj* o, IpcCtx* c);
+/* "service cmd N ... args .. | wants X out bytes" text for the commands we answer
+   with nothing; logged once per (service, cmd) so one run documents the whole gap. */
+void ipc_arg_str(IpcCtx* c, char* out, int cap);
 SvcObj* svc_generic(const char* name);               /* empty success reply, logged */
 
 /* service registry */

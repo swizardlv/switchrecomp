@@ -30,7 +30,19 @@ int ipc_warn_once(const char* name, u32 cmd){
   for(int i=0;i<nt;i++) if(t[i].cmd==cmd && !strcmp(t[i].n,name)) return ++t[i].cnt<=3;
   if(nt<512){ t[nt].n=name; t[nt].cmd=cmd; t[nt].cnt=1; nt++; } return 1; }
 
-int stub_ok(SvcObj* o, IpcCtx* c){ if(ipc_warn_once(o->name,c->cmd)) LOG("  [stub] %s cmd %u -> ok\n",o->name,c->cmd); return 0; }
+/* Human readable summary of a request we are about to answer with nothing: the raw
+   argument words plus how much output the caller asked for. Seeing the arguments is
+   what turns "some applet command returned empty" into an implementable spec, so this
+   is logged once per (service, cmd) and nowhere else. */
+void ipc_arg_str(IpcCtx* c, char* out, int cap){
+  int p=0; p+=snprintf(out+p,cap-p," args");
+  for(int i=0;i<6;i++){ u32 v=0; memcpy(&v,c->raw+i*4,4); p+=snprintf(out+p,cap-p," %x",v); if(p>=cap-16) break; }
+  u64 need=0; for(int i=0;i<c->nb && i<MAX_BUFS;i++) need+=c->b[i].size;
+  for(int i=0;i<c->nc && i<MAX_BUFS;i++) need+=c->c[i].size;
+  snprintf(out+p,cap-p," | wants %llu out bytes, %d copy-h, %d move-h",(unsigned long long)need,c->ncopy,c->nmove);
+}
+
+int stub_ok(SvcObj* o, IpcCtx* c){ if(ipc_warn_once(o->name,c->cmd)){ char a[128]; ipc_arg_str(c,a,sizeof a); LOG("  [stub] %s cmd %u -> ok%s\n",o->name,c->cmd,a); } return 0; }
 
 /* ============================================================ registry */
 typedef struct { char name[16]; SvcCtor ctor; } SvcReg;

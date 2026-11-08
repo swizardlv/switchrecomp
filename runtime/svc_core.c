@@ -30,7 +30,8 @@ static SvcObj* new_sm(void){ return svcobj_new("sm:",sm_disp,0); }
 /* unknown service -> generic stub, everything succeeds */
 typedef struct { char name[16]; } GenData;
 
-static int generic_disp(SvcObj* o, IpcCtx* c){ extern int ipc_warn_once(const char*,u32); if(ipc_warn_once(((GenData*)o->data)->name,c->cmd)) WARN("  [not implemented] %s cmd %u -> ok\n",((GenData*)o->data)->name,c->cmd); return 0; }
+static int generic_disp(SvcObj* o, IpcCtx* c){ extern int ipc_warn_once(const char*,u32); extern void ipc_arg_str(IpcCtx*,char*,int);
+  if(ipc_warn_once(((GenData*)o->data)->name,c->cmd)){ char a[128]; ipc_arg_str(c,a,sizeof a); LOG("  [not implemented] %s cmd %u -> ok%s\n",((GenData*)o->data)->name,c->cmd,a); } return 0; }
 
 SvcObj* svc_generic(const char* n){ SvcObj* o=svcobj_new("generic",generic_disp,sizeof(GenData)); strncpy(((GenData*)o->data)->name,n,15); o->name=((GenData*)o->data)->name; return o; }
 
@@ -38,7 +39,8 @@ SvcObj* svc_generic(const char* n){ SvcObj* o=svcobj_new("generic",generic_disp,
    them shows up in the log */
 static int quiet_ok(SvcObj* o, IpcCtx* c){ static struct { const char* n; u32 cmd; } seen[96]; static int ns;
   for(int i=0;i<ns;i++) if(seen[i].n==o->name && seen[i].cmd==c->cmd) return 0;
-  if(ns<96){ seen[ns].n=o->name; seen[ns].cmd=c->cmd; ns++; LOG("ipc: %s cmd %u answered empty\n",o->name,c->cmd); }
+  if(ns<96){ seen[ns].n=o->name; seen[ns].cmd=c->cmd; ns++; char a[128]; ipc_arg_str(c,a,sizeof a);
+    LOG("ipc: %s cmd %u answered empty%s\n",o->name,c->cmd,a); }
   return 0; }
 
 static SvcObj* quiet(const char* name){ return svcobj_new(name,quiet_ok,0); }
@@ -331,7 +333,13 @@ static int am_proxy(SvcObj* o, IpcCtx* c){        /* IApplicationProxy */
   return stub_ok(o,c); }
 
 static int am_oe(SvcObj* o, IpcCtx* c){
-  if(c->cmd==0){ out_obj(c,svcobj_new("IApplicationProxy",am_proxy,0)); return 0; }
+  /* Both 0 and 10 hand back IApplicationProxy. Evidence from the console log: the
+     first request this title sends on the appletOE session is cmd 10, and it then
+     drives the returned object with the IApplicationProxy command set
+     (0..4, 11, 20, 1000). Answering 10 with a dummy made every one of those
+     "succeed without output", so nnSdk stored NULL interfaces and later called
+     through them (badcall target=0), then waited on a 0 handle (E401 abort). */
+  if(c->cmd==0 || c->cmd==10){ out_obj(c,svcobj_new("IApplicationProxy",am_proxy,0)); return 0; }
   /* On hardware appletOE/appletAE hand back IApplicationProxy itself: the game
      sends GetCommonStateGetter(0) ... GetApplicationFunctions(20) straight to
      the service session, with no cmd-0 indirection. Those all used to fall into
