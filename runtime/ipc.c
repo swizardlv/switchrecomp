@@ -176,6 +176,31 @@ SvcObj* ipc_in_obj(IpcCtx* c, int i){
   KSession* s=(KSession*)h_get_type(c->move_h[i],KO_SESSION); if(!s || !s->obj) return NULL;
   __atomic_add_fetch(&s->obj->refs,1,__ATOMIC_SEQ_CST); return s->obj; }
 
+/* ============================================================ census
+   Every (service, cmd) pair the game asks for, with how often it came back
+   without producing ANY output at all. That second column is the useful one:
+   a command that takes output buffers and writes nothing leaves the game
+   holding a NULL interface/object, and nnSdk then calls through the null
+   pointer thousands of instructions later (nn::am / nn::oe do exactly this).
+   The table is dumped from the svcBreak path, so one console run shows the
+   whole remaining service surface instead of the first thing that broke. */
+typedef struct { const char* name; u32 cmd, n, empty; } IpcStat;
+static IpcStat g_ist[1024]; static int g_nist;
+
+static IpcStat* ist_get(const char* name, u32 cmd){
+  for(int i=0;i<g_nist;i++) if(g_ist[i].cmd==cmd && g_ist[i].name==name) return &g_ist[i];
+  if(g_nist>=1024) return NULL;
+  IpcStat* s=&g_ist[g_nist++]; s->name=name; s->cmd=cmd; s->n=0; s->empty=0; return s; }
+
+void ipc_dump_stats(void){
+  if(!g_nist){ LOG("ipc: no commands recorded\n"); return; }
+  u64 total=0; for(int i=0;i<g_nist;i++) total+=g_ist[i].n;
+  LOG("ipc: %d distinct (service, cmd) pairs, %llu requests\n",g_nist,(unsigned long long)total);
+  for(int i=0;i<g_nist;i++)
+    LOG("  %-30s cmd %-4u x%-8u%s\n",g_ist[i].name,g_ist[i].cmd,g_ist[i].n,
+        g_ist[i].empty? "  <== NEVER WROTE OUTPUT" : "");
+}
+
 void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
   CPU* cpu=&t->cpu;
   KSession* s=(KSession*)h_get_type(handle,KO_SESSION);
@@ -209,6 +234,11 @@ void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
   LOGV("IPC %s cmd %u\n",obj->name,c->cmd);
   c->rc=(u32)obj->dispatch(obj,c);
   { u32 i=__atomic_fetch_add(&g_ipc_ring_n,1,__ATOMIC_RELAXED)&31; u32 in0=0,in1=0; memcpy(&in0,c->raw,4); memcpy(&in1,c->raw+4,4); snprintf(g_ipc_ring[i],80,"%s cmd %u (in %x %x) -> %x",obj->name,c->cmd,in0,in1,c->rc); }
+  { IpcStat* st=ist_get(obj->name,c->cmd);
+    if(st){ st->n++;
+      int produced = c->nout_copy + c->nout_move + c->nout_objs + c->nx_out + (c->out_size?1:0);
+      if(!produced && !c->rc && (c->nb || c->nc)){ st->empty++;
+        if(st->empty<=3) WARN("ipc: %s cmd %u returned OK but wrote NO output (%d out bufs)\n",obj->name,c->cmd,c->nb+c->nc); } } }
   respond(c);
   if(c->is_domain) svcobj_unref(obj);           /* drop the ref from domain_get */
   free(c);

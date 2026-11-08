@@ -332,7 +332,14 @@ static int am_proxy(SvcObj* o, IpcCtx* c){        /* IApplicationProxy */
 
 static int am_oe(SvcObj* o, IpcCtx* c){
   if(c->cmd==0){ out_obj(c,svcobj_new("IApplicationProxy",am_proxy,0)); return 0; }
-  return stub_ok(o,c); }
+  /* On hardware appletOE/appletAE hand back IApplicationProxy itself: the game
+     sends GetCommonStateGetter(0) ... GetApplicationFunctions(20) straight to
+     the service session, with no cmd-0 indirection. Those all used to fall into
+     stub_ok, which answers "ok" but writes no object handle, so nnSdk stored a
+     NULL interface and later called through it (nn::am::InitializeApplication-
+     Interfaces / nn::oe::InitializeApplet -> blr x8 with x8 = 0). cmd 0 stays
+     supported for the titles that do ask for the proxy object explicitly. */
+  return am_proxy(o,c); }
 
 static SvcObj* new_appletoe(void){ return svcobj_new("appletOE",am_oe,0); }
 

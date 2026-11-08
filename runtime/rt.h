@@ -249,6 +249,7 @@ SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t d
 void    svcobj_unref(SvcObj* o);
 u32     session_new(SvcObj* obj);
 void    ipc_handle(KThread* t, u32 handle, u64 msg_addr);
+void    ipc_dump_stats(void);   /* every (service, cmd) the game asked for */
 /* reading args */
 static inline u32 in32(IpcCtx* c, u32 off){ u32 v=0; if(off+4<=c->raw_size) memcpy(&v,c->raw+off,4); return v; }
 

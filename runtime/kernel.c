@@ -29,6 +29,13 @@ static u64 g_next_tid = 0x50;
 typedef struct { u32 imm, res; u64 lr, a[4], o1; } SvcRec;
 
 static SvcRec g_svc_ring[64]; static u32 g_svc_ring_n;
+/* how often each SVC id was used -- dumped on abort so one run shows which
+   kernel services this title actually depends on */
+static u32 g_svc_n[256];
+static void svc_dump_census(void){
+  LOG("svc: kernel service census\n");
+  for(int i=0;i<256;i++) if(g_svc_n[i]) LOG("  svc 0x%02x x%u\n",(u32)i,g_svc_n[i]);
+}
 
 /* ============================================================ handles */
 #define MAXH 4096
@@ -699,6 +706,7 @@ void swr_svc(CPU* c, u32 imm){
 static void swr_svc_(CPU* c, u32 imm){
   KThread* t=kthread_cur();
   u64* x=c->x;
+  if(imm<256) __atomic_fetch_add(&g_svc_n[imm],1,__ATOMIC_RELAXED);
   switch(imm){
   case 0x01: { u64 a=mem_heap_set(x[1]); if(!a && x[1]){ x[0]=R_OUTOFMEM; return; } x[0]=0; x[1]=HEAP_BASE; return; }
   case 0x02: mem_set_state(x[0],x[1],0xFFFFFFFFu,(u32)x[2]); x[0]=0; return;
@@ -763,6 +771,10 @@ static void swr_svc_(CPU* c, u32 imm){
     if(reason&0x80000000u){ LOGV("svcBreak (notice) %x\n",reason); x[0]=0; return; }
     WARN("\n*** The game called svcBreak (reason=%x, info=%llx size=%llx) ***\n",reason,(unsigned long long)x[1],(unsigned long long)x[2]);
     if(x[1] && x[2]>=4 && x[2]<0x1000){ u8 tmp[64]; memcpy(tmp,GP(x[1]),x[2]<64?x[2]:64); WARN("  data: "); for(u64 i=0;i<(x[2]<64?x[2]:64);i++) WARN("%02x",tmp[i]); WARN("\n"); }
+    /* the service surface first: a NULL interface from a stubbed applet command
+       is what makes nnSdk panic later, far away from the actual gap */
+    svc_dump_census();
+    ipc_dump_stats();
     kernel_dump_regs(c);
     /* strings pointed to by regs, often the abort message */
     for(int r=0;r<31;r++){ u64 a=c->x[r]; if(a<0x10000 || a>=AS_SIZE-256) continue; MemBlock b; mem_query(a,&b);

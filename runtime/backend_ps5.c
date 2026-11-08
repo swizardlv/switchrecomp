@@ -36,7 +36,10 @@ extern int  sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferInde
 extern int  sceVideoOutSetFlipRate(int handle, int rate);
 extern int  sceVideoOutSubmitFlip(int handle, int bufferIndex, u32 flipMode, long flipArg);
 extern int  sceVideoOutWaitVblank(int handle);
-extern int  sceKernelGetDirectMemorySize(void);
+/* This returns int64_t. Declaring it "int" truncates 0x300000000 (12 GiB) to 0,
+   which made video_init believe the console had no direct memory and give up
+   before allocating frames -- one console run showed "direct memory 0 MiB". */
+extern int64_t sceKernelGetDirectMemorySize(void);
 extern int  sceKernelAllocateDirectMemory(long searchStart, long searchEnd, unsigned long length,
                                           unsigned long alignment, int memoryType,
                                           long* physicalAddress);
