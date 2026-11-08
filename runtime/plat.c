@@ -435,7 +435,16 @@ int plat_text_input(const u16* def, u16* out, int max){
    refused outright (confirmed on hardware: "Could not reserve 128 GB of virtual
    memory for the game."). Reserve pure virtual address space with
    sceKernelReserveVirtualRange() and commit pages on demand with mmap(MAP_FIXED)
-   -- the same pattern EglantinePS5 uses for its fastmem window. */
+   -- the same pattern EglantinePS5 uses for its fastmem window.
+
+   sceKernelReserveVirtualRange() also has a per-call size ceiling: on this
+   console 16 GiB succeeds (base 0x200200000), 32 GiB and 128 GiB fail with
+   0x8002000C. AS_SIZE is 128 GiB and every guest region is an offset into ONE
+   contiguous host reservation, so shrinking the layout would change guest-
+   visible addresses. Instead the window is reserved as N equal MAP_FIXED
+   segments (EglantinePS5's UnmapChunks / nxnative PoC two-segment fallback
+   pattern). Every call is logged so one console run reports the real ceiling
+   and the first segment that fails. */
 extern int   sceKernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment);
 extern int64_t sceKernelGetDirectMemorySize(void);
 #define SWR_PS5_VA_GRANULE 0x200000ull   /* 2 MiB, the PS5 "large page" */
@@ -445,6 +454,76 @@ static int ps5_reserve_at(void* want, u64 size, int flags, void** out){
   int rc = sceKernelReserveVirtualRange(&p, (size_t)size, flags, SWR_PS5_VA_GRANULE);
   if(out) *out = p;
   return rc;
+}
+
+/* Reserve [base, base+size) as a contiguous window. Returns the base or NULL.
+   Never leaves partial reservations behind. */
+static u8* ps5_reserve_window(u64 size){
+  void* base = NULL;
+  u64 chunk = 0;
+  /* Find the largest single call the kernel grants. The first success is kept
+     as segment 0 instead of being released and reserved again. */
+  for(u64 s = size; s >= (1ull<<30); s >>= 1){
+    void* hint = NULL;
+    int rc = ps5_reserve_at(NULL, s, 0, &hint);
+    LOG("mem:   reserve %6llu MiB -> rc=%d addr=%p\n",
+        (unsigned long long)(s>>20), rc, hint);
+    if(rc == 0 && hint && hint != MAP_FAILED){ base = hint; chunk = s; break; }
+  }
+  if(!base){
+    LOG("mem: no single reservation >= 1024 MiB succeeded\n");
+    return NULL;
+  }
+  if(chunk == size){
+    LOG("mem: window OK: 1 segment x %llu MiB at %p\n",
+        (unsigned long long)(chunk>>20), base);
+    return (u8*)base;
+  }
+  if(size % chunk){
+    LOG("mem: window FAILED: %llu MiB is not a multiple of the %llu MiB ceiling\n",
+        (unsigned long long)(size>>20), (unsigned long long)(chunk>>20));
+    munmap(base, (size_t)chunk);
+    return NULL;
+  }
+  u64 nseg = size / chunk;
+  for(u64 k = 1; k < nseg; ++k){
+    void* want = (void*)((u8*)base + k*chunk);
+    void* got = want;
+    int rc = ps5_reserve_at(want, chunk, MAP_FIXED, &got);
+    LOG("mem:   segment %llu/%llu want=%p got=%p rc=%d\n",
+        (unsigned long long)k, (unsigned long long)nseg, want, got, rc);
+    if(rc || got != want){
+      LOG("mem: window FAILED at segment %llu: %llu/%llu MiB reserved, releasing\n",
+          (unsigned long long)k, (unsigned long long)((k*chunk)>>20),
+          (unsigned long long)(size>>20));
+      munmap(base, (size_t)(k*chunk));
+      return NULL;
+    }
+  }
+  LOG("mem: window OK: %llu segments x %llu MiB = %llu MiB at %p..%p\n",
+      (unsigned long long)nseg, (unsigned long long)(chunk>>20),
+      (unsigned long long)(size>>20), base, (void*)((u8*)base+size));
+  /* Prove the full commit -> touch -> decommit -> re-reserve cycle on segment
+     0 before the guest starts using the window. One console run then covers
+     both the VA ceiling and the page-commit path. */
+  {
+    u64 probe = SWR_PS5_VA_GRANULE;
+    void* r = mmap(base, (size_t)probe, PROT_READ|PROT_WRITE,
+                   MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+    if(r == base){
+      volatile u8* p = (volatile u8*)base;
+      p[0] = 0x5A; p[probe-1] = 0xA5;
+      LOG("mem: commit selftest mmap=OK touch first=%02x last=%02x\n", p[0], p[probe-1]);
+      int mu = munmap(base, (size_t)probe);
+      void* again = base;
+      int rr = ps5_reserve_at(base, probe, MAP_FIXED, &again);
+      LOG("mem: decommit selftest munmap=%d re_reserve rc=%d addr=%p %s\n",
+          mu, rr, again, (!mu && !rr && again==base)? "OK" : "FAILED");
+    } else {
+      LOG("mem: commit selftest mmap(MAP_FIXED) FAILED got=%p errno=%d\n", r, errno);
+    }
+  }
+  return (u8*)base;
 }
 #endif
 
@@ -511,20 +590,9 @@ u8* plat_vm_reserve(u64 size){
   LOG("mem: mmap(PROT_NONE,MAP_ANON) -> %s errno=%d\n",
       p0==MAP_FAILED? "FAILED" : "OK", p0==MAP_FAILED? errno : 0);
   if(p0 != MAP_FAILED) return (u8*)p0;
-  void* p = NULL;
-  int rc = ps5_reserve_at(NULL, size, 0, &p);
-  LOG("mem: sceKernelReserveVirtualRange(%llu MiB, 2M granule) rc=%d addr=%p\n",
-      (unsigned long long)(size>>20), rc, p);
-  if(rc == 0 && p) return (u8*)p;
-  /* Never silently hand back a smaller AS_SIZE: report the largest reservation
-     the kernel would grant so the next change is driven by a measured number. */
-  for(u64 s = size>>1; s >= (4ull<<30); s >>= 1){
-    void* q = NULL;
-    int r2 = ps5_reserve_at(NULL, s, 0, &q);
-    LOG("mem:   probe %5llu MiB -> rc=%d addr=%p\n", (unsigned long long)(s>>20), r2, q);
-    if(r2 == 0 && q) munmap(q, (size_t)s);
-  }
-  return NULL;
+  /* OrbisOS refuses the whole 128 GiB in one call; build the same contiguous
+     window out of ceiling-sized MAP_FIXED segments instead. */
+  return ps5_reserve_window(size);
 #else
   void* p=mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); return p==MAP_FAILED? NULL : (u8*)p;
 #endif
