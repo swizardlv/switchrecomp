@@ -190,12 +190,19 @@ void romfs_init(void){
       fclose(cf);
     }
   }
-  /* (2) candidate NUP locations: internal dev path, then the USB games
-     directory (where the multi-GB dumps live), then a package-local copy. */
+  /* (2) candidate NUP locations.
+     PREFER a package-local copy (g_datadir/romfs.nup == /app0/swr_data/romfs.nup):
+     under the PS5 app sandbox /app0 is the ONLY path the app can actually
+     read through open()+pread(); the USB games folder is only stat()-visible,
+     pread() returns garbage there (the sandbox blocks cross-package I/O). The
+     games folder stays as a compatibility location for other dumps. */
+  char pkgnup[1200];
+  size_t dl = strlen(g_datadir);
+  while(dl>0 && g_datadir[dl-1]=='/') dl--;
+  snprintf(pkgnup,sizeof pkgnup,"%.*s/romfs.nup",(int)dl,g_datadir);
   static const char* cand[] = {
-    "/data/switchrecomp/romfs.nup",
+    pkgnup,
     "/mnt/usb1/games/Donkey Kong BananzaUpdate3.2.0DLC.nup",
-    "/app0/swr_data/romfs.nup",
     NULL };
   for(int i=0; cand[i]; i++){
     u64 z=plat_file_size(cand[i]);
@@ -207,11 +214,6 @@ void romfs_init(void){
       return;
     }
     nup_close();
-  }
-  { /* direct open() probe: sandbox/path reachability check */
-    const char* pp[] = {"/mnt/usb1/games/Donkey Kong BananzaUpdate3.2.0DLC.nup",
-                        "/mnt/usb1/PPSA99201/eboot.bin", NULL};
-    for(int i=0; pp[i]; i++){ int fd=open(pp[i],O_RDONLY); LOG("RomFS: openprobe %s fd=%d errno=%d\n", pp[i], fd, errno); if(fd>=0) close(fd); }
   }
   if(g_romfs_dir_override[0] && plat_is_dir(g_romfs_dir_override)){ LOG("RomFS: %s\n",g_romfs_dir_override); romfs_build(g_romfs_dir_override); return; }
   snprintf(p,sizeof p,"%sromfs.bin",g_datadir); rraw=fopen(p,"rb");
