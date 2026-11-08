@@ -507,6 +507,46 @@ void ps5_free_large(void* p, u64 size){
       (unsigned long long)(aligned>>20),rc);
 }
 
+/* ---- 2 MiB-granule commit tracking -------------------------------------
+   sceKernelReserveVirtualRange() reserves the window with 2 MiB alignment,
+   and OrbisOS only accepts MAP_FIXED anonymous commits on those boundaries.
+   Measured on hardware: a 4 KiB-aligned 36 MiB commit at 0x1008021000
+   (guest base 0x8021000, which is not a granule boundary) returns EINVAL(22),
+   while the 128 KiB rtld commit at 0x1008000000 succeeds. EglantinePS5's
+   MapChunks and the nxnative PoC both commit whole Granule-sized chunks.
+   Track which granules already have a mapping so a later commit for a
+   neighbouring guest page does not replace an existing mapping (which would
+   silently reset its mprotect permissions). */
+#define SWR_PS5_MAX_GRANULES 65536u          /* 128 GiB / 2 MiB */
+static u8* g_ps5_win;
+static u64 g_ps5_win_size;
+static u8  g_ps5_commit[SWR_PS5_MAX_GRANULES/8];
+
+static void ps5_window_set(u8* base, u64 size){
+  g_ps5_win=base; g_ps5_win_size=size;
+  memset(g_ps5_commit,0,sizeof g_ps5_commit);
+}
+
+static int ps5_commit_granule(void* a){
+  u64 G=SWR_PS5_VA_GRANULE;
+  void* r=mmap(a,(size_t)G,PROT_READ|PROT_WRITE,
+               MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+  if(r!=MAP_FAILED) return 0;
+  int e=errno;
+  /* Fallback: explicitly allocate a physical large page and map it fixed --
+     the EglantinePS5 MapChunks path. Logged so one run tells us whether the
+     alignment assumption or the allocator was the problem. */
+  int64_t phys=-1, total=sceKernelGetDirectMemorySize();
+  int rc=sceKernelAllocateDirectMemory(0,total,(size_t)G,G,12,&phys);
+  void* q=a;
+  int mr = rc ? rc : sceKernelMapDirectMemory(&q,(size_t)G,
+                  PROT_READ|PROT_WRITE,MAP_FIXED,phys,G);
+  LOG("mem: commit fallback at %p: mmap errno=%d direct rc=%d phys=%lld map rc=%d addr=%p\n",
+      a,e,rc,(long long)phys,mr,q);
+  if(mr || q!=a){ if(!rc && phys>=0) sceKernelReleaseDirectMemory(phys,(size_t)G); return -1; }
+  return 0;
+}
+
 /* Reserve [base, base+size) as ONE contiguous window.
    Hardware probe tools/ps5/ps5_va_probe.c (2026-11-08) settled the question:
      hint=NULL / 0x300000000        -> 16 GiB ok, 32 GiB+ rc=0x8002000C
@@ -646,11 +686,11 @@ u8* plat_vm_reserve(u64 size){
   void* p0 = mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
   LOG("mem: mmap(PROT_NONE,MAP_ANON) -> %s errno=%d\n",
       p0==MAP_FAILED? "FAILED" : "OK", p0==MAP_FAILED? errno : 0);
-  if(p0 != MAP_FAILED) return (u8*)p0;
+  if(p0 != MAP_FAILED){ ps5_window_set((u8*)p0,size); return (u8*)p0; }
   /* Plain mmap cannot back 128 GiB here (ENOMEM) and the 0x40 MAP_NORESERVE
      bit is rejected (EINVAL). Keep this attempt as a durable diagnostic,
      then use the high-hint reserve path. */
-  return ps5_reserve_window(size);
+  { u8* r=ps5_reserve_window(size); if(r) ps5_window_set(r,size); return r; }
 #else
   void* p=mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); return p==MAP_FAILED? NULL : (u8*)p;
 #endif
@@ -660,12 +700,36 @@ void plat_vm_readonly(u8* p, u64 size){ mprotect(p,size,PROT_READ); }
 
 int plat_vm_commit(u8* p, u64 size){
 #ifdef SWR_PS5
-  /* sceKernelReserveVirtualRange only reserves VA; mprotect alone would leave
-     no backing pages. Replace the slice with a real anonymous mapping. */
-  void* r = mmap(p,(size_t)size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
-  if(r==MAP_FAILED){
-    static int said; if(!said){ said=1; LOG("mem: commit mmap(MAP_FIXED) %llu KiB at %p FAILED errno=%d\n",
-                                            (unsigned long long)(size>>10),(void*)p,errno); }
+  if(!size) return 0;
+  const u64 G=SWR_PS5_VA_GRANULE;
+  u64 lo=(u64)(uintptr_t)p, hi=lo+size;
+  u64 a0=lo & ~(G-1), a1=(hi+G-1)&~(G-1);
+  u64 win=(u64)(uintptr_t)g_ps5_win;
+  int made=0, reused=0, failed=0;
+  for(u64 a=a0; a<a1; a+=G){
+    if(!win || a<win || a>=win+g_ps5_win_size){ ++failed; break; }
+    u64 idx=(a-win)/G;
+    if(idx>=SWR_PS5_MAX_GRANULES){ ++failed; break; }
+    if(g_ps5_commit[idx>>3] & (u8)(1u<<(idx&7))){ ++reused; continue; }
+    if(ps5_commit_granule((void*)a)){
+      if(!failed) LOG("mem: commit granule mmap(%p,%llu KiB) FAILED errno=%d\n",
+                      (void*)a,(unsigned long long)(G>>10),errno);
+      ++failed; break;
+    }
+    g_ps5_commit[idx>>3]|=(u8)(1u<<(idx&7));
+    ++made;
+  }
+  { static u32 calls=0; ++calls;
+    if(failed || made || calls<=32)
+      LOG("mem: commit %llu KiB at %p -> granules %llx..%llx made=%d reused=%d failed=%d\n",
+          (unsigned long long)(size>>10),(void*)p,(unsigned long long)a0,
+          (unsigned long long)a1,made,reused,failed); }
+  if(failed) return -1;
+  /* Exact 4 KiB protection for just the requested slice. Newly mapped
+     granules are already RW; this also restores previously PROT_NONE slices. */
+  if(mprotect(p,(size_t)size,PROT_READ|PROT_WRITE)){
+    static int said; if(!said){ said=1; LOG("mem: commit mprotect(%p,%llu) FAILED errno=%d\n",
+                                            (void*)p,(unsigned long long)size,errno); }
     return -1;
   }
   return 0;
@@ -677,10 +741,14 @@ int plat_vm_commit(u8* p, u64 size){
 void plat_vm_decommit(u8* p, u64 size){
 #ifdef SWR_PS5
   if(!size) return;
-  munmap(p,(size_t)size);
-  void* q = p;
-  int rc = ps5_reserve_at(p, size, MAP_FIXED, &q);
-  if(rc || q != p){ static int said; if(!said){ said=1; LOG("mem: decommit re-reserve FAILED rc=%d\n",rc); } }
+  /* Keep the granule mapping: a neighbouring guest page may share that 2 MiB
+     block, and munmap()-ing it would destroy that page. Discard the backing
+     pages and drop protection instead; the next commit reuses the granule and
+     only mprotect()s the slice back to RW. */
+  int ma=madvise(p,(size_t)size,MADV_DONTNEED);
+  int mp=mprotect(p,(size_t)size,PROT_NONE);
+  LOG("mem: decommit %llu KiB at %p madvise=%d mprotect=%d errno=%d\n",
+      (unsigned long long)(size>>10),(void*)p,ma,mp,errno);
 #else
   madvise(p,size,MADV_DONTNEED); mprotect(p,size,PROT_NONE);
 #endif
