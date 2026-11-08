@@ -428,6 +428,26 @@ int plat_text_input(const u16* def, u16* out, int max){
 #define MAP_NORESERVE 0
 #endif
 
+#ifdef SWR_PS5
+/* OrbisOS (FreeBSD 9 derived) never implemented MAP_NORESERVE: its sys/mman.h
+   calls the old bit MAP_RESERVED0040. A MAP_ANONYMOUS reservation is therefore
+   checked against physical memory + swap, so the 128 GB guest address space is
+   refused outright (confirmed on hardware: "Could not reserve 128 GB of virtual
+   memory for the game."). Reserve pure virtual address space with
+   sceKernelReserveVirtualRange() and commit pages on demand with mmap(MAP_FIXED)
+   -- the same pattern EglantinePS5 uses for its fastmem window. */
+extern int   sceKernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment);
+extern int64_t sceKernelGetDirectMemorySize(void);
+#define SWR_PS5_VA_GRANULE 0x200000ull   /* 2 MiB, the PS5 "large page" */
+
+static int ps5_reserve_at(void* want, u64 size, int flags, void** out){
+  void* p = want;
+  int rc = sceKernelReserveVirtualRange(&p, (size_t)size, flags, SWR_PS5_VA_GRANULE);
+  if(out) *out = p;
+  return rc;
+}
+#endif
+
 void pm_init(PMutex* m){ pthread_mutex_init(&m->l,NULL); }
 
 void pm_lock(PMutex* m){ pthread_mutex_lock(&m->l); }
@@ -483,12 +503,62 @@ int g_ww_ok;
 
 int plat_ww_collect(u8* base, u64 size, void (*cb)(u64)){ (void)base; (void)size; (void)cb; return -1; }
 
-u8* plat_vm_reserve(u64 size){ void* p=mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); return p==MAP_FAILED? NULL : (u8*)p; }
+u8* plat_vm_reserve(u64 size){
+#ifdef SWR_PS5
+  LOG("mem: PS5 direct memory %lld MiB, requesting %llu MiB of VA\n",
+      (long long)(sceKernelGetDirectMemorySize()>>20), (unsigned long long)(size>>20));
+  void* p0 = mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+  LOG("mem: mmap(PROT_NONE,MAP_ANON) -> %s errno=%d\n",
+      p0==MAP_FAILED? "FAILED" : "OK", p0==MAP_FAILED? errno : 0);
+  if(p0 != MAP_FAILED) return (u8*)p0;
+  void* p = NULL;
+  int rc = ps5_reserve_at(NULL, size, 0, &p);
+  LOG("mem: sceKernelReserveVirtualRange(%llu MiB, 2M granule) rc=%d addr=%p\n",
+      (unsigned long long)(size>>20), rc, p);
+  if(rc == 0 && p) return (u8*)p;
+  /* Never silently hand back a smaller AS_SIZE: report the largest reservation
+     the kernel would grant so the next change is driven by a measured number. */
+  for(u64 s = size>>1; s >= (4ull<<30); s >>= 1){
+    void* q = NULL;
+    int r2 = ps5_reserve_at(NULL, s, 0, &q);
+    LOG("mem:   probe %5llu MiB -> rc=%d addr=%p\n", (unsigned long long)(s>>20), r2, q);
+    if(r2 == 0 && q) munmap(q, (size_t)s);
+  }
+  return NULL;
+#else
+  void* p=mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); return p==MAP_FAILED? NULL : (u8*)p;
+#endif
+}
 
 void plat_vm_readonly(u8* p, u64 size){ mprotect(p,size,PROT_READ); }
-int plat_vm_commit(u8* p, u64 size){ return mprotect(p,size,PROT_READ|PROT_WRITE); }
 
-void plat_vm_decommit(u8* p, u64 size){ madvise(p,size,MADV_DONTNEED); mprotect(p,size,PROT_NONE); }
+int plat_vm_commit(u8* p, u64 size){
+#ifdef SWR_PS5
+  /* sceKernelReserveVirtualRange only reserves VA; mprotect alone would leave
+     no backing pages. Replace the slice with a real anonymous mapping. */
+  void* r = mmap(p,(size_t)size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+  if(r==MAP_FAILED){
+    static int said; if(!said){ said=1; LOG("mem: commit mmap(MAP_FIXED) %llu KiB at %p FAILED errno=%d\n",
+                                            (unsigned long long)(size>>10),(void*)p,errno); }
+    return -1;
+  }
+  return 0;
+#else
+  return mprotect(p,size,PROT_READ|PROT_WRITE);
+#endif
+}
+
+void plat_vm_decommit(u8* p, u64 size){
+#ifdef SWR_PS5
+  if(!size) return;
+  munmap(p,(size_t)size);
+  void* q = p;
+  int rc = ps5_reserve_at(p, size, MAP_FIXED, &q);
+  if(rc || q != p){ static int said; if(!said){ said=1; LOG("mem: decommit re-reserve FAILED rc=%d\n",rc); } }
+#else
+  madvise(p,size,MADV_DONTNEED); mprotect(p,size,PROT_NONE);
+#endif
+}
 
 #ifdef SWR_PS5
 /* Native titles are statically linked: load_code() takes the swr_module_static
