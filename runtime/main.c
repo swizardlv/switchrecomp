@@ -176,6 +176,12 @@ const RtAPI g_rtapi={swr_svc,rt_undef,rt_note_hint,rt_ticks,rt_brk,rt_fpcr,rt_se
 void crash_report(void* host_pc, void* fault, int sig){
   KThread* t=kthread_cur();
   u64 ga=(u64)((u8*)fault-g_mem);
+  /* Mirror the crash signature to the independent fsync-backed diag file so it
+     survives even if the buffered log is lost. */
+  { extern void romfs_diag(const char*); char b[128];
+    snprintf(b,sizeof b,"CRASH sig=%d host_pc=%p fault=%p ga=%llx\n",sig,host_pc,fault,(unsigned long long)ga); romfs_diag(b); }
+  { extern char g_diag_manopen_dir[]; char b[2048];
+    snprintf(b,sizeof b,"LAST_MANOPEN=%s\n",g_diag_manopen_dir); romfs_diag(b); }
   logf_(0,"\n*** Crash (signal %d) at host pc=%p, access to %p (game address %llx) ***\n",sig,host_pc,fault,(unsigned long long)ga);
 #ifdef SWR_PS5
   swr_dump_bad_calls();

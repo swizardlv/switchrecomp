@@ -18,7 +18,7 @@ import argparse, glob, json, os, re, shutil, subprocess, sys, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', 'svc_fs', 'svc_vi',
-               'nvdrv', 'gpu', 'gpu_engines', 'gpu_3d', 'loader', 'main']
+               'nvdrv', 'gpu', 'gpu_engines', 'gpu_3d', 'loader', 'main', 'nup_ps5']
 # glibc_compat.c is Linux-only: it defines fmod/fmodf, which would become
 # application exports in .dynsym and the FSELF converter rejects those.
 EXTRA = ['gpu_nogl', 'shader_proc', 'host1x', 'snxvk_glue',
@@ -64,6 +64,10 @@ int main(int argc, char** argv, char** envp){
 DEFAULT_SDK = '/data/code/EglantinePS5-build56/.deps/lapy-ps5-payload-sdk-v0.42'
 DEFAULT_LLVM = '/data/toolchains/llvm-23.1.4/bin/llvm-config'
 DEFAULT_BOILER = '/data/code/ps5-native-app-boilerplate'
+
+# zstd (used by the NUP romfs reader) from the PS5 payload SDK bundled with EglantinePS5.
+ZSTD_INC = '/data/code/EglantinePS5-build56/.deps/pacbrew-0.40.2/opt/ps5-payload-sdk/target/user/homebrew/include'
+ZSTD_LIB = '/data/code/EglantinePS5-build56/.deps/pacbrew-0.40.2/opt/ps5-payload-sdk/target/user/homebrew/lib/libzstd.a'
 DEFAULT_SIGNER = '/data/switchrecomp/tools/native-tool/ps5-native-tool'
 
 STAGES = ['env', 'runtime', 'link', 'convert', 'sign', 'package', 'verify']
@@ -200,6 +204,7 @@ def compile_one(job):
            '-I', os.path.join(repo, 'runtime', 'spvc'),
            '-I', os.path.join(repo, 'runtime', 'oh264', 'include'),
            '-I', os.path.join(repo, 'runtime', 'opus', 'include'),
+           '-I', ZSTD_INC,
            '-c', src, '-o', obj]
     t0 = time.time()
     try:
@@ -259,7 +264,8 @@ def link_pie(run, a, env, envinfo, rt_objs, extra_objs, archive, outpath):
     lld = os.path.join(a.sdk, 'bin', 'prospero-lld')
     stubs = sorted(glob.glob(os.path.join(a.sdk, 'target', 'lib', '*.so')))
     cmd = [lld, '-T', envinfo['linker_script'], '--eh-frame-hdr',
-           '--version-script', envinfo['symbol_map'], '-e', '_start', '-o', outpath]
+           '--version-script', envinfo['symbol_map'], '-e', '_start', '-o', outpath,
+           '--exclude-libs', 'ALL', ZSTD_LIB]
     cmd += ['-u', 'swr_module_static']   # force the static hook even if archive-only
     cmd += list(extra_objs) + list(rt_objs)
     if archive:
@@ -276,7 +282,7 @@ def link_pie(run, a, env, envinfo, rt_objs, extra_objs, archive, outpath):
             # objects.rsp already contains every game object (including
             # module.o), so extra_objs must not be repeated here. Its entries
             # are relative to the build dir -> run lld with that cwd.
-            cmd2 += list(rt_objs) + ['@' + os.path.basename(rsp), '--as-needed'] + stubs
+            cmd2 += ['--exclude-libs', 'ALL', ZSTD_LIB] + list(rt_objs) + ['@' + os.path.basename(rsp), '--as-needed'] + stubs
             r = run.cmd(cmd2, env=env, cwd=os.path.dirname(rsp), label='link-pie-direct')
     if r['rc']:
         run.issue('LINK_FAILED', (r['err'] or r['out'])[-2000:])

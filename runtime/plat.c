@@ -785,45 +785,92 @@ typedef struct { DIR* d; char path[1024]; int* idx; int n, i; } PD_;
    totals so the two views can be compared from swr.log alone. */
 typedef struct { char* dir; char* name; int is_dir; u64 size; } ManEnt;
 static ManEnt* g_man; static int g_nman, g_cman, g_man_loaded;
+char g_diag_manopen_dir[2048]; void* g_man_mmap; long g_man_msz;
+
+/* Independent, fsync-backed diagnostic so romfs events survive a hard crash
+   (LOG may be buffered and lost on _exit).  Appended to a separate file; the
+   first call each run truncates so a fresh boot starts clean. */
+void romfs_diag(const char* m){
+  static int first=1;
+  FILE* f=fopen("/data/switchrecomp/romfs_diag.log", first? "w":"a");
+  first=0;
+  if(f){ fwrite(m,1,strlen(m),f); fflush(f); fsync(fileno(f)); fclose(f); }
+}
 
 static void man_load(void){
+  { char b[64]; snprintf(b,sizeof b,"MAN_LOAD_ENTER g_man_loaded=%d\n", g_man_loaded); romfs_diag(b); }
   if(g_man_loaded) return; g_man_loaded=1;
-  /* OrbisOS refuses opendir() on the read-only /app0 mount, so a build-time
-     manifest of the deployed package replaces directory enumeration.  The
-     package is deployed on the USB drive at /mnt/usb1/PPSA99201, and the
-     manifest lives there as romfs_manifest.txt.  A single, well-known path
-     keeps deployment simple (one place: the USB drive). */
   const char* path="/mnt/usb1/PPSA99201/romfs_manifest.txt";
   FILE* f=fopen(path,"rb");
+  { char b[128]; snprintf(b,sizeof b,"MAN_LOAD_OPEN path=%s ok=%d errno=%d\n",path,!!f,errno); romfs_diag(b); }
   if(!f){ LOG("romfs: manifest not found at %s (errno=%d)\n",path,errno); return; }
-  char ln[8192]; int lines=0, ndir=0, nfile=0; u64 total=0;
-  while(fgets(ln,sizeof ln,f)){
-    lines++;
-    char* a=ln, *b=strchr(a,'\t'); if(!b) continue; *b++=0;
-    char* c2=strchr(b,'\t');       if(!c2) continue; *c2++=0;
-    char* d2=strchr(c2,'\t');      if(!d2) continue; *d2++=0;
-    char* nl=strchr(d2,'\n'); if(nl) *nl=0;
-    int isdir=(a[0]=='D'||a[0]=='d'); u64 size=strtoull(d2,NULL,10);
-    if(g_nman==g_cman){ g_cman=g_cman? g_cman*2 : 4096; g_man=realloc(g_man,sizeof(ManEnt)*g_cman); }
-    g_man[g_nman].dir=strdup(b); g_man[g_nman].name=strdup(c2);
+  /* Map the manifest privately: fields are NUL-terminated in place (copy-on-
+     write) so we keep zero heap-allocated string copies.  The entry array is
+     taken from an anonymous mapping, so the ENTIRE manifest lives outside the
+     libc heap.  This avoids both the realloc() growth that previously returned
+     NULL at 65536 entries and the ~75k strdup() calls that fragmented the
+     allocator.  Measured crash was a NULL g_man written at offset 65536*32 =
+     0x200000, i.e. exactly the fault address. */
+  fseek(f,0,SEEK_END); long sz=(long)ftell(f); fseek(f,0,SEEK_SET);
+  int fd=fileno(f);
+  char* m=mmap(NULL,(size_t)(sz>0?sz:1),PROT_READ|PROT_WRITE,MAP_PRIVATE,fd,0);
+  fclose(f);
+  if(m==MAP_FAILED){ LOG("romfs: mmap(%s) failed errno=%d\n",path,errno); return; }
+  g_man_mmap=m; g_man_msz=sz;
+  /* Pass 1: count lines so the array is allocated exactly once (no realloc). */
+  long n=0; for(long i=0;i<sz;i++) if(m[i]=='\n') n++;
+  g_nman=0; g_cman=(int)n+1;
+  g_man=mmap(NULL,sizeof(ManEnt)*(size_t)g_cman,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+  if(g_man==MAP_FAILED){ LOG("romfs: anon mmap for %d entries failed errno=%d\n",g_cman,errno);
+    munmap(m,(size_t)sz); return; }
+  { char b[80]; snprintf(b,sizeof b,"MAN_MAP n=%ld cman=%d man=%p mmap=%p\n",n,g_cman,(void*)g_man,(void*)m); romfs_diag(b); }
+  /* Pass 2: parse in place, pointing dir/name straight into the mapping. */
+  char* p=m; char* end=m+sz; int lines=0,ndir=0,nfile=0; u64 total=0;
+  while(p<end){
+    char* nl=memchr(p,'\n',(size_t)(end-p));
+    char* line_end=nl? nl:end;
+    if(nl) *nl='\0';
+    char* a=p; char* d=strchr(a,'\t'); if(!d){ p=line_end+1; continue; } *d++='\0';
+    char* nm=strchr(d,'\t'); if(!nm){ p=line_end+1; continue; } *nm++='\0';
+    char* szp=strchr(nm,'\t'); if(!szp){ p=line_end+1; continue; } *szp++='\0';
+    int isdir=(a[0]=='D'||a[0]=='d'); u64 size=strtoull(szp,NULL,10);
+    g_man[g_nman].dir=d; g_man[g_nman].name=nm;
     g_man[g_nman].is_dir=isdir; g_man[g_nman].size=size; g_nman++;
     if(isdir) ndir++; else { nfile++; total+=size; }
+    lines++;
+    if((lines%10000)==0){ char bb[48]; snprintf(bb,sizeof bb,"MAN_ITER lines=%d nman=%d\n",lines,g_nman); romfs_diag(bb); }
+    p=line_end+1;
   }
-  fclose(f);
   LOG("romfs: manifest %s -> %d lines, %d entries (%d dirs, %d files, %.2f GiB)\n",
       path,lines,g_nman,ndir,nfile,(double)total/1073741824.0);
+  { char b[96]; snprintf(b,sizeof b,"MAN_LOAD_DONE lines=%d nman=%d ndir=%d nfile=%d\n",lines,g_nman,ndir,nfile); romfs_diag(b); }
 }
 
 static int man_open(const char* path, PD_* p){
+  snprintf(g_diag_manopen_dir,sizeof g_diag_manopen_dir,"%s",path);
+  { static int c; if((c++%50)==0){ char b[1200]; snprintf(b,sizeof b,"MANOPEN dir=%s\n",path); romfs_diag(b); } }
+  romfs_diag("MANOPEN_ENTER\n");
   man_load();
   p->idx=NULL; p->n=0; p->i=0;
   if(!g_nman) return 0;
-  for(int i=0;i<g_nman;i++) if(!strcmp(g_man[i].dir,path)){
-    if(p->n==0) p->idx=malloc(sizeof(int)*64);
-    else if(!(p->n&63)) p->idx=realloc(p->idx,sizeof(int)*(p->n+64));
-    p->idx[p->n++]=i; }
+  /* Count matches first, then allocate the index exactly once (no realloc
+     growth) -- the previous realloc() loop was the prime suspect for the
+     PS5 libc heap corruption that crashed ~1300 dirs into romfs enumeration. */
+  int cnt=0;
+  for(int i=0;i<g_nman;i++){
+    char* dp=g_man[i].dir;
+    if(dp<(char*)g_man_mmap || dp>=(char*)g_man_mmap+g_man_msz){ romfs_diag("BAD_DIR_ABORT\n"); break; }
+    if(!strcmp(dp,path)) cnt++;
+  }
+  if(!cnt) return 0;
+  p->idx=malloc(sizeof(int)*(size_t)cnt);
+  if(!p->idx){ LOG("romfs: man_open idx malloc(%d) failed\n",cnt); return 0; }
+  p->n=0;
+  for(int i=0;i<g_nman;i++) if(!strcmp(g_man[i].dir,path)) p->idx[p->n++]=i;
+  { static int d; if(d<6){ d++; char b[128]; snprintf(b,sizeof b,"MANOPEN_DONE n=%d path=%s\n",p->n,path); romfs_diag(b); } }
   return p->n>0;
 }
+
 #endif
 
 int plat_dir_open(PDir* d, const char* path){
@@ -832,9 +879,11 @@ int plat_dir_open(PDir* d, const char* path){
   /* One console run has to tell us whether /app0 supports directory
      enumeration at all; log the first few opens, not all 75k files. */
   { static int nopen; if(nopen<3){ nopen++; LOG("romfs: opendir(%s) -> %p errno=%d\n",path,(void*)p->d,p->d? 0 : errno); } }
-  if(!p->d && man_open(path,p)){
-    { static int nman; if(nman<3){ nman++; LOG("romfs: manifest dir %s -> %d entries\n",path,p->n); } }
-    strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
+  if(!p->d){
+    romfs_diag("PDIR_OPEN_FAILED_WILL_MANOPEN\n");
+    if(man_open(path,p)){
+      { static int nman; if(nman<3){ nman++; LOG("romfs: manifest dir %s -> %d entries\n",path,p->n); } }
+      strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; } }
 #endif
   if(!p->d){ free(p->idx); free(p); return -1; }
   strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
