@@ -771,11 +771,35 @@ int plat_is_dir(const char* p){ struct stat s; return !stat(p,&s) && S_ISDIR(s.s
 
 typedef struct { DIR* d; char path[1024]; } PD_;
 
-int plat_dir_open(PDir* d, const char* path){ PD_* p=malloc(sizeof *p); p->d=opendir(path); if(!p->d){ free(p); return -1; } strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
+int plat_dir_open(PDir* d, const char* path){ PD_* p=malloc(sizeof *p); p->d=opendir(path);
+#ifdef SWR_PS5
+  /* One console run has to tell us whether /app0 supports directory
+     enumeration at all; log the first few opens, not all 75k files. */
+  { static int nopen; if(nopen<3){ nopen++; LOG("romfs: opendir(%s) -> %p errno=%d\n",path,(void*)p->d,p->d? 0 : errno); } }
+#endif
+  if(!p->d){ free(p); return -1; } strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
 
 int plat_dir_next(PDir* d){ PD_* p=d->h; struct dirent* e;
   while((e=readdir(p->d))){ if(!strcmp(e->d_name,".")||!strcmp(e->d_name,"..")) continue; strncpy(d->name,e->d_name,511); d->name[511]=0;
-    char f[1600]; snprintf(f,sizeof f,"%s/%s",p->path,e->d_name); struct stat s; if(stat(f,&s)) continue; d->is_dir=S_ISDIR(s.st_mode); d->size=(u64)s.st_size; return 1; }
+    char f[1600]; snprintf(f,sizeof f,"%s/%s",p->path,e->d_name); struct stat s;
+    if(stat(f,&s)){
+#ifdef SWR_PS5
+      /* OrbisOS' /app0 mount can refuse stat() on individual package files
+         even though fopen()/opendir() work. Dropping those entries silently
+         produced "RomFS: 1 folders, 0 files" on real hardware. Classify with
+         opendir() and read the size with fseek/ftell instead. */
+      { static int said; if(!said){ said=1; LOG("romfs: stat(%s) FAILED errno=%d -> fallback\n",f,errno); } }
+      DIR* t=opendir(f);
+      if(t){ closedir(t); d->is_dir=1; d->size=0; return 1; }
+      FILE* fp=fopen(f,"rb"); if(!fp) continue;
+      if(fseek(fp,0,SEEK_END)){ fclose(fp); continue; }
+      long sz=ftell(fp); fclose(fp); if(sz<0) continue;
+      d->is_dir=0; d->size=(u64)sz; return 1;
+#else
+      continue;
+#endif
+    }
+    d->is_dir=S_ISDIR(s.st_mode); d->size=(u64)s.st_size; return 1; }
   return 0; }
 
 void plat_dir_close(PDir* d){ PD_* p=d->h; closedir(p->d); free(p); }

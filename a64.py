@@ -519,13 +519,26 @@ def _(g):
         if L: return g.setX('rt', 'ldx(c,M,%s,%d)' % (A, size))
         return g.setW('rs', 'stx(c,M,%s,%d,%s)' % (A, size, g.X('rt')))
     if not o2 and o1:
-        if size < 2: return None
+        if size < 2:
+            # ARMv8.1 CASP/CASPA/CASPL/CASPAL: a PAIR of W (size 0) or X
+            # (size 1) registers. LDXP/STXP only exist for size 2/3, so these
+            # encodings used to produce undef(). Rs/Rs+1 hold the expected pair
+            # and receive the loaded pair, Rt/Rt+1 are stored on success. Rs
+            # must be even. bit22 = A, bit15 = L; the SEQ_CST helper covers
+            # both orderings, so neither needs to be specialised.
+            if g.known('rs') and (g.v('rs') & 1): return None
+            return 'swr_casp(c,M,%s,%s,%s,%s);' % (A, g.f('rs'), g.f('rt'), g.f('size'))
         if L: return '{ u64 v1_,v2_; ldxp(c,M,%s,%d,&v1_,&v2_); %s %s }' % (A, size, g.setX('rt', 'v1_'), g.setX('rt2', 'v2_'))
         return g.setW('rs', 'stxp(c,M,%s,%d,%s,%s)' % (A, size, g.X('rt'), g.X('rt2')))
     if o2 and not o1:
         if L: return g.setX('rt', '*(volatile %s*)MP(%s)' % (['u8', 'u16', 'u32', 'u64'][size], A))
         return '{ %s(%s,%s); SWR_FENCE(); }' % (WR[size], A, g.X('rt'))
-    return None
+    # ARMv8.1 CAS/CASA/CASL/CASAL (o2=1, o1=1). Rs is BOTH the expected value
+    # and the destination for the loaded value, Rt is the value stored on
+    # success. bit22 = A (acquire), bit15 = L (release); a SEQ_CST CAS is a
+    # strict superset of both on every host we support. The helper takes
+    # register indices (not values) because it has to write Rs back.
+    return 'swr_cas(c,M,%s,%s,%s,%s);' % (A, g.f('rs'), g.f('rt'), g.f('size'))
 
 
 # ------------------------------------------------------------------ ARMv8.1 / 8.3 (Switch 2, system 22+)

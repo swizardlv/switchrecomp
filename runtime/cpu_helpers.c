@@ -289,6 +289,66 @@ u64 swr_lse(u8* M, u64 a, u64 v, int size, int op){
 }
 #undef SWR_LSE_CASE
 
+/* ---- ARMv8.1 LSE CAS / CASP ---------------------------------------------
+   The LDSTX encodings with o2=1,o1=1 are CAS/CASA/CASL/CASAL and the ones
+   with o2=0,o1=1,size<2 are CASP/CASPA/CASPL/CASPAL. Both used to be emitted
+   as c->rt->undef() and killed the guest the first time a Nintendo SDK
+   critical section was entered (nn::os::detail::InternalCriticalSection...).
+   Unlike swr_lse(), CAS must write the loaded value back into Rs, so these
+   helpers take CPU* plus register *indices* rather than register values.
+   Reuse the swr_casN primitives (defined for gcc/clang and tcc above), which
+   also avoids any libatomic dependency in the FSELF link. */
+static u64 swr_cas_loaded(u8* M, u64 a, int size, u64 expect, u64 newv){
+  static const u64 m_[4]={0xFFull,0xFFFFull,0xFFFFFFFFull,0xFFFFFFFFFFFFFFFFull};
+  expect &= m_[size&3]; newv &= m_[size&3];
+#define SWR_CAS_CASE(T, CASFN) do { \
+    T* p_=(T*)(M+a); T o_; \
+    for(;;){ o_=*(volatile T*)p_; \
+             if((u64)o_!=expect) return (u64)o_; \
+             if(CASFN(p_,o_,(T)newv)) return (u64)o_; } \
+  } while(0)
+  switch(size&3){
+    case 0: SWR_CAS_CASE(u8,  swr_cas8);
+    case 1: SWR_CAS_CASE(u16, swr_cas16);
+    case 2: SWR_CAS_CASE(u32, swr_cas32);
+    default:SWR_CAS_CASE(u64, swr_cas64);
+  }
+#undef SWR_CAS_CASE
+  return 0;
+}
+
+void swr_cas(CPU* c, u8* M, u64 a, int rs, int rt, int size){
+  u64 e = rs==31? 0 : c->x[rs];
+  u64 n = rt==31? 0 : c->x[rt];
+  u64 o = swr_cas_loaded(M,a,size,e,n);   /* zero-extended for size < 3 */
+  if(rs!=31) c->x[rs]=o;
+}
+
+void swr_casp(CPU* c, u8* M, u64 a, int rs, int rt, int size){
+  int r1=(rs+1)&31, t1=(rt+1)&31;
+  u64 o0=rs==31?0:c->x[rs], o1=r1==31?0:c->x[r1];
+  u64 n0=rt==31?0:c->x[rt], n1=t1==31?0:c->x[t1];
+  u64* p=(u64*)(M+a);
+  if(size&1){
+    /* two X registers: 16-byte atomic CAS. swr_cas128 does not report the
+       loaded pair, so reload on failure; the pair only changes on success. */
+    for(;;){
+      u64 c0=*(volatile u64*)&p[0], c1=*(volatile u64*)&p[1];
+      if(c0!=o0 || c1!=o1){ o0=c0; o1=c1; break; }
+      if(swr_cas128(p,c0,c1,n0,n1)) break;
+    }
+  } else {
+    /* two W registers: one 8-byte CAS. swr_cas_loaded returns the pair it
+       observed, which is exactly what Rs/Rs+1 must receive. */
+    u64 e=((u64)(u32)o0)|((u64)(u32)o1<<32);
+    u64 n=((u64)(u32)n0)|((u64)(u32)n1<<32);
+    u64 o=swr_cas_loaded(M,a,3,e,n);
+    o0=(u32)o; o1=(u32)(o>>32);
+  }
+  if(rs!=31) c->x[rs]=o0;
+  if(r1!=31) c->x[r1]=o1;
+}
+
 /* ================================================================ system */
 #define SYSREG(op0,op1,crn,crm,op2) ((((op0)&1)<<14)|((op1)<<11)|((crn)<<7)|((crm)<<3)|(op2))
 
