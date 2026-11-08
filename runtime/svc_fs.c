@@ -200,7 +200,7 @@ void romfs_init(void){
   size_t dl = strlen(g_datadir);
   while(dl>0 && g_datadir[dl-1]=='/') dl--;
   snprintf(pkgnup,sizeof pkgnup,"%.*s/romfs.nup",(int)dl,g_datadir);
-  static const char* cand[] = {
+  const char* cand[] = {
     pkgnup,
     "/mnt/usb1/games/Donkey Kong BananzaUpdate3.2.0DLC.nup",
     NULL };
