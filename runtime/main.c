@@ -411,8 +411,17 @@ static void build_dispatch(void){
       (double)(n*sizeof(GuestFn))/1048576.0,g_mod->nentries,
       (void*)(size_t)g_mod->entry_addr,(void*)(size_t)g_mod->entry_fn,
       (void*)(size_t)g_mod->interp);
+  u64 bytes=n? n*sizeof(GuestFn) : sizeof(GuestFn);
+#ifdef SWR_PS5
+  /* OrbisOS libc heap is tiny: calloc(87.8 MiB) fails with ENOMEM (measured).
+     ps5_alloc_large uses anonymous mmap and falls back to direct memory. */
+  extern void* ps5_alloc_large(u64 size);
+  g_disp=(GuestFn*)ps5_alloc_large(bytes);
+  LOG("dispatch: ps5_alloc_large -> %p errno=%d\n",(void*)g_disp,errno);
+#else
   g_disp=calloc(n?n:1,sizeof(GuestFn));
   LOG("dispatch: calloc -> %p errno=%d\n",(void*)g_disp,errno);
+#endif
   if(!g_disp) fatal("Could not allocate the dispatch table (%llu slots / %.1f MiB).",
                     (unsigned long long)n,(double)(n*sizeof(GuestFn))/1048576.0);
   u64 filled=0;

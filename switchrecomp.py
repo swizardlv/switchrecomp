@@ -463,6 +463,8 @@ def main():
     ap.add_argument('--llvm-config', default=DEFAULT_LLVM_CONFIG, help='host llvm-config for the prospero wrappers')
     ap.add_argument('--ps5-boilerplate', default='/data/code/ps5-native-app-boilerplate')
     ap.add_argument('--ps5-title-id', default='PPSA99201', help='PPSAxxxxx folder / param.json titleId')
+    ap.add_argument('--ps5-display-title', default='',
+                    help='user-facing titleName in param.json (defaults to the -o build name)')
     ap.add_argument('--ps5-no-package', action='store_true', help='stop after libgame_code.a + manifest (no link/sign)')
     ap.add_argument('--native', action='store_true', help='optimize for THIS processor (-march=native)')
     ap.add_argument('--no-build', action='store_true', help='only generate the C code and copy the game data')
@@ -562,6 +564,7 @@ def main():
         # hand ps5build.py module.o explicitly (plus a -u force symbol).
         modobj = next((o for o in objs if os.path.basename(o).startswith('module.') and o.endswith('.o')), None)
         manifest = dict(title=title, title_id='%016X' % info['title_id'], ps5_title_id=a.ps5_title_id,
+                        display_title=a.ps5_display_title or '',
                         repo=HERE, build=build, datadir=datadir, appdir=appdir,
                         archive=modout, module_obj=modobj,
                         objects_rsp=os.path.join(build, 'objects.rsp'),

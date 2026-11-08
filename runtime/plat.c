@@ -457,6 +457,44 @@ static int ps5_reserve_at(void* want, u64 size, int flags, void** out){
   return rc;
 }
 
+/* ---- large zero-filled allocations that bypass the tiny OrbisOS libc heap ----
+   Measured on hardware (2026-11-08): build_dispatch's calloc(87.8 MiB) returns
+   NULL with errno=12 (ENOMEM) although the console reports 12 GiB of direct
+   memory. The CRT heap cannot grow that far. Anonymous mmap is zero-filled and
+   does not use the libc heap; if the kernel refuses it, fall back to explicit
+   direct-memory allocation + mapping -- the exact path EglantinePS5 and the
+   nxnative PoC use for their guest windows. Both attempts are logged, so one
+   console run shows which path works and the real pool size. */
+extern int32_t sceKernelAllocateDirectMemory(int64_t search_start, int64_t search_end,
+                                             size_t size, size_t alignment, int type,
+                                             int64_t* physical);
+extern int32_t sceKernelMapDirectMemory(void** address, size_t size, int protection,
+                                        int flags, int64_t physical, size_t alignment);
+extern int32_t sceKernelReleaseDirectMemory(int64_t physical, size_t size);
+
+void* ps5_alloc_large(u64 size){
+  u64 bytes = size ? size : 1;
+  u64 aligned = (bytes + SWR_PS5_VA_GRANULE-1) & ~(SWR_PS5_VA_GRANULE-1);
+  void* p = mmap(NULL, (size_t)aligned, PROT_READ|PROT_WRITE,
+                 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  LOG("mem: alloc_large: mmap(%llu MiB) -> %p errno=%d\n",
+      (unsigned long long)(aligned>>20), p, p==MAP_FAILED? errno : 0);
+  if(p != MAP_FAILED) return p;   /* anonymous pages are already zero-filled */
+  int64_t phys = -1, total = sceKernelGetDirectMemorySize();
+  int rc = sceKernelAllocateDirectMemory(0, total, (size_t)aligned,
+                                         SWR_PS5_VA_GRANULE, 12, &phys);
+  LOG("mem: alloc_large: direct(%llu MiB) rc=%d phys=%lld pool=%lld MiB\n",
+      (unsigned long long)(aligned>>20), rc, (long long)phys, (long long)(total>>20));
+  if(rc) return NULL;
+  void* q = NULL;
+  int mr = sceKernelMapDirectMemory(&q, (size_t)aligned, PROT_READ|PROT_WRITE, 0,
+                                    phys, SWR_PS5_VA_GRANULE);
+  LOG("mem: alloc_large: map_direct rc=%d addr=%p\n", mr, q);
+  if(mr || !q){ sceKernelReleaseDirectMemory(phys, (size_t)aligned); return NULL; }
+  memset(q, 0, (size_t)aligned);
+  return q;
+}
+
 /* Reserve [base, base+size) as ONE contiguous window.
    Hardware probe tools/ps5/ps5_va_probe.c (2026-11-08) settled the question:
      hint=NULL / 0x300000000        -> 16 GiB ok, 32 GiB+ rc=0x8002000C

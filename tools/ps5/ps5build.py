@@ -342,7 +342,17 @@ def stage_package(run, a, env, envinfo, fself):
         param['titleId'] = tid
         param['conceptId'] = num
         param['contentId'] = 'UP9000-%s_00-SWITCHRECOMP001' % tid
-        param['localizedParameters']['en-US']['titleName'] = a.title or 'SwitchRecomp'
+        # A user-facing title may differ from the -o build name (which is used
+        # for log files, ini and generated C). Prefer --display-title, else the
+        # human-readable name already in the template, and only then the build
+        # name -- the PS5 home screen must never show an internal "swr_*" name.
+        enus = param.get('localizedParameters', {}).get('en-US', {})
+        tmpl_name = enus.get('titleName', '') if isinstance(enus, dict) else ''
+        display = (getattr(a, 'display_title', '') or tmpl_name
+                   or a.title or 'SwitchRecomp')
+        for lang, loc in param.get('localizedParameters', {}).items():
+            if isinstance(loc, dict) and 'titleName' in loc:
+                loc['titleName'] = display
         with open(os.path.join(app, 'sce_sys', 'param.json'), 'w', encoding='utf-8') as f:
             json.dump(param, f, indent=2)
         copied.append('param.json')
@@ -464,18 +474,22 @@ def main():
                     help='build a tiny boot-probe title (same CRT/link/sign chain, ~MB eboot)')
     ap.add_argument('--va-probe', action='store_true',
                     help='build a tiny VA-capability probe from tools/ps5/ps5_va_probe.c')
+    ap.add_argument('--display-title', default='',
+                    help='param.json localizedParameters titleName (defaults to the build -o name)')
     ap.add_argument('--runtime-only', action='store_true')
     a = ap.parse_args()
 
     cfg = dict(repo=os.path.abspath(a.repo), sdk=a.sdk, llvm_config=a.llvm_config,
                boilerplate=a.boilerplate, opt=a.opt, jobs=a.jobs, title='', ps5_title_id=a.title_id,
+               display_title=a.display_title or '',
                appdir='', datadir='', archive='', module_obj='', objects_rsp='', smoke=a.smoke,
                probe=a.probe or a.va_probe, va_probe=a.va_probe,
                runtime_only=a.runtime_only, backend=a.backend)
     if a.manifest:
         with open(a.manifest, encoding='utf-8') as f: m = json.load(f)
         for k in ('repo', 'sdk', 'llvm_config', 'boilerplate', 'opt', 'jobs', 'backend', 'title',
-                  'ps5_title_id', 'appdir', 'datadir', 'archive', 'module_obj', 'objects_rsp'):
+                  'ps5_title_id', 'display_title', 'appdir', 'datadir', 'archive',
+                  'module_obj', 'objects_rsp'):
             if k in m and m[k]: cfg[k] = m[k]
         cfg['build'] = m.get('build', os.path.dirname(a.manifest))
     else:
