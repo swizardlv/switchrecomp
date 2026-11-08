@@ -21,14 +21,30 @@ WFM_DIRS = (
     '/data', '/data/homebrew', '/data/homebrew/PPSA99201',
     '/data/eglantineps5/user/log', '/devlog', '/user', '/user/log',
     '/app0', '/app0/swr_data',
+    # crash forensics: appmeta proves the title was launched, coredumps.0 and
+    # shadowmount debug logs record what happened immediately afterwards.
+    '/data/shadowmount', '/devlog/system', '/devlog/system/sce_coredumps.0',
+    '/devlog/system/sce_logs', '/devlog/app', '/user/temp', '/user/data',
+    '/user/appmeta', '/user/appmeta/PPSA99201', '/data/cheatrunner',
+    '/data/eglantineps5/logs', '/data/blackbox-v2',
 )
 FTP_DIRS = ('/', '/data', '/data/homebrew', '/data/homebrew/PPSA99201',
             '/data/eglantineps5/user/log', '/mnt/usb1/PPSA99201')
-LOG_EXT = ('.log', '.txt', '.out')
+LOG_EXT = ('.log', '.txt', '.out', '.json', '.ini', '.1', '.dat')
 KEYS = ('SwitchRecomp', 'statically linked module', 'no dlopen', 'dlopen', 'RomFS',
-        'PPSA99201', 'swr_bananza', 'fatal', 'error', 'warn', 'code:', 'eboot')
+        'PPSA99201', 'swr_bananza', 'fatal', 'error', 'warn', 'code:', 'eboot',
+        'crash', 'coredump', 'panic', 'exception', 'abort', 'signal', 'launch',
+        'mount', '99201', 'swr_', 'app0', 'sce_err', 'SWR_PS5_PROBE')
+# Lines matching these are the ones that actually explain a launch failure;
+# generic RomFS indexing chatter from Eglantine must not drown them out.
+CRITICAL = ('99201', 'switchrecomp', 'swr_', 'statically linked', 'no dlopen',
+            'crash', 'coredump', 'panic', 'exception', 'abort', 'fatal',
+            'app0', 'launch', 'shadowmount', 'core dump', 'swr_ps5_probe')
 MAX_FILE = 8 << 20
 MAX_TOTAL = 96 << 20
+MAX_HITS = 6000
+# Eglantine's old RomFS indexing chatter fills the hit buffer otherwise.
+NOISE = ('romfs indexing:', 'finalizing image structure')
 APP_EBOOT = '/mnt/usb1/PPSA99201/eboot.bin'
 APP_EBOOT_SIZE = 571874598
 
@@ -40,7 +56,7 @@ class Run:
         os.makedirs(self.logs, exist_ok=True)
         self.f = open(os.path.join(self.dir, 'ps5_probe.log'), 'a', encoding='utf-8')
         self.issues = []
-        self.data = dict(ports={}, dirs={}, downloads=[], hits=[])
+        self.data = dict(ports={}, dirs={}, downloads=[], hits=[], critical=[])
         self.total = 0
 
     def log(self, stage, msg):
@@ -82,8 +98,16 @@ def port_open(host, port):
 
 def scan_text(run, name, text):
     for i, line in enumerate(text.splitlines(), 1):
-        if any(k.lower() in line.lower() for k in KEYS) and len(run.data['hits']) < 800:
-            run.data['hits'].append(dict(file=name, line=i, text=line[:400]))
+        low = line.lower()
+        if any(n in low for n in NOISE):
+            continue
+        if not any(k.lower() in low for k in KEYS):
+            continue
+        rec = dict(file=name, line=i, text=line[:400])
+        if len(run.data['hits']) < MAX_HITS:
+            run.data['hits'].append(rec)
+        if any(k in low for k in CRITICAL) and len(run.data['critical']) < 2000:
+            run.data['critical'].append(rec)
 
 
 def save_log(run, name, raw):
@@ -202,12 +226,16 @@ def probe_ftp(run, host, port):
 
 
 def main():
+    global APP_EBOOT_SIZE
     ap = argparse.ArgumentParser()
     ap.add_argument('--host', default='192.168.88.33')
     ap.add_argument('--ftp-port', type=int, default=2121)
     ap.add_argument('--http-port', type=int, default=8888)
+    ap.add_argument('--expected-eboot-size', type=int, default=APP_EBOOT_SIZE,
+                    help='expected eboot.bin byte count (change when a probe eboot is deployed)')
     ap.add_argument('--run-dir', required=True)
     a = ap.parse_args()
+    APP_EBOOT_SIZE = a.expected_eboot_size
     run = Run(a.run_dir)
     run.log('main', 'PS5 probe start host=%s' % a.host)
     for p in PORTS:
@@ -227,8 +255,15 @@ def main():
         except Exception as e:
             run.issue('FTP_STAGE_FAILED', '%s: %s' % (type(e).__name__, e))
     hits = run.data['hits']
+    critical = run.data['critical']
     blob = '\n'.join(h['text'] for h in hits).lower()
     lay = run.data.get('layout', {})
+    dirs = run.data['dirs']
+    core = dirs.get('/devlog/system/sce_coredumps.0')
+    core_files = core if isinstance(core, list) else []
+    appmeta = dirs.get('/user/appmeta')
+    appmeta_list = appmeta if isinstance(appmeta, list) else []
+    registered = next((e for e in appmeta_list if 'PPSA99201' in str(e.get('name'))), None)
     verdict = dict(
         usb_app_present=lay.get('usb_app_present', False),
         usb_eboot_size_ok=lay.get('usb_eboot_size') == APP_EBOOT_SIZE,
@@ -237,10 +272,17 @@ def main():
         statically_linked=('statically linked module' in blob or 'no dlopen' in blob),
         romfs_seen=('romfs:' in blob or 'romfs,' in blob),
         switchrecomp_seen=('switchrecomp' in blob),
+        probe_ok=('swr_ps5_probe_ok' in blob),
         title_seen=('ppsa99201' in blob or 'swr_bananza' in blob),
         fatal_seen=('fatal' in blob),
         hit_count=len(hits),
+        critical_hits=len(critical),
         downloaded_logs=len(run.data['downloads']),
+        title_registered=bool(registered),
+        appmeta_mtime=registered.get('mtime') if registered else None,
+        coredump_entries=len(core_files),
+        coredump_files=[dict(name=e.get('name'), size=e.get('size'), mtime=e.get('mtime'))
+                        for e in core_files[:20]],
     )
     run.data['verdict'] = verdict
     run.dump()
@@ -254,12 +296,21 @@ def main():
              'static module log   : %s' % verdict['statically_linked'],
              'RomFS log           : %s' % verdict['romfs_seen'],
              'SwitchRecomp log    : %s' % verdict['switchrecomp_seen'],
+             'boot probe OK       : %s' % verdict['probe_ok'],
              'PPSA99201 log       : %s' % verdict['title_seen'],
-             'fatal in logs       : %s' % verdict['fatal_seen'], '']
+             'fatal in logs       : %s' % verdict['fatal_seen'], '',
+             '--- crash forensics ---',
+             'title appmeta registered : %s (mtime=%s)' % (
+                 verdict['title_registered'], verdict['appmeta_mtime']),
+             'coredump dir entries     : %d  %s' % (
+                 verdict['coredump_entries'], verdict['coredump_files']),
+             'critical keyword hits   : %d' % verdict['critical_hits'], '']
     for i in run.issues:
         lines.append('%-5s %-22s %s' % (i['severity'], i['code'], i['detail'][:180]))
-    lines += ['', '--- keyword hits (last 80) ---']
-    lines += ['%s:%d %s' % (h['file'], h['line'], h['text'][:220]) for h in hits[-80:]]
+    lines += ['', '--- critical hits (last 120) ---']
+    lines += ['%s:%d %s' % (h['file'], h['line'], h['text'][:220]) for h in critical[-120:]]
+    lines += ['', '--- other keyword hits (last 40) ---']
+    lines += ['%s:%d %s' % (h['file'], h['line'], h['text'][:220]) for h in hits[-40:]]
     with open(os.path.join(run.dir, 'ps5_probe_summary.txt'), 'w', encoding='utf-8') as fo:
         fo.write('\n'.join(lines) + '\n')
     run.log('main', 'probe done -> %s' % os.path.join(run.dir, 'ps5_probe_summary.txt'))

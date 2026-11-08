@@ -23,6 +23,44 @@ RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', '
 # application exports in .dynsym and the FSELF converter rejects those.
 EXTRA = ['gpu_nogl', 'shader_proc', 'host1x', 'snxvk_glue',
          'backend_headless', 'entry', 'ps5_crt']
+# --probe replaces entry.c (which owns main()) with a tiny main that writes a
+# durable boot log and exits. It links the same CRT / stubs / converter / signer
+# as the real game, so a passing probe isolates a crash to payload size/content.
+EXTRA_PROBE = [n for n in EXTRA if n != 'entry']
+
+PROBE_C = r'''/* Minimal PS5 boot probe. Proves _start -> init arrays -> main actually runs,
+   and leaves a durable log even though stdout/stderr are not capturable. */
+#include <stdio.h>
+#include <stdlib.h>
+
+const void* swr_module(void){ return (void*)0; }
+const void* swr_module_static(void){ return (void*)0; }
+
+static int g_argc;
+static const char* g_argv0;
+
+static void probe_log(const char* tag){
+  static const char* paths[] = {
+    "/data/ps5_probe.log", "/data/switchrecomp/ps5_probe.log",
+    "/mnt/usb1/ps5_probe.log", "/mnt/usb0/ps5_probe.log", NULL
+  };
+  for(int i=0; paths[i]; ++i){
+    FILE* f = fopen(paths[i], "a");
+    if(!f) continue;
+    fprintf(f, "%s argc=%d argv0=%s\n", tag, g_argc, g_argv0 ? g_argv0 : "(none)");
+    fclose(f);
+  }
+}
+
+int main(int argc, char** argv, char** envp){
+  (void)envp;
+  g_argc = argc;
+  g_argv0 = (argc > 0 && argv && argv[0]) ? argv[0] : "(none)";
+  probe_log("SWR_PS5_PROBE_OK");
+  exit(0);
+  return 0;
+}
+'''
 DEFAULT_SDK = '/data/code/EglantinePS5-build56/.deps/lapy-ps5-payload-sdk-v0.42'
 DEFAULT_LLVM = '/data/toolchains/llvm-23.1.4/bin/llvm-config'
 DEFAULT_BOILER = '/data/code/ps5-native-app-boilerplate'
@@ -180,7 +218,8 @@ def compile_one(job):
 def stage_runtime(run, a, env, objdir):
     s = 'runtime'
     os.makedirs(objdir, exist_ok=True)
-    srcs = [os.path.join(a.repo, 'runtime', n + '.c') for n in RUNTIME_SRC + EXTRA]
+    extras = EXTRA_PROBE if getattr(a, 'probe', False) else EXTRA
+    srcs = [os.path.join(a.repo, 'runtime', n + '.c') for n in RUNTIME_SRC + extras]
     missing = [p for p in srcs if not os.path.isfile(p)]
     for p in missing:
         run.issue('RUNTIME_SRC_MISSING', p)
@@ -421,13 +460,15 @@ def main():
     ap.add_argument('--backend', default='ps5')
     ap.add_argument('--title-id', default='PPSA99201')
     ap.add_argument('--smoke', action='store_true')
+    ap.add_argument('--probe', action='store_true',
+                    help='build a tiny boot-probe title (same CRT/link/sign chain, ~MB eboot)')
     ap.add_argument('--runtime-only', action='store_true')
     a = ap.parse_args()
 
     cfg = dict(repo=os.path.abspath(a.repo), sdk=a.sdk, llvm_config=a.llvm_config,
                boilerplate=a.boilerplate, opt=a.opt, jobs=a.jobs, title='', ps5_title_id=a.title_id,
                appdir='', datadir='', archive='', module_obj='', objects_rsp='', smoke=a.smoke,
-               runtime_only=a.runtime_only, backend=a.backend)
+               probe=a.probe, runtime_only=a.runtime_only, backend=a.backend)
     if a.manifest:
         with open(a.manifest, encoding='utf-8') as f: m = json.load(f)
         for k in ('repo', 'sdk', 'llvm_config', 'boilerplate', 'opt', 'jobs', 'backend', 'title',
@@ -445,7 +486,8 @@ def main():
     env = build_env(c.sdk, c.llvm_config)
     try:
         run.log('INFO', 'ps5build start mode=%s repo=%s' % (
-            'smoke' if c.smoke else 'runtime-only' if c.runtime_only else 'full', c.repo))
+            'probe' if c.probe else 'smoke' if c.smoke
+            else 'runtime-only' if c.runtime_only else 'full', c.repo))
         envinfo = stage_env(run, c, env); run.stage['env'] = 'OK'
         objdir = os.path.join(c.run_dir, 'objects'); os.makedirs(objdir, exist_ok=True)
         rt_objs = stage_runtime(run, c, env, objdir)
@@ -457,7 +499,17 @@ def main():
             run.stage['link'] = 'SKIP (no runtime objects)'
             report(run, c); return 1
         pie = os.path.join(c.run_dir, 'llvm-pie.elf')
-        if c.smoke:
+        if c.probe:
+            probe = os.path.join(c.run_dir, 'probe.c')
+            with open(probe, 'w') as f:
+                f.write(PROBE_C)
+            r = compile_one((probe, os.path.join(objdir, 'probe.o'), c.sdk, c.repo, c.opt, env))
+            if r['rc']:
+                run.issue('PROBE_COMPILE_FAILED', r['tail'])
+                report(run, c); return 1
+            extra = [os.path.join(objdir, 'probe.o')]
+            arc = None
+        elif c.smoke:
             smoke = os.path.join(c.run_dir, 'smoke.c')
             with open(smoke, 'w') as f:
                 # entry.c already provides main(); the smoke only needs the
@@ -483,7 +535,7 @@ def main():
         eboot_elf, fself = stage_convert_sign(run, c, env, envinfo, pie)
         run.stage['convert'] = 'OK' if eboot_elf else 'FAIL'
         run.stage['sign'] = 'OK' if fself else 'FAIL'
-        if not c.smoke:
+        if not c.smoke or c.probe:
             stage_package(run, c, env, envinfo, fself); run.stage['package'] = 'OK'
         stage_verify(run, c, env, envinfo, pie, fself); run.stage['verify'] = 'OK'
         rc = report(run, c)
