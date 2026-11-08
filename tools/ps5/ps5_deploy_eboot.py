@@ -76,7 +76,7 @@ def main():
     ap.add_argument('--port', type=int, default=DEFAULT_PORT)
     ap.add_argument('--remote-dir', default=DEFAULT_DIR)
     ap.add_argument('--local', default='')
-    ap.add_argument('--mode', choices=['probe', 'restore', 'status'], default='status')
+    ap.add_argument('--mode', choices=['probe', 'replace', 'restore', 'status'], default='status')
     ap.add_argument('--run-dir', required=True)
     a = ap.parse_args()
     run = Run(a.run_dir)
@@ -96,7 +96,7 @@ def main():
             run.dump()
             return 0
 
-        if a.mode == 'probe':
+        if a.mode in ('probe', 'replace'):
             if not a.local or not os.path.isfile(a.local):
                 run.issue('LOCAL_MISSING', a.local or '(none)')
                 run.dump()
@@ -105,17 +105,28 @@ def main():
             want = sha256_bytes(data)
             run.data['local_size'] = len(data)
             run.data['sha256'] = want
-            if any(e['name'] == GAME for e in before):
-                run.issue('ALREADY_SWAPPED', '%s exists; use --mode restore first' % GAME)
+            has_game = any(e['name'] == GAME for e in before)
+            if a.mode == 'probe' and has_game:
+                run.issue('ALREADY_SWAPPED', '%s exists; use --mode replace (or restore first)' % GAME)
                 run.dump()
                 return 1
             if not any(e['name'] == 'eboot.bin' for e in before):
                 run.issue('NO_EBOOT', 'eboot.bin missing on console')
                 run.dump()
                 return 1
-            # Keep the original on the console: an FTP rename is instant.
-            ftp.rename('eboot.bin', GAME)
-            run.log('INFO', 'renamed eboot.bin -> %s' % GAME)
+            if a.mode == 'probe':
+                # Keep the original on the console: an FTP rename is instant.
+                ftp.rename('eboot.bin', GAME)
+                run.log('INFO', 'renamed eboot.bin -> %s' % GAME)
+            else:
+                # Original game eboot is already parked in GAME. The current
+                # eboot.bin is a small diagnostic build; drop it and keep GAME.
+                if not has_game:
+                    ftp.rename('eboot.bin', GAME)
+                    run.log('INFO', 'parked current eboot.bin as %s' % GAME)
+                else:
+                    ftp.delete('eboot.bin')
+                    run.log('INFO', 'removed previous diagnostic eboot.bin (backup %s intact)' % GAME)
             ftp.storbinary('STOR eboot.bin', io.BytesIO(data))
             run.log('INFO', 'uploaded %d bytes as eboot.bin' % len(data))
             size = ftp.size('eboot.bin')

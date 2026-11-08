@@ -27,9 +27,12 @@ WFM_DIRS = (
     '/devlog/system/sce_logs', '/devlog/app', '/user/temp', '/user/data',
     '/user/appmeta', '/user/appmeta/PPSA99201', '/data/cheatrunner',
     '/data/eglantineps5/logs', '/data/blackbox-v2',
+    # SwitchRecomp's logf_ writes <g_exedir><g_exename>.log; on PS5 that is
+    # /data/switchrecomp/swr.log (see runtime/plat.c:24 and main.c PS5 branch).
+    '/data/switchrecomp',
 )
 FTP_DIRS = ('/', '/data', '/data/homebrew', '/data/homebrew/PPSA99201',
-            '/data/eglantineps5/user/log', '/mnt/usb1/PPSA99201')
+            '/data/eglantineps5/user/log', '/data/switchrecomp', '/mnt/usb1/PPSA99201')
 LOG_EXT = ('.log', '.txt', '.out', '.json', '.ini', '.1', '.dat')
 KEYS = ('SwitchRecomp', 'statically linked module', 'no dlopen', 'dlopen', 'RomFS',
         'PPSA99201', 'swr_bananza', 'fatal', 'error', 'warn', 'code:', 'eboot',
@@ -261,6 +264,8 @@ def main():
     dirs = run.data['dirs']
     core = dirs.get('/devlog/system/sce_coredumps.0')
     core_files = core if isinstance(core, list) else []
+    rtlog = dirs.get('/data/switchrecomp')
+    rtlog_files = rtlog if isinstance(rtlog, list) else []
     appmeta = dirs.get('/user/appmeta')
     appmeta_list = appmeta if isinstance(appmeta, list) else []
     registered = next((e for e in appmeta_list if 'PPSA99201' in str(e.get('name'))), None)
@@ -283,6 +288,8 @@ def main():
         coredump_entries=len(core_files),
         coredump_files=[dict(name=e.get('name'), size=e.get('size'), mtime=e.get('mtime'))
                         for e in core_files[:20]],
+        runtime_log_files=[dict(name=e.get('name'), size=e.get('size'), mtime=e.get('mtime'))
+                           for e in rtlog_files[:20]],
     )
     run.data['verdict'] = verdict
     run.dump()
@@ -297,6 +304,7 @@ def main():
              'RomFS log           : %s' % verdict['romfs_seen'],
              'SwitchRecomp log    : %s' % verdict['switchrecomp_seen'],
              'boot probe OK       : %s' % verdict['probe_ok'],
+             'runtime log files   : %s' % (verdict['runtime_log_files'] or 'none'),
              'PPSA99201 log       : %s' % verdict['title_seen'],
              'fatal in logs       : %s' % verdict['fatal_seen'], '',
              '--- crash forensics ---',
