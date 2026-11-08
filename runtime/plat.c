@@ -769,17 +769,82 @@ int plat_mkdir(const char* p){ return mkdir(p,0755); }
 
 int plat_is_dir(const char* p){ struct stat s; return !stat(p,&s) && S_ISDIR(s.st_mode); }
 
-typedef struct { DIR* d; char path[1024]; } PD_;
+typedef struct { DIR* d; char path[1024]; int* idx; int n, i; } PD_;
 
-int plat_dir_open(PDir* d, const char* path){ PD_* p=malloc(sizeof *p); p->d=opendir(path);
+#ifdef SWR_PS5
+/* OrbisOS refuses opendir() on the read-only /app0 mount even though stat()
+   and fopen() work: measured "romfs: opendir(/app0/swr_data/romfs) -> 0
+   errno=1", after which RomFS came back as "1 folders, 0 files" and every
+   asset was invisible to the guest.  A build-time manifest of the deployed
+   package replaces directory enumeration.  One tab-separated line per entry:
+
+       D|F <dir> <name> <size>
+
+   <dir> is the *guest* directory path, e.g. /app0/swr_data/romfs/Models.
+   The generator writes a structured report; this loader logs the parsed
+   totals so the two views can be compared from swr.log alone. */
+typedef struct { char* dir; char* name; int is_dir; u64 size; } ManEnt;
+static ManEnt* g_man; static int g_nman, g_cman, g_man_loaded;
+
+static void man_load(void){
+  if(g_man_loaded) return; g_man_loaded=1;
+  const char* paths[]={"/app0/romfs_manifest.txt",
+                       "/app0/swr_data/romfs_manifest.txt",
+                       "/data/switchrecomp/romfs_manifest.txt"};
+  FILE* f=NULL; const char* used=NULL;
+  for(int k=0;k<3 && !f;k++){ f=fopen(paths[k],"rb"); if(f) used=paths[k]; }
+  if(!f){ LOG("romfs: no manifest under /app0 or /data/switchrecomp (errno=%d)\n",errno); return; }
+  char ln[8192]; int lines=0, ndir=0, nfile=0; u64 total=0;
+  while(fgets(ln,sizeof ln,f)){
+    lines++;
+    char* a=ln, *b=strchr(a,'\t'); if(!b) continue; *b++=0;
+    char* c2=strchr(b,'\t');       if(!c2) continue; *c2++=0;
+    char* d2=strchr(c2,'\t');      if(!d2) continue; *d2++=0;
+    char* nl=strchr(d2,'\n'); if(nl) *nl=0;
+    int isdir=(a[0]=='D'||a[0]=='d'); u64 size=strtoull(d2,NULL,10);
+    if(g_nman==g_cman){ g_cman=g_cman? g_cman*2 : 4096; g_man=realloc(g_man,sizeof(ManEnt)*g_cman); }
+    g_man[g_nman].dir=strdup(b); g_man[g_nman].name=strdup(c2);
+    g_man[g_nman].is_dir=isdir; g_man[g_nman].size=size; g_nman++;
+    if(isdir) ndir++; else { nfile++; total+=size; }
+  }
+  fclose(f);
+  LOG("romfs: manifest %s -> %d lines, %d entries (%d dirs, %d files, %.2f GiB)\n",
+      used,lines,g_nman,ndir,nfile,(double)total/1073741824.0);
+}
+
+static int man_open(const char* path, PD_* p){
+  man_load();
+  p->idx=NULL; p->n=0; p->i=0;
+  if(!g_nman) return 0;
+  for(int i=0;i<g_nman;i++) if(!strcmp(g_man[i].dir,path)){
+    if(p->n==0) p->idx=malloc(sizeof(int)*64);
+    else if(!(p->n&63)) p->idx=realloc(p->idx,sizeof(int)*(p->n+64));
+    p->idx[p->n++]=i; }
+  return p->n>0;
+}
+#endif
+
+int plat_dir_open(PDir* d, const char* path){
+  PD_* p=malloc(sizeof *p); p->d=opendir(path); p->idx=NULL; p->n=0; p->i=0;
 #ifdef SWR_PS5
   /* One console run has to tell us whether /app0 supports directory
      enumeration at all; log the first few opens, not all 75k files. */
   { static int nopen; if(nopen<3){ nopen++; LOG("romfs: opendir(%s) -> %p errno=%d\n",path,(void*)p->d,p->d? 0 : errno); } }
+  if(!p->d && man_open(path,p)){
+    { static int nman; if(nman<3){ nman++; LOG("romfs: manifest dir %s -> %d entries\n",path,p->n); } }
+    strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
 #endif
-  if(!p->d){ free(p); return -1; } strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
+  if(!p->d){ free(p->idx); free(p); return -1; }
+  strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
 
 int plat_dir_next(PDir* d){ PD_* p=d->h; struct dirent* e;
+#ifdef SWR_PS5
+  if(!p->d){
+    if(p->i>=p->n) return 0;
+    ManEnt* m=&g_man[p->idx[p->i++]];
+    strncpy(d->name,m->name,511); d->name[511]=0;
+    d->is_dir=m->is_dir; d->size=m->size; return 1; }
+#endif
   while((e=readdir(p->d))){ if(!strcmp(e->d_name,".")||!strcmp(e->d_name,"..")) continue; strncpy(d->name,e->d_name,511); d->name[511]=0;
     char f[1600]; snprintf(f,sizeof f,"%s/%s",p->path,e->d_name); struct stat s;
     if(stat(f,&s)){
@@ -802,7 +867,7 @@ int plat_dir_next(PDir* d){ PD_* p=d->h; struct dirent* e;
     d->is_dir=S_ISDIR(s.st_mode); d->size=(u64)s.st_size; return 1; }
   return 0; }
 
-void plat_dir_close(PDir* d){ PD_* p=d->h; closedir(p->d); free(p); }
+void plat_dir_close(PDir* d){ PD_* p=d->h; if(p->d) closedir(p->d); free(p->idx); free(p); }
 
 u64 plat_file_size(const char* p){ struct stat s; if(stat(p,&s)) return 0; return (u64)s.st_size; }
 

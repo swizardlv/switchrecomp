@@ -46,6 +46,53 @@ static void load_hints(void){ FILE* f=fopen(g_hints_path,"r"); if(!f) return; ch
 
 void kernel_dump_regs(CPU* c);
 
+#ifdef SWR_PS5
+/* ---- out-of-range indirect guest calls -----------------------------------
+   A NULL guest function pointer (unresolved weak import, an SDK singleton
+   that was never initialised) used to land in the interpreter at guest pc=0,
+   which raised "Unsupported instruction 00000000 at 0" and killed the title
+   at the first missing path.  swr_lookup() is inlined into every generated
+   object, but it returns the *global* swr_interp_entry, so wrapping that one
+   pointer needs only a runtime rebuild, not a full 281-object regeneration.
+
+   In-range targets still go to the real interpreter (dynamic code, basic
+   blocks that were never recompiled).  Out-of-range targets are collected in
+   one table, logged once per distinct (target,caller), and faked as a call
+   that returns 0: one console tap now exposes every missing path instead of
+   stopping at the first one.  Every crash report dumps the whole table. */
+typedef struct { u64 target, caller, count; } BadCall;
+#define SWR_BAD_MAX 256
+static BadCall g_bad[SWR_BAD_MAX];
+static int g_nbad;
+static GuestFn g_real_interp;
+
+void swr_dump_bad_calls(void){
+  if(!g_nbad){ LOG("badcall: none\n"); return; }
+  WARN("badcall: %d distinct out-of-range indirect targets\n",g_nbad);
+  for(int i=0;i<g_nbad;i++)
+    WARN("  badcall[%d] target=%llx caller=%llx count=%llu\n",i,
+         (unsigned long long)g_bad[i].target,(unsigned long long)g_bad[i].caller,
+         (unsigned long long)g_bad[i].count);
+}
+
+static void interp_guard(CPU* c, u64 pc){
+  if(pc>=g_code_lo && pc<g_code_hi){ g_real_interp(c,pc); return; }
+  u64 lr=c->x[30];
+  int i; for(i=0;i<g_nbad;i++) if(g_bad[i].target==pc && g_bad[i].caller==lr) break;
+  if(i==g_nbad){
+    if(g_nbad<SWR_BAD_MAX){ g_bad[g_nbad]=(BadCall){pc,lr,0}; i=g_nbad++; }
+    else i=SWR_BAD_MAX-1;                 /* keep counting in the last slot */
+  }
+  u64 n=++g_bad[i].count;
+  if(n==1 || n==1000)
+    WARN("badcall: target=%llx caller=%llx count=%llu x0=%llx x1=%llx x2=%llx x8=%llx -> fake return 0\n",
+         (unsigned long long)pc,(unsigned long long)lr,(unsigned long long)n,
+         (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+         (unsigned long long)c->x[2],(unsigned long long)c->x[8]);
+  c->x[0]=0; c->pc=lr;                 /* resume after the failing BLR/BR */
+}
+#endif
+
 static void rt_undef(CPU* c, u64 pc, u32 w){
   WARN("\nUnsupported instruction %08x at %llx\n",w,(unsigned long long)pc); c->pc=pc; kernel_dump_regs(c);
   save_hints(); fatal("Unsupported instruction %08x at %llx",w,(unsigned long long)pc); }
@@ -130,6 +177,9 @@ void crash_report(void* host_pc, void* fault, int sig){
   KThread* t=kthread_cur();
   u64 ga=(u64)((u8*)fault-g_mem);
   logf_(0,"\n*** Crash (signal %d) at host pc=%p, access to %p (game address %llx) ***\n",sig,host_pc,fault,(unsigned long long)ga);
+#ifdef SWR_PS5
+  swr_dump_bad_calls();
+#endif
   /* PIE diagnostics: print an offset relative to a symbol whose ELF address is
      known from nm. Locally, pc_off = (pc_rel + nm(crash_report)) maps straight
      into llvm-addr2line, whatever ASLR base the console picked. */
@@ -433,7 +483,13 @@ static void build_dispatch(void){
   u64 filled=0;
   for(u32 i=0;i<g_mod->nentries;i++){ u64 a=g_mod->entry_addr[i];
     if(a>=g_code_lo && a<g_code_hi){ g_disp[(a-g_code_lo)/4]=g_mod->entry_fn[i]; ++filled; } }
+#ifdef SWR_PS5
+  g_real_interp=g_mod->interp;
+  swr_interp_entry=interp_guard;
+  LOG("dispatch: interp_guard installed, real interp=%p\n",(void*)(size_t)g_real_interp);
+#else
   swr_interp_entry=g_mod->interp;
+#endif
   LOG("dispatch: filled %llu/%u entries, interp_entry=%p\n",
       (unsigned long long)filled,g_mod->nentries,(void*)(size_t)swr_interp_entry);
 }
