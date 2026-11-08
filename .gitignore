@@ -26,3 +26,4 @@ captures/
 # python
 __pycache__/
 *.pyc
+.DS_Store
