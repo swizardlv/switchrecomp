@@ -269,6 +269,24 @@ int nup_node_count(void) { return (int)G.ndirs + (int)G.nfiles; }
 
 uint64_t nup_pool_size(void) { return (uint64_t)G.pool_size; }
 
+uint64_t nup_name_bytes(void) {
+    uint64_t sum = 0;
+    if (!G.toc) return 0;
+    for (uint32_t i = 0; i < G.ndirs; i++) {
+        const uint8_t* p = G.toc + G.dir_at + i * 0x18;
+        uint32_t off = rd32(p + 0), len = rd32(p + 4);
+        if (off + len > G.pool_size) continue;
+        sum += (uint64_t)len + 1;
+    }
+    for (uint32_t i = 0; i < G.nfiles; i++) {
+        const uint8_t* p = G.toc + G.file_at + i * 0x50;
+        uint32_t off = rd32(p + 0), len = rd32(p + 4);
+        if (off + len > G.pool_size) continue;
+        sum += (uint64_t)len + 1;
+    }
+    return sum;
+}
+
 int nup_dir_child_count(int dir_node) {
     if (dir_node < 0 || (uint32_t)dir_node >= G.ndirs) return 0;
     const uint8_t* p = G.toc + G.dir_at + (uint32_t)dir_node * 0x18;

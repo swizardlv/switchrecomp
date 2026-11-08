@@ -15,11 +15,11 @@ import argparse, collections, json, os, re, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 
 RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', 'svc_fs', 'svc_vi',
-               'nvdrv', 'gpu', 'gpu_engines', 'gpu_3d', 'loader', 'main']
-# build_runtime()'s headless set (no GL) + the always-present glue sources
+               'nvdrv', 'gpu', 'gpu_engines', 'gpu_3d', 'loader', 'main', 'nup_ps5']
+# build_runtime()'s PS5 set (no GL) + the always-present glue sources
 # glibc_compat.c is Linux-only (defines fmod/fmodf); the PS5 build omits it.
 EXTRA = ['gpu_nogl', 'shader_proc', 'host1x', 'snxvk_glue',
-         'backend_headless', 'entry', 'ps5_crt']
+         'backend_ps5', 'entry', 'ps5_crt']
 
 
 def normalise(line):

@@ -35,10 +35,23 @@ extern void  ps5_free_large(void* p, u64 size);
 static char* g_name_arena;
 static u64   g_name_pos;
 static u64   g_name_cap;
+static int   g_name_overflow;          /* set once if the arena ever runs short */
+static char  g_name_empty[1] = "";
 static char* store_name(const char* s){
   if(g_name_arena){
     size_t L = strlen(s);
-    if(g_name_pos + L + 1 > g_name_cap){ LOG("RomFS: name arena exhausted\n"); return (char*)s; }
+    if(g_name_pos + L + 1 > g_name_cap){
+      /* NEVER hand back the caller's buffer here: nup_scan passes a stack
+         scratch (char nm[1536]), so that pointer would dangle as soon as the
+         frame returns and every node would alias a dead local. Give out one
+         shared empty string instead, and log once (a per-node log with fsync
+         slowed the scan from <1 s to >60 s). romfs_build_nup sizes the arena
+         exactly from nup_name_bytes(), so this should never trigger. */
+      if(!g_name_overflow++)
+        LOG("RomFS: name arena overflow (used %llu of %llu) - names truncated\n",
+            (unsigned long long)g_name_pos, (unsigned long long)g_name_cap);
+      return g_name_empty;
+    }
     char* p = g_name_arena + g_name_pos;
     memcpy(p, s, L + 1);
     g_name_pos += L + 1;
@@ -208,17 +221,23 @@ static int romfs_build_nup(void){
   dn = (DNode*)ps5_alloc_large(sizeof(DNode)*(total+16));
   fn = (FNode*)ps5_alloc_large(sizeof(FNode)*(total+16));
   if(!dn || !fn){ LOG("RomFS: index arrays alloc failed (nodes=%d)\n", total); return 0; }
-  /* Name arena: the TOC string pool already lives in heap-free memory; we give
-     ourselves at least that much plus a couple of bytes per node for terminators
-     and alignment, so store_name() never needs the CRT heap. */
-  u64 pool = nup_pool_size();
-  g_name_cap = pool + (u64)total*2 + 64;
+  /* Name arena: sized EXACTLY from the container, i.e. the sum of (name_len+1)
+     over every node, plus 8 bytes per node for the terminator/alignment pad and
+     a little slack.  Measured on the Bananza container: 5.28 MiB of names over
+     166,433 nodes.  The earlier "pool + 2 bytes/node" estimate asked for only
+     2.3 MiB and ran dry at ~43%, so names were silently truncated. */
+  u64 name_bytes = nup_name_bytes();
+  g_name_cap = name_bytes + (u64)total*8 + 4096;
+  g_name_overflow = 0;
+  LOG("RomFS: index %d nodes, names %llu bytes -> arena %.1f MB\n",
+      total, (unsigned long long)name_bytes, (double)g_name_cap/1048576.0);
   g_name_arena = (char*)ps5_alloc_large(g_name_cap);
   g_name_pos = 0;
   if(!g_name_arena){ LOG("RomFS: name arena alloc failed\n"); return 0; }
   add_dir("",0); dn[0].parent=0; g_romdir_len=0;
   nup_scan(root,0);
-  LOG("RomFS: NUP scanned %d folders, %d files\n", ndn, nfn);
+  LOG("RomFS: NUP scanned %d folders, %d files (names used %llu/%llu bytes)\n",
+      ndn, nfn, (unsigned long long)g_name_pos, (unsigned long long)g_name_cap);
   finalize_romfs();
   return nrfiles>0;
 }

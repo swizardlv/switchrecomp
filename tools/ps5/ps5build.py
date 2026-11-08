@@ -22,7 +22,7 @@ RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', '
 # glibc_compat.c is Linux-only: it defines fmod/fmodf, which would become
 # application exports in .dynsym and the FSELF converter rejects those.
 EXTRA = ['gpu_nogl', 'shader_proc', 'host1x', 'snxvk_glue',
-         'backend_headless', 'entry', 'ps5_crt']
+         'backend_ps5', 'entry', 'ps5_crt']
 # --probe replaces entry.c (which owns main()) with a tiny main that writes a
 # durable boot log and exits. It links the same CRT / stubs / converter / signer
 # as the real game, so a passing probe isolates a crash to payload size/content.
