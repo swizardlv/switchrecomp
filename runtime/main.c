@@ -586,6 +586,11 @@ int swr_main(int argc, char** argv){
     { static int lf=-1, still; if(g_vt_on && !g_rec_active){ if(g_frames!=lf){ lf=g_frames; still=0; } else if(++still==180){ vt_set(0); WARN("smooth recording: the game stopped presenting images; back to the normal clock\n"); } } else { lf=-1; still=0; } }
     frontend_frame();
     if(++tick%300==0) save_hints();
+    /* One-shot service census 12 s in. Together with the dump inside the svcBreak
+       path this covers both outcomes: the game panics (early dump) or it hangs /
+       runs without ever reaching the crash handler (this dump). Either way one
+       console run leaves behind the full list of services the title asked for. */
+    { static int censused; if(!censused && tick>=60*12){ censused=1; ipc_dump_stats(); } }
     { extern void snxvk_tick(int); snxvk_tick(tick); }   /* vulkan_native saves its pipeline cache now and then */
     /* dump thread states to threads.txt every 15s, useful when something hangs */
     if(tick%900==0){ extern __thread FILE* g_log_redirect; extern void kernel_dump_threads(void); char p[1200]; snprintf(p,sizeof p,"%sthreads.txt",g_exedir);
