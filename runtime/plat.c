@@ -14,6 +14,12 @@ static PMutex g_logm; static int g_logm_ok;
 
 __thread FILE* g_log_redirect;   /* redirect for the threads.txt dumps so they don't end up in the log, it's per
                                     thread so the other threads keep logging like normal */
+
+/* fsync every log line while the runtime is still starting up, so a hard
+   freeze/panic can't lose the trace (the PS5 leaves UFS2 page-cache data
+   unflushed). Cleared once the guest is running, because fsync per line would
+   otherwise stall gameplay (see docs/ps5_splash_hang_analysis.md, root cause 6). */
+int g_log_fsync = 1;
 void logf_(int lvl, const char* fmt, ...){
   if(!g_logm_ok){ pm_init(&g_logm); g_logm_ok=1; }
   char buf[2048]; va_list ap; va_start(ap,fmt); vsnprintf(buf,sizeof buf,fmt,ap); va_end(ap);
@@ -25,9 +31,9 @@ void logf_(int lvl, const char* fmt, ...){
   if(g_logf){ static int bol=1; if(bol) fputs(tb,g_logf); fputs(buf,g_logf); size_t L=strlen(buf); bol= L && buf[L-1]=='\n'; fflush(g_logf);
 #if defined(__PROSPERO__) || defined(__ORBIS__)
     /* On the PS5 a hard freeze/panic can leave the UFS2 page cache unflushed,
-       so every log line is fsync'd to survive a crash (see
-       docs/ps5_splash_hang_analysis.md, root cause 6). */
-    if(g_logf != stderr) fsync(fileno(g_logf));
+       so startup log lines are fsync'd to survive a crash. Disabled once
+       g_log_fsync is cleared (guest running) to avoid per-line stalls. */
+    if(g_log_fsync && g_logf != stderr) fsync(fileno(g_logf));
 #endif
   }
   if(lvl<=1 || g_verbose>=2) fputs(buf,stderr);

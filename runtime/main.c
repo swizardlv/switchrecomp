@@ -569,6 +569,9 @@ int swr_main(int argc, char** argv){
   { extern void plat_prof_start(int); if(g_opt_prof){ plat_prof_start(0); LOG("profile: active (profile.txt every 10 s)\n"); } }
   LOG("stage: kernel_run_main\n");
   kernel_run_main(g_mod->mods[0].base+g_mod->mods[0].text_off,g_mod->main_stack?g_mod->main_stack:0x100000,(int)g_mod->main_prio,(int)g_mod->main_core);
+  /* startup is done: stop fsync'ing every log line (it would stall gameplay once
+     the guest starts hammering the romfs "romfs: <file>" tracer). */
+  g_log_fsync = 0;
   /* 60Hz frontend loop */
   u64 next=plat_ns(); int tick=0;
   while(!g_quit){

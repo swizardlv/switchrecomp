@@ -179,7 +179,12 @@ static int nup_node_cmp(const void* a, const void* b){
 }
 static void nup_scan(int dir_node, int di){
   int nchild=nup_dir_child_count(dir_node);
-  int* kids=(int*)ps5_alloc_large(sizeof(int)*(nchild?nchild:1));
+  /* Transient per-directory scratch: small and freed on return. The big RomFS
+     index now lives in heap-free mmap, so the CRT heap is free and a short-lived
+     malloc here is safe (and avoids 2 MiB-granule mmap + per-alloc logging for
+     each of the ~2.9k directories). */
+  int* kids=(int*)malloc(sizeof(int)*(nchild?nchild:1));
+  if(!kids){ LOG("RomFS: kids alloc failed (n=%d)\n", nchild); return; }
   for(int i=0;i<nchild;i++) kids[i]=nup_dir_child(dir_node,i);
   qsort(kids,(size_t)nchild,sizeof(int),nup_node_cmp);
   int lastd=-1, lastf=-1;
@@ -188,7 +193,7 @@ static void nup_scan(int dir_node, int di){
     if(nup_node_is_dir(node)){ int c=add_dir(nm,di); if(lastd<0) dn[di].first_child=c; else dn[lastd].next_sib=c; lastd=c; nup_scan(node,c); }
     else { u64 fsz=0; nup_file_size(node,&fsz); int f=add_file(nm,di,fsz,node); if(lastf<0) dn[di].first_file=f; else fn[lastf].next_sib=f; lastf=f; }
   }
-  ps5_free_large(kids, sizeof(int)*(nchild?nchild:1));
+  free(kids);
 }
 static int romfs_build_nup(void){
   int root=nup_base_romfs_dir();

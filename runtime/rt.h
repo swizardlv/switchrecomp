@@ -88,6 +88,7 @@ extern __thread void* tls_thread;
 
 /* ======================================================= log */
 extern int g_verbose;
+extern int g_log_fsync;   /* fsync each log line (startup only; see plat.c) */
 void logf_(int lvl, const char* fmt, ...);
 #define LOG(...)  logf_(1,__VA_ARGS__)
 #define LOGV(...) do{ if(g_verbose>=2) logf_(2,__VA_ARGS__); }while(0)
