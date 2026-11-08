@@ -788,12 +788,18 @@ static ManEnt* g_man; static int g_nman, g_cman, g_man_loaded;
 
 static void man_load(void){
   if(g_man_loaded) return; g_man_loaded=1;
+  /* OrbisOS refuses opendir() on the read-only /app0 mount, so a build-time
+     manifest of the deployed package replaces directory enumeration.  The
+     manifest may live in the internal package (/app0, when installed), on the
+     USB package (/mnt/usb1 when the drive is inserted), or in /data (cached by
+     a previous run).  The first one that opens wins. */
   const char* paths[]={"/app0/romfs_manifest.txt",
                        "/app0/swr_data/romfs_manifest.txt",
+                       "/mnt/usb1/PPSA99201/romfs_manifest.txt",
                        "/data/switchrecomp/romfs_manifest.txt"};
   FILE* f=NULL; const char* used=NULL;
-  for(int k=0;k<3 && !f;k++){ f=fopen(paths[k],"rb"); if(f) used=paths[k]; }
-  if(!f){ LOG("romfs: no manifest under /app0 or /data/switchrecomp (errno=%d)\n",errno); return; }
+  for(int k=0;k<4 && !f;k++){ f=fopen(paths[k],"rb"); if(f) used=paths[k]; }
+  if(!f){ LOG("romfs: no manifest under /app0, /mnt/usb1 or /data/switchrecomp (errno=%d)\n",errno); return; }
   char ln[8192]; int lines=0, ndir=0, nfile=0; u64 total=0;
   while(fgets(ln,sizeof ln,f)){
     lines++;
@@ -810,6 +816,22 @@ static void man_load(void){
   fclose(f);
   LOG("romfs: manifest %s -> %d lines, %d entries (%d dirs, %d files, %.2f GiB)\n",
       used,lines,g_nman,ndir,nfile,(double)total/1073741824.0);
+  /* Cache a copy at /data/switchrecomp (which the runtime can write even
+     though FTP cannot) so later boots work without the USB drive inserted.
+     Only copy when it was found on a removable mount, and skip if a cache
+     already exists or matches. */
+  if(strcmp(used,"/data/switchrecomp/romfs_manifest.txt")){
+    const char* cache="/data/switchrecomp/romfs_manifest.txt";
+    FILE* cf=fopen(cache,"rb");
+    if(cf){ fclose(cf); }
+    else {
+      cf=fopen(used,"rb"); FILE* out=fopen(cache,"wb");
+      if(cf && out){ char buf[1<<16]; size_t r;
+        while((r=fread(buf,1,sizeof buf,cf))>0) fwrite(buf,1,r,out);
+        LOG("romfs: cached manifest -> %s\n",cache); }
+      if(cf) fclose(cf); if(out) fclose(out);
+    }
+  }
 }
 
 static int man_open(const char* path, PD_* p){
