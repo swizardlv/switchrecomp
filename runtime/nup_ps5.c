@@ -41,7 +41,7 @@ static unsigned zstd_stub_is_error(size_t code) { return code == (size_t)-1; }
  * [ndirs, ndirs+nfiles) are files. */
 typedef struct {
     int      fd;
-    uint8_t* toc;            /* malloc'd copy of the table of contents          */
+    uint8_t* toc;            /* heap-free (mmap) copy of the table of contents */
     uint64_t toc_size;
     uint64_t blob_offset;    /* file offset where the blob (extent) region starts */
     uint64_t file_size;
@@ -55,8 +55,6 @@ typedef struct {
     uint32_t pkg_at;
     uint32_t npkg;
     int      base_romfs_dir; /* node index of the base romfs root, or -1        */
-    void*    map;            /* mmap of the whole file (no heap use)            */
-    uint64_t map_size;
 } Nup;
 
 static Nup G;
@@ -118,21 +116,20 @@ static uint8_t* zc_decompress(int node) {
     while (zc_bytes + size0 > ZC_CAP && zc_n > 0) {
         int mi = 0;
         for (int i = 1; i < zc_n; i++) if (zc[i].tick < zc[mi].tick) mi = i;
-        free(zc[mi].data);
+        nup_free(zc[mi].data, zc[mi].size);   /* zc data is mmap'd, never free() */
         zc_bytes -= zc[mi].size;
         zc[mi] = zc[--zc_n];
     }
     if (zc_n >= ZC_MAX) return NULL;
 
-    uint8_t* comp = nup_alloc(ext_size ? (size_t)ext_size : 1);
-    uint8_t* out  = nup_alloc(size0 ? (size_t)size0 : 1);
-    if (!comp || !out) { nup_free(comp, ext_size); nup_free(out, size0); return NULL; }
+        uint8_t* comp = nup_alloc(ext_size ? (size_t)ext_size : 1);
+        uint8_t* out  = nup_alloc(size0 ? (size_t)size0 : 1);
+        if (!comp || !out) { nup_free(comp, ext_size); nup_free(out, size0); return NULL; }
 
-        memcpy(comp, (const uint8_t*)G.map + (size_t)(G.blob_offset + ext_off), (size_t)ext_size);
-        ssize_t r = (ssize_t)ext_size;
-        size_t  d = (r == (ssize_t)ext_size)
-                        ? ZSTD_decompress(out, (size_t)size0, comp, (size_t)ext_size)
-                        : (size_t)-1;
+        if (pread(G.fd, comp, (size_t)ext_size, (off_t)(G.blob_offset + ext_off)) != (ssize_t)ext_size) {
+            nup_free(comp, ext_size); nup_free(out, size0); return NULL;
+        }
+        size_t d = ZSTD_decompress(out, (size_t)size0, comp, (size_t)ext_size);
     nup_free(comp, ext_size);
     if (ZSTD_isError(d) || d != (size_t)size0) { nup_free(out, size0); return NULL; }
 
@@ -156,31 +153,38 @@ int nup_open(const char* path) {
     if (fstat(fd, &st) != 0) { g_nup_err = errno; g_nup_errno = errno; close(fd); return 0; }
     uint64_t fsize = (uint64_t)st.st_size;
 
-    /* Map the whole container read-only. The TOC (14.96 MB) and the blob both
-       live inside this mapping, so we never malloc a large block -- PS5's CRT
-       heap cannot grow that far (see plat.c). Raw extents are served in place. */
-    void* map = mmap(NULL, (size_t)fsize, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (map == MAP_FAILED) {
-        g_nup_err = -20; g_nup_errno = errno; close(fd); return 0;
+    /* We deliberately do NOT mmap the whole (multi-GB) container: mapping a
+       giant file over the ShadowMountPlus (nullfs + exFAT) USB layer makes the
+       OrbisOS VFS pager take page faults that lock up the kernel on dense
+       reads, and the CRT heap cannot hold anything large anyway.  Instead we
+       read the small superblock + TOC once via pread() into a heap-free (mmap)
+       buffer and serve every data extent later with pread() too.  pread from
+       this same USB path is already proven to work for the exefs modules. */
+    uint8_t hdr[0x80];
+    if (pread(fd, hdr, sizeof hdr, 0) != (ssize_t)sizeof hdr) {
+        g_nup_err = -12; g_nup_errno = errno; close(fd); return 0;
     }
-    const uint8_t* base = (const uint8_t*)map;
-
-    uint64_t toc_offset  = rd64(base + 8);
-    uint64_t toc_size    = rd64(base + 16);
-    uint64_t blob_offset = rd64(base + 56);
-    uint64_t file_size   = rd64(base + 64);
-    uint32_t npkg        = rd32(base + 72);
-    uint32_t flags       = rd32(base + 76);
+    uint64_t toc_offset  = rd64(hdr + 8);
+    uint64_t toc_size    = rd64(hdr + 16);
+    uint64_t blob_offset = rd64(hdr + 56);
+    uint64_t file_size   = rd64(hdr + 64);
+    uint32_t npkg        = rd32(hdr + 72);
+    uint32_t flags       = rd32(hdr + 76);
 
     /* Basic sanity so a truncated / corrupt file cannot make us read OOB. */
-    if (flags != 0) { g_nup_err = -2; munmap(map,(size_t)fsize); close(fd); return 0; }
-    if (toc_offset != 0x80) { g_nup_err = -3; munmap(map,(size_t)fsize); close(fd); return 0; }
-    if (toc_offset + toc_size > fsize) { g_nup_err = -9; munmap(map,(size_t)fsize); close(fd); return 0; }
-    if (blob_offset < toc_offset + toc_size) { g_nup_err = -4; munmap(map,(size_t)fsize); close(fd); return 0; }
-    if (blob_offset > fsize) { g_nup_err = -10; munmap(map,(size_t)fsize); close(fd); return 0; }
+    if (flags != 0) { g_nup_err = -2; close(fd); return 0; }
+    if (toc_offset != 0x80) { g_nup_err = -3; close(fd); return 0; }
+    if (toc_offset + toc_size > fsize) { g_nup_err = -9; close(fd); return 0; }
+    if (blob_offset < toc_offset + toc_size) { g_nup_err = -4; close(fd); return 0; }
+    if (blob_offset > fsize) { g_nup_err = -10; close(fd); return 0; }
 
-    const uint8_t* toc = base + toc_offset;
-    if (memcmp(toc, "TOC\x01", 4) != 0) { g_nup_err = -7; munmap(map,(size_t)fsize); close(fd); return 0; }
+    uint8_t* toc = nup_alloc(toc_size ? (size_t)toc_size : 1);
+    if (!toc) { g_nup_err = -20; g_nup_errno = errno; close(fd); return 0; }
+    if (pread(fd, toc, (size_t)toc_size, (off_t)toc_offset) != (ssize_t)toc_size) {
+        g_nup_err = -13; g_nup_errno = errno; nup_free(toc, toc_size); close(fd); return 0;
+    }
+
+    if (memcmp(toc, "TOC\x01", 4) != 0) { g_nup_err = -7; nup_free(toc, toc_size); close(fd); return 0; }
     uint32_t package_count = rd32(toc + 4);
     uint64_t dir_count     = rd64(toc + 8);
     uint64_t file_count    = rd64(toc + 16);
@@ -189,7 +193,7 @@ int nup_open(const char* path) {
 
     if (package_count == 0 || package_count > 4096 ||
         dir_count > 8*1024*1024 || file_count > 16*1024*1024) {
-        g_nup_err = -11; munmap(map,(size_t)fsize); close(fd); return 0;
+        g_nup_err = -11; nup_free(toc, toc_size); close(fd); return 0;
     }
 
     uint64_t dir_at      = 0x30 + (uint64_t)package_count * 0x40;
@@ -198,13 +202,11 @@ int nup_open(const char* path) {
     uint64_t children_bytes = pool_offset - children_at;
     if (pool_offset < children_at || pool_offset + pool_size > toc_size ||
         children_bytes % 4 != 0) {
-        g_nup_err = -8; munmap(map,(size_t)fsize); close(fd); return 0;
+        g_nup_err = -8; nup_free(toc, toc_size); close(fd); return 0;
     }
 
     G.fd           = fd;
-    G.map          = map;
-    G.map_size     = fsize;
-    G.toc          = (uint8_t*)toc;
+    G.toc          = toc;
     G.toc_size     = toc_size;
     G.blob_offset  = blob_offset;
     G.file_size    = file_size;
@@ -241,7 +243,7 @@ int nup_open(const char* path) {
 
 void nup_close(void) {
     if (G.fd >= 0) { close(G.fd); G.fd = -1; }
-    if (G.map) { munmap(G.map, (size_t)G.map_size); G.map = NULL; }
+    if (G.toc) { nup_free(G.toc, G.toc_size); G.toc = NULL; }
     for (int i = 0; i < zc_n; i++) nup_free(zc[i].data, zc[i].size);
     zc_n = 0; zc_bytes = 0;
     memset(&G, 0, sizeof G);
@@ -250,6 +252,10 @@ void nup_close(void) {
 }
 
 int nup_base_romfs_dir(void) { return G.base_romfs_dir; }
+
+int nup_node_count(void) { return (int)G.ndirs + (int)G.nfiles; }
+
+uint64_t nup_pool_size(void) { return (uint64_t)G.pool_size; }
 
 int nup_dir_child_count(int dir_node) {
     if (dir_node < 0 || (uint32_t)dir_node >= G.ndirs) return 0;
@@ -317,8 +323,8 @@ int nup_read_file(int file_node, uint64_t offset, void* dst, uint64_t size) {
     if (offset >= size0) return 0;            /* past end -> caller fills zeros */
     uint64_t n = size; if (offset + n > size0) n = size0 - offset;
 
-    if (codec == 0) { /* raw: zero-copy in-place read straight from the mapping */
-        memcpy(dst, (const uint8_t*)G.map + (size_t)(G.blob_offset + ext_off + offset), (size_t)n);
+    if (codec == 0) { /* raw: direct pread from the blob (no mmap of the giant file) */
+        if (pread(G.fd, dst, (size_t)n, (off_t)(G.blob_offset + ext_off + offset)) != (ssize_t)n) return -1;
         return 0;
     }
 
@@ -329,11 +335,10 @@ int nup_read_file(int file_node, uint64_t offset, void* dst, uint64_t size) {
         if (!comp) return -1;
         uint8_t* full = nup_alloc(size0 ? (size_t)size0 : 1);
         if (!full) { nup_free(comp, ext_size); return -1; }
-        memcpy(comp, (const uint8_t*)G.map + (size_t)(G.blob_offset + ext_off), (size_t)ext_size);
-        ssize_t r = (ssize_t)ext_size;
-        size_t d = (r == (ssize_t)ext_size)
-                       ? ZSTD_decompress(full, (size_t)size0, comp, (size_t)ext_size)
-                       : (size_t)-1;
+        if (pread(G.fd, comp, (size_t)ext_size, (off_t)(G.blob_offset + ext_off)) != (ssize_t)ext_size) {
+            nup_free(comp, ext_size); nup_free(full, size0); return -1;
+        }
+        size_t d = ZSTD_decompress(full, (size_t)size0, comp, (size_t)ext_size);
         nup_free(comp, ext_size);
         if (ZSTD_isError(d) || d != (size_t)size0) { nup_free(full, size0); return -1; }
         memcpy(dst, full + offset, (size_t)n);

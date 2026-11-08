@@ -19,6 +19,13 @@ void nup_close(void);
    Falls back to the first package that has a romfs directory. */
 int nup_base_romfs_dir(void);
 
+/* Total number of nodes (directories + files) in the container. Useful for
+   preallocating the RomFS index without touching the tiny PS5 CRT heap. */
+int nup_node_count(void);
+
+/* Size of the string pool (bytes) referenced by node names. */
+uint64_t nup_pool_size(void);
+
 /* Directory tree traversal. A "node" is an index into the container's combined
    node space: 0 .. ndirs-1 are directories, ndirs .. ndirs+nfiles-1 are files. */
 int  nup_dir_child_count(int dir_node);

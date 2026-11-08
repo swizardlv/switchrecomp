@@ -22,7 +22,14 @@ void logf_(int lvl, const char* fmt, ...){
   char tb[24]; snprintf(tb,sizeof tb,"[%7.2f] ",(double)(now-t0)/1e9);
   pm_lock(&g_logm);
   if(!g_logf){ char p[1200]; snprintf(p,sizeof p,"%s%s.log",g_exedir,g_exename[0]?g_exename:"switchrecomp"); g_logf=fopen(p,"w"); }
-  if(g_logf){ static int bol=1; if(bol) fputs(tb,g_logf); fputs(buf,g_logf); size_t L=strlen(buf); bol= L && buf[L-1]=='\n'; fflush(g_logf); }
+  if(g_logf){ static int bol=1; if(bol) fputs(tb,g_logf); fputs(buf,g_logf); size_t L=strlen(buf); bol= L && buf[L-1]=='\n'; fflush(g_logf);
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+    /* On the PS5 a hard freeze/panic can leave the UFS2 page cache unflushed,
+       so every log line is fsync'd to survive a crash (see
+       docs/ps5_splash_hang_analysis.md, root cause 6). */
+    if(g_logf != stderr) fsync(fileno(g_logf));
+#endif
+  }
   if(lvl<=1 || g_verbose>=2) fputs(buf,stderr);
   pm_unlock(&g_logm);
 }

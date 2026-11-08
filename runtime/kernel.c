@@ -130,7 +130,15 @@ static void thread_body(void* p){
 
 void kthread_start(KThread* t){
   t->state=1;
-  if(plat_thread(thread_body,t,(size_t)64<<20)) fatal("could not create a system thread");
+#if defined(__PROSPERO__) || defined(__ORBIS__)
+  /* PS5's host thread-stack region is small; 4 MiB is plenty for recompiled
+     guest code, and keeps the 16-40 guest threads a game spawns from exhausting
+     it (a 64 MiB request here is what the doc flags as root cause 5). */
+  size_t stack_sz = (size_t)4 << 20;
+#else
+  size_t stack_sz = (size_t)64 << 20;
+#endif
+  if(plat_thread(thread_body,t,stack_sz)) fatal("could not create a system thread");
 }
 
 void svc_exit_thread(KThread* t){
