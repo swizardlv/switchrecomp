@@ -20,8 +20,8 @@ DIRS = (
     '/devlog/system', '/data',
 )
 FILES = (
-    '/data/switchrecomp/swr.log', '/data/ps5_probe.log',
-    '/data/switchrecomp/swr.ini',
+    '/data/switchrecomp/swr.log', '/data/switchrecomp/va_probe.log',
+    '/data/ps5_probe.log', '/data/switchrecomp/swr.ini',
 )
 VERDICT_KEYS = ('FATAL', 'window OK', 'window FAILED', 'segment ', 'reserve ',
                 'commit selftest', 'decommit selftest', 'statically linked',
@@ -79,6 +79,7 @@ def main():
             out['issues'].append('%s: %s' % (d, out['dirs'][d]))
 
     text = ''
+    va_text = ''
     for f in FILES:
         try:
             raw = wfm_download(op, base, f)
@@ -92,6 +93,8 @@ def main():
         out['files'][f] = dict(local=local, size=len(raw))
         if f.endswith('swr.log'):
             text = raw.decode('utf-8', 'replace')
+        if f.endswith('va_probe.log'):
+            va_text = raw.decode('utf-8', 'replace')
 
     with open(os.path.join(a.run_dir, 'timeline.json'), 'w', encoding='utf-8') as fo:
         json.dump(out, fo, indent=2, ensure_ascii=False)
@@ -106,6 +109,9 @@ def main():
              'swr.log : %d bytes' % len(text.encode('utf-8', 'replace')),
              '']
     lines += ['--- swr.log ---'] + (text.splitlines() or ['(missing)'])
+    if va_text:
+        lines += ['', '--- va_probe.log (%d bytes) ---' % len(va_text.encode('utf-8', 'replace'))]
+        lines += va_text.splitlines()
     lines += ['', '--- verdict lines ---']
     lines += [l for l in text.splitlines() if any(k.lower() in l.lower() for k in VERDICT_KEYS)] or ['(none)']
     if out['issues']:

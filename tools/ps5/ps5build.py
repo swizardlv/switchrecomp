@@ -462,13 +462,16 @@ def main():
     ap.add_argument('--smoke', action='store_true')
     ap.add_argument('--probe', action='store_true',
                     help='build a tiny boot-probe title (same CRT/link/sign chain, ~MB eboot)')
+    ap.add_argument('--va-probe', action='store_true',
+                    help='build a tiny VA-capability probe from tools/ps5/ps5_va_probe.c')
     ap.add_argument('--runtime-only', action='store_true')
     a = ap.parse_args()
 
     cfg = dict(repo=os.path.abspath(a.repo), sdk=a.sdk, llvm_config=a.llvm_config,
                boilerplate=a.boilerplate, opt=a.opt, jobs=a.jobs, title='', ps5_title_id=a.title_id,
                appdir='', datadir='', archive='', module_obj='', objects_rsp='', smoke=a.smoke,
-               probe=a.probe, runtime_only=a.runtime_only, backend=a.backend)
+               probe=a.probe or a.va_probe, va_probe=a.va_probe,
+               runtime_only=a.runtime_only, backend=a.backend)
     if a.manifest:
         with open(a.manifest, encoding='utf-8') as f: m = json.load(f)
         for k in ('repo', 'sdk', 'llvm_config', 'boilerplate', 'opt', 'jobs', 'backend', 'title',
@@ -501,8 +504,18 @@ def main():
         pie = os.path.join(c.run_dir, 'llvm-pie.elf')
         if c.probe:
             probe = os.path.join(c.run_dir, 'probe.c')
+            if c.va_probe:
+                va_src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      'ps5_va_probe.c')
+                if not os.path.isfile(va_src):
+                    run.issue('VA_PROBE_SRC_MISSING', va_src)
+                    report(run, c); return 1
+                with open(va_src, encoding='utf-8') as sf:
+                    probe_c = sf.read()
+            else:
+                probe_c = PROBE_C
             with open(probe, 'w') as f:
-                f.write(PROBE_C)
+                f.write(probe_c)
             r = compile_one((probe, os.path.join(objdir, 'probe.o'), c.sdk, c.repo, c.opt, env))
             if r['rc']:
                 run.issue('PROBE_COMPILE_FAILED', r['tail'])
