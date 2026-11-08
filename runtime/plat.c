@@ -437,14 +437,15 @@ int plat_text_input(const u16* def, u16* out, int max){
    sceKernelReserveVirtualRange() and commit pages on demand with mmap(MAP_FIXED)
    -- the same pattern EglantinePS5 uses for its fastmem window.
 
-   sceKernelReserveVirtualRange() also has a per-call size ceiling: on this
-   console 16 GiB succeeds (base 0x200200000), 32 GiB and 128 GiB fail with
-   0x8002000C. AS_SIZE is 128 GiB and every guest region is an offset into ONE
-   contiguous host reservation, so shrinking the layout would change guest-
-   visible addresses. Instead the window is reserved as N equal MAP_FIXED
-   segments (EglantinePS5's UnmapChunks / nxnative PoC two-segment fallback
-   pattern). Every call is logged so one console run reports the real ceiling
-   and the first segment that fails. */
+   Measured on hardware with tools/ps5/ps5_va_probe.c: the 16 GiB ceiling is
+   NOT a per-call size limit, it is the LOW address region. hint=NULL places
+   the window at 0x200200000 where only 16 GiB of contiguous VA is free; a
+   hint inside the CPU map range (>= 0x1000000000) grants the full 128 GiB in
+   ONE call with the hint honoured exactly. MAP_FIXED reserve on a fresh low
+   address (0x600200000) killed the process, while the same call at a high
+   address succeeds. AS_SIZE is 128 GiB and every guest region is an offset
+   into ONE contiguous host reservation, so shrinking the layout would change
+   guest-visible addresses. Reserve the whole window once at a high hint. */
 extern int   sceKernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment);
 extern int64_t sceKernelGetDirectMemorySize(void);
 #define SWR_PS5_VA_GRANULE 0x200000ull   /* 2 MiB, the PS5 "large page" */
@@ -456,74 +457,80 @@ static int ps5_reserve_at(void* want, u64 size, int flags, void** out){
   return rc;
 }
 
-/* Reserve [base, base+size) as a contiguous window. Returns the base or NULL.
-   Never leaves partial reservations behind. */
+/* Reserve [base, base+size) as ONE contiguous window.
+   Hardware probe tools/ps5/ps5_va_probe.c (2026-11-08) settled the question:
+     hint=NULL / 0x300000000        -> 16 GiB ok, 32 GiB+ rc=0x8002000C
+     hint=0x1000000000 / 0x2000000000 -> 16/32/64/128 GiB ALL rc=0, exact hint
+     mmap + MAP_NORESERVE(0x40)     -> EINVAL; plain mmap -> ENOMEM
+     mmap(MAP_FIXED) commit -> touch -> munmap -> re_reserve -> all OK
+     MAP_FIXED reserve on a fresh high address -> rc=0 (NOT fatal)
+   So the 16 GiB ceiling was the LOW address region, not a per-call size limit:
+   hint=NULL lands at 0x200200000 where only 16 GiB of contiguous VA is free,
+   and chaining a second segment at 0x600200000 killed the process. A high hint
+   inside the CPU map range [0x300000000, 0x4000000000) grants the whole
+   AS_SIZE in ONE call. No segmentation, no change to AS_SIZE or any
+   guest-visible address. */
 static u8* ps5_reserve_window(u64 size){
-  void* base = NULL;
-  u64 chunk = 0;
-  /* Find the largest single call the kernel grants. The first success is kept
-     as segment 0 instead of being released and reserved again. */
-  for(u64 s = size; s >= (1ull<<30); s >>= 1){
-    void* hint = NULL;
-    int rc = ps5_reserve_at(NULL, s, 0, &hint);
-    LOG("mem:   reserve %6llu MiB -> rc=%d addr=%p\n",
-        (unsigned long long)(s>>20), rc, hint);
-    if(rc == 0 && hint && hint != MAP_FAILED){ base = hint; chunk = s; break; }
-  }
-  if(!base){
-    LOG("mem: no single reservation >= 1024 MiB succeeded\n");
-    return NULL;
-  }
-  if(chunk == size){
-    LOG("mem: window OK: 1 segment x %llu MiB at %p\n",
-        (unsigned long long)(chunk>>20), base);
-    return (u8*)base;
-  }
-  if(size % chunk){
-    LOG("mem: window FAILED: %llu MiB is not a multiple of the %llu MiB ceiling\n",
-        (unsigned long long)(size>>20), (unsigned long long)(chunk>>20));
-    munmap(base, (size_t)chunk);
-    return NULL;
-  }
-  u64 nseg = size / chunk;
-  for(u64 k = 1; k < nseg; ++k){
-    void* want = (void*)((u8*)base + k*chunk);
-    void* got = want;
-    int rc = ps5_reserve_at(want, chunk, MAP_FIXED, &got);
-    LOG("mem:   segment %llu/%llu want=%p got=%p rc=%d\n",
-        (unsigned long long)k, (unsigned long long)nseg, want, got, rc);
-    if(rc || got != want){
-      LOG("mem: window FAILED at segment %llu: %llu/%llu MiB reserved, releasing\n",
-          (unsigned long long)k, (unsigned long long)((k*chunk)>>20),
-          (unsigned long long)(size>>20));
-      munmap(base, (size_t)(k*chunk));
-      return NULL;
+  static const uintptr_t hints[] = {
+    0x1000000000ull,   /* [64,192) GiB -- comfortably inside the CPU map range */
+    0x2000000000ull,   /* [128,256) GiB -- upper edge, still legal */
+    0x0400000000ull,   /* 16 GiB */
+    0x300000000ull,    /* 12 GiB */
+    0                  /* kernel's own choice (16 GiB ceiling) */
+  };
+  for(unsigned i=0; i<sizeof hints/sizeof hints[0]; ++i){
+    void* hint = (void*)hints[i];
+    void* p = hint;
+    int rc = ps5_reserve_at(hint, size, 0, &p);
+    LOG("mem:   reserve %6llu MiB hint=%p -> rc=%d addr=%p\n",
+        (unsigned long long)(size>>20), hint, rc, p);
+    if(rc || !p || p == MAP_FAILED) continue;
+    if((uintptr_t)p % SWR_PS5_VA_GRANULE || (uintptr_t)p + size < (uintptr_t)p){
+      LOG("mem:   unusable placement (unaligned/wrap), releasing\n");
+      munmap(p, (size_t)size);
+      continue;
     }
-  }
-  LOG("mem: window OK: %llu segments x %llu MiB = %llu MiB at %p..%p\n",
-      (unsigned long long)nseg, (unsigned long long)(chunk>>20),
-      (unsigned long long)(size>>20), base, (void*)((u8*)base+size));
-  /* Prove the full commit -> touch -> decommit -> re-reserve cycle on segment
-     0 before the guest starts using the window. One console run then covers
-     both the VA ceiling and the page-commit path. */
-  {
-    u64 probe = SWR_PS5_VA_GRANULE;
-    void* r = mmap(base, (size_t)probe, PROT_READ|PROT_WRITE,
-                   MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
-    if(r == base){
-      volatile u8* p = (volatile u8*)base;
-      p[0] = 0x5A; p[probe-1] = 0xA5;
-      LOG("mem: commit selftest mmap=OK touch first=%02x last=%02x\n", p[0], p[probe-1]);
-      int mu = munmap(base, (size_t)probe);
-      void* again = base;
-      int rr = ps5_reserve_at(base, probe, MAP_FIXED, &again);
-      LOG("mem: decommit selftest munmap=%d re_reserve rc=%d addr=%p %s\n",
-          mu, rr, again, (!mu && !rr && again==base)? "OK" : "FAILED");
-    } else {
-      LOG("mem: commit selftest mmap(MAP_FIXED) FAILED got=%p errno=%d\n", r, errno);
+    LOG("mem: window OK: 1 x %llu MiB at %p..%p\n",
+        (unsigned long long)(size>>20), p, (void*)((u8*)p+size));
+    /* Prove commit -> touch -> decommit -> re-reserve at BOTH ends of the
+       full window before the guest starts using it. One console run then
+       covers VA placement and the page-commit path together. */
+    { u64 ends[2] = { 0, size - SWR_PS5_VA_GRANULE };
+      for(int e=0;e<2;++e){
+        u8* at = (u8*)p + ends[e];
+        void* r = mmap(at, (size_t)SWR_PS5_VA_GRANULE, PROT_READ|PROT_WRITE,
+                       MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+        if(r == at){
+          volatile u8* q = (volatile u8*)at;
+          q[0]=0x5A; q[SWR_PS5_VA_GRANULE-1]=0xA5;
+          LOG("mem: commit selftest end=%d off=%llu MiB touch=%02x/%02x OK\n",
+              e, (unsigned long long)(ends[e]>>20), q[0], q[SWR_PS5_VA_GRANULE-1]);
+          int mu = munmap(at, (size_t)SWR_PS5_VA_GRANULE);
+          void* again = at;
+          int rr = ps5_reserve_at(at, SWR_PS5_VA_GRANULE, MAP_FIXED, &again);
+          LOG("mem: decommit selftest end=%d munmap=%d re_reserve rc=%d addr=%p %s\n",
+              e, mu, rr, again, (!mu && !rr && again==at)? "OK" : "FAILED");
+        } else {
+          LOG("mem: commit selftest end=%d mmap(MAP_FIXED) FAILED got=%p errno=%d\n",
+              e, r, errno);
+        }
+      }
     }
+    return (u8*)p;
   }
-  return (u8*)base;
+  /* Fallback for other firmware/layout variants: report the largest single
+     window the high hint grants, so the next change is driven by a measured
+     number. Never silently hand back a smaller AS_SIZE. */
+  for(u64 s = size>>1; s >= (1ull<<30); s >>= 1){
+    void* hint = (void*)0x1000000000ull;
+    void* q = hint;
+    int r2 = ps5_reserve_at(hint, s, 0, &q);
+    LOG("mem:   probe %6llu MiB -> rc=%d addr=%p\n",
+        (unsigned long long)(s>>20), r2, q);
+    if(r2 == 0 && q) munmap(q, (size_t)s);
+  }
+  LOG("mem: no usable %llu MiB window at any hint\n", (unsigned long long)(size>>20));
+  return NULL;
 }
 #endif
 
@@ -590,8 +597,9 @@ u8* plat_vm_reserve(u64 size){
   LOG("mem: mmap(PROT_NONE,MAP_ANON) -> %s errno=%d\n",
       p0==MAP_FAILED? "FAILED" : "OK", p0==MAP_FAILED? errno : 0);
   if(p0 != MAP_FAILED) return (u8*)p0;
-  /* OrbisOS refuses the whole 128 GiB in one call; build the same contiguous
-     window out of ceiling-sized MAP_FIXED segments instead. */
+  /* Plain mmap cannot back 128 GiB here (ENOMEM) and the 0x40 MAP_NORESERVE
+     bit is rejected (EINVAL). Keep this attempt as a durable diagnostic,
+     then use the high-hint reserve path. */
   return ps5_reserve_window(size);
 #else
   void* p=mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); return p==MAP_FAILED? NULL : (u8*)p;
