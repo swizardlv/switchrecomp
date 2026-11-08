@@ -134,9 +134,15 @@ void crash_report(void* host_pc, void* fault, int sig){
      known from nm. Locally, pc_off = (pc_rel + nm(crash_report)) maps straight
      into llvm-addr2line, whatever ASLR base the console picked. */
   { u64 p=(u64)(size_t)host_pc, self=(u64)(size_t)&crash_report;
-    logf_(0,"  diag: &crash_report=%p pc_rel=%s%lld g_mod=%p g_disp=%p g_mem=%p\n",
-          (void*)self, (p>=self? "+" : "-"), (long long)(p>=self? p-self : self-p),
-          (void*)g_mod, (void*)g_disp, (void*)g_mem); }
+    u64 rel = p>=self? p-self : self-p;
+    logf_(0,"  diag: &crash_report=%p pc_rel=%s%llx g_mod=%p g_disp=%p g_mem=%p\n",
+          (void*)self, (p>=self? "+" : "-"), (unsigned long long)rel,
+          (void*)g_mod, (void*)g_disp, (void*)g_mem);
+    /* The app ELF is ~236 MB. A bigger relative offset means the fault is
+       inside a system library (libc/libkernel), so addr2line on our ELF is
+       meaningless -- the stage/loader logs are what pin the call site. */
+    if(p>=self && rel>0x10000000ull)
+      logf_(0,"  diag: pc outside app image: fault inside a system library\n"); }
   { extern void mem_report(char*,int); char mr[200]; mem_report(mr,sizeof mr); logf_(0,"  memory: %s\n",mr);
 #ifdef _WIN32
     { extern char __ImageBase; u64 b=(u64)(size_t)&__ImageBase, p=(u64)(size_t)host_pc; if(p>=b && p<b+0x10000000ull) logf_(0,"  in the runtime itself (exe offset +%llx), thread %s\n",(unsigned long long)(p-b), kthread_cur()? "of the game" : "of the runtime (GPU, audio or window)"); }
@@ -417,7 +423,7 @@ static void build_dispatch(void){
      ps5_alloc_large uses anonymous mmap and falls back to direct memory. */
   extern void* ps5_alloc_large(u64 size);
   g_disp=(GuestFn*)ps5_alloc_large(bytes);
-  LOG("dispatch: ps5_alloc_large -> %p errno=%d\n",(void*)g_disp,errno);
+  LOG("dispatch: ps5_alloc_large -> %p %s\n",(void*)g_disp,g_disp?"OK":"FAILED");
 #else
   g_disp=calloc(n?n:1,sizeof(GuestFn));
   LOG("dispatch: calloc -> %p errno=%d\n",(void*)g_disp,errno);

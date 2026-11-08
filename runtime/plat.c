@@ -495,6 +495,18 @@ void* ps5_alloc_large(u64 size){
   return q;
 }
 
+/* Companion to ps5_alloc_large. The mmap path only needs munmap(); the
+   direct-memory fallback would additionally need sceKernelReleaseDirectMemory,
+   but that path is only a fallback and these are one-shot startup buffers. */
+void ps5_free_large(void* p, u64 size){
+  if(!p || p==MAP_FAILED) return;
+  u64 bytes = size ? size : 1;
+  u64 aligned = (bytes + SWR_PS5_VA_GRANULE-1) & ~(SWR_PS5_VA_GRANULE-1);
+  int rc = munmap(p,(size_t)aligned);
+  LOG("mem: free_large: munmap(%p, %llu MiB) rc=%d\n",p,
+      (unsigned long long)(aligned>>20),rc);
+}
+
 /* Reserve [base, base+size) as ONE contiguous window.
    Hardware probe tools/ps5/ps5_va_probe.c (2026-11-08) settled the question:
      hint=NULL / 0x300000000        -> 16 GiB ok, 32 GiB+ rc=0x8002000C
