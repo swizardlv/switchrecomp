@@ -21,6 +21,11 @@ RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', '
 EXTRA = ['gpu_nogl', 'shader_proc', 'host1x', 'snxvk_glue',
          'backend_ps5', 'entry', 'ps5_crt']
 
+# zstd headers for runtime/nup_ps5.c, from the pacbrew payload SDK (same path
+# ps5build.py uses).
+ZSTD_INC = ('/data/code/EglantinePS5-build56/.deps/pacbrew-0.40.2/opt/'
+            'ps5-payload-sdk/target/user/homebrew/include')
+
 
 def normalise(line):
     x = re.sub(r'[^/\s]+\.(c|h|cpp)', '<file>', line)
@@ -49,6 +54,11 @@ def cc_cmd(a, src, syntax_only=True):
            '-I', os.path.join(a.repo, 'runtime', 'spvc'),
            '-I', os.path.join(a.repo, 'runtime', 'oh264', 'include'),
            '-I', os.path.join(a.repo, 'runtime', 'opus', 'include')]
+    # zstd ships with the pacbrew payload SDK; ps5build.py adds the same path for
+    # nup_ps5.c. Keep the sweep authoritative: without it that one file always
+    # "fails" for a reason the real build does not have.
+    if os.path.isdir(ZSTD_INC):
+        cmd += ['-I', ZSTD_INC]
     cmd += ['-DSWR_NO_H264', '-DSWR_NO_OPUS', '-DSWR_PS5']
     cmd += ['-fsyntax-only'] if syntax_only else ['-c']
     cmd += [src]
