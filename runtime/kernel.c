@@ -820,27 +820,107 @@ static int s2_cstr(u64 a, char* out, int cap){
   }
   out[0]=0; return 0; }
 
+/* Track unique NVN caller return addresses so new call sites are always logged
+   even after high-frequency loops exhaust the initial call counter. */
+static int s2_nvn_lr_seen(u64 lr){
+  static u64 seen[128]; static u32 nseen;
+  u32 n=__atomic_load_n(&nseen,__ATOMIC_RELAXED);
+  for(u32 i=0;i<n && i<128;i++) if(seen[i]==lr) return 1;
+  u32 idx=__atomic_fetch_add(&nseen,1,__ATOMIC_RELAXED);
+  if(idx<128) seen[idx]=lr;
+  return 0; }
+
+/* In Bananza's NVN texture/sampler descriptor pool manager (F_813a27c,
+   returned to at lr=0x813a538 after nvnTextureInitialize), x19 holds the
+   descriptor pool manager object:
+     *(u32*)(x19 + 0xaa0) [2720] = pool capacity (power of 2, e.g. 4096)
+     *(u64*)(x19 + 0xaa8) [2728] = pointer to array of 40-byte descriptor slots
+     *(u16*)(x19 + 0xb12) [2834] = reserved descriptor count (256)
+     *(u32*)(x19 + 0xb14) [2836] = atomic next-slot counter
+   Each 40-byte slot at slot_array + idx*40 has a 32-bit state at offset +0:
+     -1 (0xFFFFFFFF) = free slot (acquired via CAS(-1 -> 1) at 0x813a578 / 0x813a5fc)
+   When the descriptor pool capacity at x19+0xaa0 is 0 or slot states are 0
+   instead of -1, F_813a27c computes mask = capacity - 1 = 0xFFFFFFFF and spins
+   across all 2^32 indices (4.29 billion atomic CAS+LDADD iterations, ~45s per
+   pass at 0x813a538 -> 0x813a5c0 -> 0x813a63c) without ever finding a free
+   slot (run 1806).  Ensure the pool has a valid power-of-two capacity and
+   40-byte slot table initialized to -1 (free). */
+static void s2_nvn_heal_pool(CPU* c){
+  u64 mgr=c->x[19];
+  if(!s2_guest_ok(mgr,0xb20)) return;
+  /* Only match if mgr looks like the descriptor manager before 0x813a538:
+     check either the exact return address 0x813a538 or a caller in 0x8138000..0x813c000. */
+  u64 lr=c->x[30];
+  if(lr<0x8138000ull || lr>0x813c000ull) return;
+  u32 cap=0; u64 arr=0; u16 rsv=0;
+  memcpy(&cap,GP(mgr+0xaa0),4);
+  memcpy(&arr,GP(mgr+0xaa8),8);
+  memcpy(&rsv,GP(mgr+0xb12),2);
+  int need_init=0;
+  if(cap<512 || (cap&(cap-1))!=0){ cap=4096; memcpy(GP(mgr+0xaa0),&cap,4); need_init=1; }
+  if(!s2_guest_ok(arr,(u64)cap*40ull)){
+    static u64 pool_slots_va;
+    if(!pool_slots_va){
+      s2_nvn_scratch_addr();
+      /* Reserve 256 KiB at offset +0x20000 inside the 1 MiB NVN scratch region
+         (enough for 4096 * 40 = 163,840 bytes of descriptor slots). */
+      pool_slots_va = g_nvn_scratch ? (g_nvn_scratch + 0x20000ull) : 0;
+      if(s2_guest_ok(pool_slots_va,(u64)cap*40ull)){
+        u8* p=(u8*)GP(pool_slots_va);
+        memset(p,0,(size_t)cap*40u);
+        u32 free_tag=0xFFFFFFFFu;
+        for(u32 i=0;i<cap;i++) memcpy(p+(size_t)i*40u,&free_tag,4);
+      }
+    }
+    arr=pool_slots_va;
+    memcpy(GP(mgr+0xaa8),&arr,8);
+    need_init=1;
+  }
+  if(s2_guest_ok(arr,(u64)cap*40ull)){
+    /* Ensure at least a batch of slots are marked free (-1) so the CAS at
+       0x813a578 / 0x813a5fc succeeds on the very first probe. */
+    u8* p=(u8*)GP(arr);
+    u32 free_cnt=0, free_tag=0xFFFFFFFFu;
+    for(u32 i=0;i<cap;i++){
+      u32 st=0; memcpy(&st,p+(size_t)i*40u,4);
+      if(st==0xFFFFFFFFu) free_cnt++;
+    }
+    if(free_cnt<64){
+      for(u32 i=0;i<cap;i++){
+        u32 st=0; memcpy(&st,p+(size_t)i*40u,4);
+        if(st==0 || need_init) memcpy(p+(size_t)i*40u,&free_tag,4);
+      }
+      LOG("hle: [S2] healed NVN descriptor pool at mgr=%llx: cap=%u arr=%llx rsv=%u (was free=%u) lr=%llx\n",
+          (unsigned long long)mgr,cap,(unsigned long long)arr,rsv,free_cnt,(unsigned long long)lr);
+    }
+  }
+}
+
 static void hle_s2_nvn_true(CPU* c,u64 pc){
   (void)pc;
+  s2_nvn_heal_pool(c);
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
-  if(k<64) LOG("hle: [S2] nvn call TRUE  x0=%llx x1=%llx x2=%llx lr=%llx\n",
-               (unsigned long long)c->x[0],(unsigned long long)c->x[1],
-               (unsigned long long)c->x[2],(unsigned long long)c->x[30]);
+  if(k<64 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn call TRUE  x0=%llx x1=%llx x2=%llx lr=%llx\n",
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)c->x[2],(unsigned long long)c->x[30]);
   c->x[0]=1; c->pc=c->x[30]; }
 static void hle_s2_nvn_zero(CPU* c,u64 pc){
   (void)pc;
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
-  if(k<64) LOG("hle: [S2] nvn call ZERO  x0=%llx x1=%llx x2=%llx lr=%llx\n",
-               (unsigned long long)c->x[0],(unsigned long long)c->x[1],
-               (unsigned long long)c->x[2],(unsigned long long)c->x[30]);
+  if(k<64 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn call ZERO  x0=%llx x1=%llx x2=%llx lr=%llx\n",
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)c->x[2],(unsigned long long)c->x[30]);
   c->x[0]=0; c->pc=c->x[30]; }
 static void hle_s2_nvn_obj(CPU* c,u64 pc){
   (void)pc;
   u64 a=s2_nvn_scratch_addr();
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
-  if(k<64) LOG("hle: [S2] nvn call OBJ   x0=%llx x1=%llx -> %llx lr=%llx\n",
-               (unsigned long long)c->x[0],(unsigned long long)c->x[1],
-               (unsigned long long)a,(unsigned long long)c->x[30]);
+  if(k<64 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn call OBJ   x0=%llx x1=%llx -> %llx lr=%llx\n",
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)a,(unsigned long long)c->x[30]);
   c->x[0]=a; c->pc=c->x[30]; }
 /* NVN queries returning a size_t / alignment / stride / free space in x0
    (e.g. nvnTextureBuilderGetStorageSize, nvnTextureBuilderGetStorageAlignment,
@@ -854,9 +934,10 @@ static void hle_s2_nvn_size(CPU* c,u64 pc){
   (void)pc;
   u64 sz=4096;
   static u32 nsz; u32 k=__atomic_fetch_add(&nsz,1,__ATOMIC_RELAXED);
-  if(k<64) LOG("hle: [S2] nvn call SIZE  x0=%llx x1=%llx -> %llu lr=%llx\n",
-               (unsigned long long)c->x[0],(unsigned long long)c->x[1],
-               (unsigned long long)sz,(unsigned long long)c->x[30]);
+  if(k<64 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn call SIZE  x0=%llx x1=%llx -> %llu lr=%llx\n",
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)sz,(unsigned long long)c->x[30]);
   c->x[0]=sz; c->pc=c->x[30]; }
 /* nvnDeviceGetInteger(const NVNdevice *device, NVNdeviceInfo pname, int *v):
    Note that in NVN, device can be NULL for static queries, so check x0/x1 if
@@ -867,15 +948,19 @@ static void hle_s2_nvn_int(CPU* c,u64 pc){
   u32 pname=(u32)c->x[1]; u64 out=c->x[2];
   if(!s2_guest_ok(out,4) && s2_guest_ok(c->x[1],4)){ pname=(u32)c->x[0]; out=c->x[1]; }
   i32 val=256;
-  /* NVN_DEVICE_INFO_API_MAJOR_VERSION=0 (55), MINOR=1 (13), alignments (4096),
-     and 256 for descriptor sizes / reserved count queries (57, 58, etc.). */
+  /* NVN_DEVICE_INFO_API_MAJOR_VERSION=0 (55), MINOR=1 (13),
+     MAX_TEXTURE_POOL_SIZE=59 (1048576), MAX_SAMPLER_POOL_SIZE=60 (4096),
+     alignments (4096), and 256 for descriptor sizes / reserved count queries (57, 58, etc.). */
   if(pname==0) val=55;
   else if(pname==1) val=13;
+  else if(pname==59) val=1048576;
+  else if(pname==60) val=4096;
   else if(pname==81 || pname==85 || pname==91) val=4096;
   if(s2_guest_ok(out,4)) memcpy(GP(out),&val,4);
   static u32 nint; u32 k=__atomic_fetch_add(&nint,1,__ATOMIC_RELAXED);
-  if(k<96) LOG("hle: [S2] nvn GetInteger pname=%u (%#x) out=%llx -> %d lr=%llx\n",
-               pname,pname,(unsigned long long)out,val,(unsigned long long)c->x[30]);
+  if(k<96 || !s2_nvn_lr_seen(c->x[30]))
+    LOG("hle: [S2] nvn GetInteger pname=%u (%#x) out=%llx -> %d lr=%llx\n",
+        pname,pname,(unsigned long long)out,val,(unsigned long long)c->x[30]);
   c->x[0]=0; c->pc=c->x[30]; }
 /* nvnWindowAcquireTexture(NVNwindow *window, NVNsync * presentSync, int *idx) -> 0 (SUCCESS) */
 static void hle_s2_nvn_acq(CPU* c,u64 pc){
@@ -1464,9 +1549,11 @@ static int host_to_guest(u64 rip, u64* ga, u64* off){
   if(!best) return 0; *ga=g; *off=rip-best; return 1; }
 
 static void sample_thread(KThread* t){
-  void* h=__atomic_load_n(&t->host,__ATOMIC_ACQUIRE); if(!h) return;
+  void* h=__atomic_load_n(&t->host,__ATOMIC_ACQUIRE);
   u64 pcs[64]; int n=0;
-  for(int k=0;k<64;k++){ u64 pc; if(plat_thread_pc(h,&pc)) pcs[n++]=pc; plat_sleep_ns(2000000); }
+  if(h){
+    for(int k=0;k<64;k++){ u64 pc; if(plat_thread_pc(h,&pc)) pcs[n++]=pc; plat_sleep_ns(2000000); }
+  }
   if(!n){
     /* On PS5 plat_thread_pc returns 0 (no host RIP sampler), so a running
        thread used to produce no live register or code dump at all -- only its
