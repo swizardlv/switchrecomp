@@ -712,6 +712,85 @@ static void hle_s2_vi_hdrstatus(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_HDR_STAT
 static void hle_s2_vi_paperwhite(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_PAPER_WHITE); }
 static void hle_s2_vi_vrr(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_VRR); }
 
+/* ---- NVN null-device takeover -------------------------------------------
+   nxnative (dm/gfx/nvn/hle_nvn.c) force-replaces nvnBootstrapLoader, which
+   main imports from sdk: all 523 NVN names resolve to host thunks and the
+   SDK's NVN driver never runs.  We have no host NVN backend yet, so hand out
+   a small set of "null device" slots instead.  Without this the game walks
+   into the real NVN driver: NvRmMemHandleAllocAttr -> NvOsDrvGpuGetGpukDevice
+   -> nn::diag::Abort(0x30af3) -> svcBreak (verified 2026-11-09, run 1619).
+
+   The slot addresses are DISCOVERED from the dump's own symbol table, so the
+   same code works on OOT: four otherwise-unused NvOsDrv/nvn exports become
+   trampolines whose dispatch entries we own.  Every requested NVN name is
+   logged, so one run exposes the whole NVN surface the game actually uses. */
+#define S2_NVN_OBJ_TRUE   0x100001400ull
+#define S2_NVN_OBJ_HANDLE 0x100001500ull
+static u64 g_nvn_slot_true, g_nvn_slot_zero, g_nvn_slot_proc, g_nvn_slot_obj;
+static u32 g_nvn_lookups;
+
+/* guest is a flat reservation: only read a string inside a committed block */
+static int s2_cstr(u64 a, char* out, int cap){
+  if(a<AS_BASE || a>=AS_SIZE) return 0;
+  MemBlock b; mem_query(a,&b);
+  if(b.state==MS_FREE || b.state==MS_INACCESSIBLE) return 0;
+  u64 room=b.addr+b.size-a; if(room>=(u64)cap) room=(u64)cap-1;
+  const char* p=(const char*)GP(a); int i=0;
+  for(; i<(int)room; i++){ out[i]=p[i]; if(!p[i]) return 1; }
+  out[i]=0; return 1; }
+
+static void hle_s2_nvn_true(CPU* c,u64 pc){ (void)pc; c->x[0]=1; c->pc=c->x[30]; }
+static void hle_s2_nvn_zero(CPU* c,u64 pc){ (void)pc; c->x[0]=0; c->pc=c->x[30]; }
+static void hle_s2_nvn_obj (CPU* c,u64 pc){ (void)pc; c->x[0]=S2_NVN_OBJ_TRUE; c->pc=c->x[30]; }
+static void hle_s2_nvn_proc(CPU* c,u64 pc){ (void)pc; c->x[0]=g_nvn_slot_true; c->pc=c->x[30]; }
+
+static void hle_s2_nvn_bootstrap(CPU* c,u64 pc){
+  char nm[128]; int ok=s2_cstr(c->x[0],nm,sizeof nm);
+  u32 k=__atomic_fetch_add(&g_nvn_lookups,1,__ATOMIC_RELAXED);
+  /* Four distinct slots: boolean-ish calls must return true, void/state calls
+     get zero, object/address getters get an opaque guest object, and proc
+     lookups get another trampoline.  Handing one address to all 523 names
+     would also work for CALLDYN, but some SDKs sanity-check distinct entries. */
+  u64 slot=g_nvn_slot_true;
+  if(ok){
+    if(strstr(nm,"ProcAddress") || strstr(nm,"GetProc") || strstr(nm,"BootstrapLoader"))
+      slot=g_nvn_slot_proc? g_nvn_slot_proc : slot;
+    else if(strstr(nm,"Map") || strstr(nm,"Alloc") || strstr(nm,"Create") || strstr(nm,"GetMemory") || strstr(nm,"GetAddress"))
+      slot=g_nvn_slot_obj? g_nvn_slot_obj : slot;
+    else if(strstr(nm,"Set") || strstr(nm,"Bind") || strstr(nm,"Draw") || strstr(nm,"Clear") ||
+            strstr(nm,"Submit") || strstr(nm,"Finish") || strstr(nm,"Flush") ||
+            strstr(nm,"Finalize") || strstr(nm,"Destroy") || strstr(nm,"Free") ||
+            strstr(nm,"Reset") || strstr(nm,"Barrier") || strstr(nm,"Fence") || strstr(nm,"Copy"))
+      slot=g_nvn_slot_zero? g_nvn_slot_zero : slot;
+  }
+  if(k<600) LOG("hle: [S2] nvn lookup #%u %-58s -> %llx%s\n",
+                k,ok?nm:"<?>",(unsigned long long)slot,gsym(pc));
+  c->x[0]=slot; c->pc=c->x[30]; }
+
+/* NV driver glue: the host has no nvdrv.  nxnative's dm/host/hle_nvdrv.c
+   force-replaces the whole family so callers take their own failure path
+   instead of aborting inside nn::diag::Abort.  Take over every exported
+   NvOsDrv* (and a few NvRm* allocators) in one pass, and log the full family
+   so a single run shows every NV export on this dump. */
+static u32 g_nv_calls;
+static void hle_s2_nv(CPU* c,u64 pc,int kind){
+  u32 k=__atomic_fetch_add(&g_nv_calls,1,__ATOMIC_RELAXED);
+  if(k<96) LOG("hle: [S2] nvdrv call %llx kind=%d%s\n",
+               (unsigned long long)pc,kind,gsym(pc));
+  switch(kind){
+    case 1: c->x[0]=(u64)-1; break;              /* Open: no device */
+    case 2: c->x[0]=3; break;                    /* Ioctl/QueryEvent: NV_ERR */
+    case 3: c->x[0]=S2_NVN_OBJ_TRUE; break;      /* GpuGetGpukDevice: opaque object */
+    case 4: c->x[0]=S2_NVN_OBJ_HANDLE; break;    /* NvRm allocation: opaque handle */
+    default: c->x[0]=0; break;                   /* success / no-op */
+  }
+  c->pc=c->x[30]; }
+static void hle_s2_nv_ok    (CPU* c,u64 pc){ hle_s2_nv(c,pc,0); }
+static void hle_s2_nv_open  (CPU* c,u64 pc){ hle_s2_nv(c,pc,1); }
+static void hle_s2_nv_err   (CPU* c,u64 pc){ hle_s2_nv(c,pc,2); }
+static void hle_s2_nv_device(CPU* c,u64 pc){ hle_s2_nv(c,pc,3); }
+static void hle_s2_nv_handle(CPU* c,u64 pc){ hle_s2_nv(c,pc,4); }
+
 /* Match a distinctive mangled substring rather than the full symbol: exported
    names carry parameter suffixes that differ between dumps.  Keep the matching
    string specific enough to exclude lookalikes -- an earlier table used bare
@@ -761,7 +840,8 @@ void swr_install_s2_hooks(void){
   extern GuestFn* g_disp; extern u64 g_code_lo, g_code_hi;
   if(!g_mod || !g_disp) return;
   const int NS=(int)(sizeof(g_s2_hooks)/sizeof(g_s2_hooks[0]));
-  int hits[48]={0}, nvi=0, ncam=0, nvifb=0;
+  int hits[48]={0}, nvi=0, ncam=0, nvifb=0, nnv=0, nvcensus=0;
+  u64 a_nvn_boot=0;
   for(u32 i=0;i<g_mod->nentries;i++){
     u64 a=g_mod->entry_addr[i]; if(a<g_code_lo || a>=g_code_hi) continue;
     const char* s=gsym(a); if(!s || !s[0]) continue;
@@ -783,7 +863,62 @@ void swr_install_s2_hooks(void){
     if(!matched && strstr(s,"2nn2vi")){
       g_disp[(a-g_code_lo)/4]=hle_s2_ok; nvifb++;
       LOG("hle: [S2] vi fallback %llx (%s) -> stub_ok\n",(unsigned long long)a,s); }
+
+    /* NVN bootstrap loader: main imports it from sdk.  Replacing it keeps the
+       SDK's NVN driver (and the whole nvdrv abort chain) from ever running.
+       nvnBootstrapLoaderInternal is only logged: it may return a table rather
+       than a single function pointer, so stubbing it could break the layout. */
+    if(strstr(s,"nvnBootstrapLoaderInternal")){
+      if(nvcensus++<256) LOG("hle: [S2] nvn export %llx (%s)\n",(unsigned long long)a,s);
+    } else if(strstr(s,"nvnBootstrapLoader")){
+      a_nvn_boot=a;
+      if(nvcensus++<256) LOG("hle: [S2] nvn bootstrap %llx (%s)\n",(unsigned long long)a,s);
+    }
+
+    /* NV driver family.  Four exports double as the NVN null-device slots;
+       they must be classified BEFORE the generic NV stub so their dispatch
+       entries keep the trampoline semantics.  All NV exports are logged so a
+       single run shows the whole surface on this dump. */
+    int is_nvos=strstr(s,"NvOsDrv")!=0;
+    int is_nvrm=strstr(s,"NvRm")!=0;
+    int is_nvn_obj=strstr(s,"nvnInstallGlobalDebugCallback")!=0;
+    if(is_nvos || is_nvrm || is_nvn_obj){
+      if(nvcensus++<256) LOG("hle: [S2] nv export %llx (%s)\n",(unsigned long long)a,s);
+      u64 slot=(a-g_code_lo)/4;
+      if(strstr(s,"NvOsDrvDumpStatusv")){
+        g_nvn_slot_true=a; g_disp[slot]=hle_s2_nvn_true; nnv++;
+        LOG("hle: [S2] nvn slot TRUE  %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"EnableTransferMemTracingv")){
+        g_nvn_slot_zero=a; g_disp[slot]=hle_s2_nvn_zero; nnv++;
+        LOG("hle: [S2] nvn slot ZERO  %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"DisableGpuSemaAcquireTimeoutv")){
+        g_nvn_slot_proc=a; g_disp[slot]=hle_s2_nvn_proc; nnv++;
+        LOG("hle: [S2] nvn slot PROC  %llx (%s)\n",(unsigned long long)a,s);
+      } else if(is_nvn_obj){
+        g_nvn_slot_obj=a; g_disp[slot]=hle_s2_nvn_obj; nnv++;
+        LOG("hle: [S2] nvn slot OBJ   %llx (%s)\n",(unsigned long long)a,s);
+      } else if(is_nvos || strstr(s,"MemHandleAlloc") || strstr(s,"MemHandleFree") || strstr(s,"ChannelOpen")){
+        GuestFn fn=hle_s2_nv_ok;
+        if(strstr(s,"GpuGetGpukDevice")) fn=hle_s2_nv_device;
+        else if(strstr(s,"NvOsDrvOpen") || strstr(s,"ChannelOpen")) fn=hle_s2_nv_open;
+        else if(strstr(s,"Ioctl") || strstr(s,"QueryEvent") || strstr(s,"GetStatus") || strstr(s,"FdEntry")) fn=hle_s2_nv_err;
+        else if(strstr(s,"MemHandleAlloc") || strstr(s,"AllocPriv") || strstr(s,"AllocNative")) fn=hle_s2_nv_handle;
+        g_disp[slot]=fn; nnv++; }
+    }
   }
+  /* Install the NVN takeover only if every required slot was discovered on
+     this dump; otherwise leave the loader alone rather than returning 0. */
+  if(a_nvn_boot && g_nvn_slot_true){
+    g_disp[(a_nvn_boot-g_code_lo)/4]=hle_s2_nvn_bootstrap;
+    LOG("hle: [S2] NVN takeover installed: bootstrap=%llx true=%llx zero=%llx proc=%llx obj=%llx\n",
+        (unsigned long long)a_nvn_boot,(unsigned long long)g_nvn_slot_true,
+        (unsigned long long)g_nvn_slot_zero,(unsigned long long)g_nvn_slot_proc,
+        (unsigned long long)g_nvn_slot_obj);
+  } else {
+    LOG("hle: [S2] NVN takeover NOT installed: bootstrap=%llx true=%llx\n",
+        (unsigned long long)a_nvn_boot,(unsigned long long)g_nvn_slot_true);
+  }
+  LOG("hle: [S2] NV family: %d exports logged, %d taken over\n",nvcensus,nnv);
   int nhit=0;
   for(int k=0;k<NS;k++){
     if(!hits[k]) LOG("hle: [S2] hook %s NOT FOUND by symbol\n",g_s2_hooks[k].sym);
@@ -1030,7 +1165,20 @@ static void swr_svc_(CPU* c, u32 imm){
     u32 reason=(u32)x[0];
     if(reason&0x80000000u){ LOGV("svcBreak (notice) %x\n",reason); x[0]=0; return; }
     WARN("\n*** The game called svcBreak (reason=%x, info=%llx size=%llx) ***\n",reason,(unsigned long long)x[1],(unsigned long long)x[2]);
-    if(x[1] && x[2]>=4 && x[2]<0x1000){ u8 tmp[64]; memcpy(tmp,GP(x[1]),x[2]<64?x[2]:64); WARN("  data: "); for(u64 i=0;i<(x[2]<64?x[2]:64);i++) WARN("%02x",tmp[i]); WARN("\n"); }
+    if(x[1] && x[2]>=4 && x[2]<0x1000){
+      u8 tmp[64]; u64 n=x[2]<64?x[2]:64; memcpy(tmp,GP(x[1]),n);
+      WARN("  data: "); for(u64 i=0;i<n;i++) WARN("%02x",tmp[i]); WARN("\n");
+      /* svcBreak info usually points at a little-endian nn::Result.  Print it
+         decoded: a bare hex dump made 0x30af3 (graphics service not
+         initialized) look like an anonymous crash for several runs. */
+      u32 r=(u32)tmp[0]|((u32)tmp[1]<<8)|((u32)tmp[2]<<16)|((u32)tmp[3]<<24);
+      static const struct { u32 v; const char* what; } known[]={
+        {0x00030AF3u,"graphics service / NVN device not initialized"},
+        {0x002EE202u,"nn::fs::ResultInvalidArgument"},
+      };
+      const char* what="(unknown Result)";
+      for(unsigned j=0;j<sizeof known/sizeof known[0];j++) if(known[j].v==r) what=known[j].what;
+      WARN("  nn::Result = 0x%08x  %s\n",r,what); }
     /* the service surface first: a NULL interface from a stubbed applet command
        is what makes nnSdk panic later, far away from the actual gap */
     svc_dump_census();

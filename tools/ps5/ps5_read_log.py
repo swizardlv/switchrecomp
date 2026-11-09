@@ -31,7 +31,10 @@ VERDICT_KEYS = ('FATAL', 'window OK', 'window FAILED', 'segment ', 'reserve ',
                 'nup: read', 'nup: zstd', 'nup: alloc',
                 'romfs: data', 'romfs: read', 'READ-FAIL',
                 'NEVER WROTE OUTPUT', 'unresolved in',
-                'kernel service census', 'LoadResult')
+                'kernel service census', 'LoadResult',
+                'nvn lookup', 'nvn slot', 'nvn export', 'nvn bootstrap',
+                'NVN takeover', 'NV family', 'nv export', 'nvdrv call',
+                'nn::Result', 'svcBreak', 'primitive_drawer')
 
 
 def opener():
