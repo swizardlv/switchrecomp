@@ -313,7 +313,7 @@ static void arb_note(u8 op, KThread* t, u64 addr, u32 type, i32 value, i64 arg, 
   r->op=op; r->tid= t? t->id : 0; r->addr=addr; r->lr= t? t->cpu.x[30] : 0; r->type=type; r->value=value; r->arg=arg; r->res=res;
   r->before=before; r->after= (addr&3)? 0 : (i32)gr32(addr); r->waiters=(u8)(waiters>255? 255 : waiters); pm_unlock(&g_arb_lk); }
 
-static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, i32 value, i64 timeout){
+static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, u64 value, i64 timeout){
   if(addr&3) return R_BADADDR;
   pm_lock(&g_klock);
   i32* p=(i32*)GP(addr);
@@ -323,6 +323,7 @@ static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, i32 value, i64 timeout)
     case 1: for(;;){ if(cur>=value){ pm_unlock(&g_klock); return R_BADSTATE; }
               if(__atomic_compare_exchange_n(p,&cur,cur-1,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)) break; } break;
     case 2: if(cur!=value){ pm_unlock(&g_klock); return R_BADSTATE; } break;
+    case 3: { u64 cur64=*(u64*)GP(addr); if(cur64!=(u64)value){ pm_unlock(&g_klock); return R_BADSTATE; } break; } /* WaitIfEqual64 (21.0+) */
     default: pm_unlock(&g_klock); return R_BADENUM;
   }
   if(timeout==0){ pm_unlock(&g_klock); return R_TIMEOUT; }
@@ -336,7 +337,7 @@ static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, i32 value, i64 timeout)
 static void wake_addr_nl(u64 addr, i32 count){
   int n=0; while(count<=0 || n<count){ KThread* w=wl_best(4,addr); if(!w) break; wl_del(w); w->wait_kind=0; wake(w,0); n++; } }
 
-static u32 svc_signal_addr(u64 addr, u32 type, i32 value, i32 count){
+static u32 svc_signal_addr(u64 addr, u32 type, u64 value, i32 count){
   if(addr&3) return R_BADADDR;
   { static int said[3]; if(type<3 && !said[type]){ said[type]=1; LOG("kernel: SignalToAddress type %u in use\n",type); } }
   pm_lock(&g_klock);
@@ -353,6 +354,9 @@ static u32 svc_signal_addr(u64 addr, u32 type, i32 value, i32 count){
     i32 exp=value;
     if(nv!=value){ if(!__atomic_compare_exchange_n(p,&exp,nv,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)){ pm_unlock(&g_klock); return R_BADSTATE; } }
     else if(__atomic_load_n(p,__ATOMIC_SEQ_CST)!=value){ pm_unlock(&g_klock); return R_BADSTATE; }
+  } else if(type==3){
+    /* SignalIfEqual64 (21.0+): signal only when the 64-bit word matches. */
+    if(*(u64*)GP(addr)!=(u64)value){ pm_unlock(&g_klock); return 0; }
   } else if(type!=0){ pm_unlock(&g_klock); return R_BADENUM; }
   wake_addr_nl(addr,count);
   pm_unlock(&g_klock); return 0; }
@@ -1416,6 +1420,28 @@ void swr_install_s2_hooks(void){
     LOG("hle: [S2] hooked shader-reflection helper @ 99a6350 (-> scratch, loop skip) sym=%s\n",
         gsym(0x99a6350ull)? gsym(0x99a6350ull): "?");
   }
+  /* Root mitigation for the recurring "unbound NVN object sentinel" crash class.
+     The game keeps a FIXED sentinel pointer (0x10000000101, identical across every
+     run) for NVN objects it never created, and dereferences it directly (e.g.
+     [x+0x18]) -- that guest page is unmapped, so it faults.  Mapping a zero-filled
+     RW page there makes every such deref read 0 instead of crashing.  This covers
+     ALL call sites at once (the material-stage reflection loop at 0x8864708 /
+     99a6350, the shader-reflection lookup at 884f2c0, and any future one) without
+     depending on a per-address dispatch hook that the JIT later overwrites.
+     Address note: 0x10000000000 == 64 GiB.  In Bananza's 39-bit layout the alias
+     logical window is [12 GiB, 76 GiB) (ALIAS_BASE=0x300000000, g_alias_size=64G),
+     so this page sits *inside* that window -- but the window is only backed per page
+     when the guest actually maps/aliases an address, and the crash at 0x10000000119
+     proved this page was unbacked (hence free).  mem_map therefore claims it
+     cleanly with no real allocation to collide with.  We cannot pick another
+     address: 0x10000000101 is a fixed SDK magic constant, so we must map exactly
+     the page that contains it.  mem_map commits zeroed host pages (plat_vm_commit),
+     so the read resolves to 0.  Page 0 is also already mapped (mem_init), so a zero
+     read at +0x18 that yields a null nested pointer derefs safely there too. */
+  if(mem_map(0x10000000000ull, 0x2000ull, MS_NORMAL, PERM_RW)==0)
+    LOG("hle: [S2] mapped unbound-NVN-sentinel page @ 10000000000 (2 pages, zero)\n");
+  else
+    WARN("hle: [S2] could not map unbound-NVN-sentinel page @ 10000000000\n");
 }
 
 static void guest_backtrace(CPU* c){
@@ -1695,9 +1721,9 @@ static void swr_svc_(CPU* c, u32 imm){
     u8* p=GP(x[0]); memset(p,0,0x320); memcpy(p,n->cpu.x,29*8); memcpy(p+29*8,&n->cpu.x[29],8); memcpy(p+30*8,&n->cpu.x[30],8);
     memcpy(p+31*8,&n->cpu.x[31],8); memcpy(p+32*8,&n->cpu.pc,8); memcpy(p+0x110,n->cpu.v,0x200); x[0]=0; return; }
   case 0x34: { u64 a=x[0]; i32 b=(a&3)? 0 : (i32)gr32(a); arb_note('w',t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3],0,b,0);
-    x[0]=svc_wait_addr(t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3]); arb_note('W',t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3],(u32)x[0],b,0); return; }
+    x[0]=svc_wait_addr(t,a,(u32)x[1],(u64)x[2],(i64)x[3]); arb_note('W',t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3],(u32)x[0],b,0); return; }
   case 0x35: { u64 a=x[0]; i32 b=(a&3)? 0 : (i32)gr32(a); pm_lock(&g_klock); int nw=wl_count(4,a); pm_unlock(&g_klock);
-    x[0]=svc_signal_addr(a,(u32)x[1],(i32)(u32)x[2],(i32)(u32)x[3]); arb_note('S',t,a,(u32)x[1],(i32)(u32)x[2],(i32)(u32)x[3],(u32)x[0],b,nw); return; }
+    x[0]=svc_signal_addr(a,(u32)x[1],(u64)x[2],(i32)(u32)x[3]); arb_note('S',t,a,(u32)x[1],(i32)(u32)x[2],(i32)(u32)x[3],(u32)x[0],b,nw); return; }
   case 0x45: { KEvent* e=kevent_new("user event",0); u32 w=h_new(&e->o), r=h_new(&e->o); x[0]=0; x[1]=w; x[2]=r; return; }
   case 0x4B: { x[0]=R_NOTIMPL; return; }
   case 0x6F: { /* GetSystemInfo(type, handle, subtype). newer SDKs abort on boot if this returns 0 */

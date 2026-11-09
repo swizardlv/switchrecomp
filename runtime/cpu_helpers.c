@@ -998,6 +998,35 @@ static int simd_ldst(CPU* c, u8* M, u32 w){
 }
 
 /* ---- dispatcher for anything AdvSIMD / crypto ---- */
+/* SDOT / UDOT (FEAT_DotProd), vector and by-element.  Each 32-bit lane of Vd
+   accumulates the sum of four 8-bit products of the matching bytes of Vn and Vm
+   (Vm lane `index` for the by-element form).  Mirrors Hookshot's nx2/insn.py dot()
+   (OoT SDK 22.2.8 has 4 such sites); suyu's translator also lacks this form, so
+   games built on the SDK 22 dot-product helpers would otherwise leave these
+   functions untranslated.  Q=0 zeroes the upper 64 bits of the 128-bit result, as
+   the architecture specifies. */
+static int simd_dot(CPU* c, u32 w){
+  int q=(w>>30)&1, u=(w>>29)&1, rm=(w>>16)&31, rn=(w>>5)&31, rd=w&31;
+  int elem=(w>>24)&1;
+  V128 n=*VR(rn), m=*VR(rm), d=*VR(rd);
+  int lanes=q? 4:2;
+  int midx0 = elem ? (4*(((w>>11)&1)<<1 | ((w>>21)&1))) : 0;
+  for(int i=0;i<lanes;i++){
+    int32_t s=0;
+    for(int j=0;j<4;j++){
+      int nidx=4*i+j;
+      int midx = elem ? midx0+j : 4*i+j;
+      int32_t a = u ? (int32_t)(u8)n.b[nidx] : (int32_t)(i8)n.b[nidx];
+      int32_t b = u ? (int32_t)(u8)m.b[midx] : (int32_t)(i8)m.b[midx];
+      s += a*b;
+    }
+    d.s[i] = (u32)((i32)d.s[i] + s);
+  }
+  if(!q){ d.s[2]=0; d.s[3]=0; }
+  *VR(rd)=d;
+  return 1;
+}
+
 int swr_simd(CPU* c, u8* M, u32 w){
   if((w&0xBF800000u)==0x0C000000u || (w&0xBF800000u)==0x0C800000u || (w&0xBF000000u)==0x0D000000u) return simd_ldst(c,M,w);
   if((w&0x9F200400u)==0x0E200400u) return simd_3same(c,w,0);
@@ -1033,5 +1062,9 @@ int swr_simd(CPU* c, u8* M, u32 w){
     if(op<=3){ v_sha1(c,op,rd,rn,rm); return 1; } if(op<=6){ v_sha256(c,op,rd,rn,rm); return 1; } return 0; }
   if((w&0xFFFF0C00u)==0x5E280800u){ int op=(w>>12)&31, rn=(w>>5)&31, rd=w&31;
     if(op==0){ v_sha1(c,0x10,rd,rn,0); return 1; } if(op==1){ v_sha1(c,0x11,rd,rn,0); return 1; } if(op==2){ v_sha256(c,0x12,rd,rn,0); return 1; } return 0; }
+  /* SDOT / UDOT (vector + by element), FEAT_DotProd.  Must come after the
+     generic 3same/3diff branches because the masks are a strict subset of theirs
+     only for the dot opcodes; placed last so nothing else claims these. */
+  if((w&0x9FE0FC00u)==0x0E809400u || (w&0x9FC0F400u)==0x0F80E000u) return simd_dot(c,w);
   return 0;
 }
