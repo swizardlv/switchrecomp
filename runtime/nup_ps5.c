@@ -83,7 +83,18 @@ static uint64_t rd64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v;
 static void* nup_alloc(uint64_t sz) {
     if (sz == 0) sz = 1;
     void* p = mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return (p == MAP_FAILED) ? NULL : p;
+    if (p == MAP_FAILED) {
+        /* Once the 128 GiB guest VA window is reserved, PS5 anonymous mmap
+           starts failing with ENOMEM (the console log shows errno=12 for even
+           4 MiB requests).  A silent NULL here used to zero-fill a whole game
+           resource, so make it visible. */
+        static uint32_t w;
+        uint32_t k = __atomic_fetch_add(&w, 1, __ATOMIC_RELAXED);
+        if (k < 16) NUP_LOG("nup: alloc mmap(%llu) FAILED errno=%d\n",
+                            (unsigned long long)sz, errno);
+        return NULL;
+    }
+    return p;
 }
 static void nup_free(void* p, uint64_t sz) {
     if (p) munmap(p, (size_t)(sz ? sz : 1));
@@ -367,6 +378,12 @@ int nup_read_file(int file_node, uint64_t offset, void* dst, uint64_t size) {
     uint64_t size0, ext_off, ext_size; int codec;
     if (nup_file_size(file_node, &size0)) return -1;
     if (nup_file_extent(file_node, &ext_off, &ext_size, &codec)) return -1;
+    { static uint32_t nr;
+      uint32_t k = __atomic_fetch_add(&nr, 1, __ATOMIC_RELAXED);
+      if (k < 40 || !(k & 63))
+        NUP_LOG("nup: read node=%d off=%llu size=%llu fsize=%llu ext=%llu codec=%d\n",
+                file_node, (unsigned long long)offset, (unsigned long long)size,
+                (unsigned long long)size0, (unsigned long long)ext_size, codec); }
 
     if (offset >= size0) return 0;            /* past end -> caller fills zeros */
     uint64_t n = size; if (offset + n > size0) n = size0 - offset;
@@ -377,6 +394,30 @@ int nup_read_file(int file_node, uint64_t offset, void* dst, uint64_t size) {
     }
 
     if (codec != 1) return -1;               /* unknown codec */
+
+    /* Whole-file read fast path: decompress straight into the caller's buffer
+       with a small stack scratch for the compressed extent.  No mmap, no CRT
+       heap, no LRU cache.  This matters on PS5 where anonymous mmap is already
+       exhausted by the time the game reads its system tables; failing it used
+       to hand the game a zero-filled BYML/RESTBL and produce LoadResult = 7.
+       All the boot-time system tables (ResourceCategoryTable 12,043 -> 48,492)
+       fit comfortably in 32 KiB. */
+    if (offset == 0 && size >= size0 && ext_size <= 32768) {
+        uint8_t scratch[32768];
+        if (pread(G.fd, scratch, (size_t)ext_size, (off_t)ext_off) == (ssize_t)ext_size) {
+            size_t d = ZSTD_decompress(dst, (size_t)size0, scratch, (size_t)ext_size);
+            if (!ZSTD_isError(d) && d == (size_t)size0) {
+                NUP_LOG("nup: zstd direct node=%d ext=%llu -> %llu OK\n",
+                        file_node, (unsigned long long)ext_size, (unsigned long long)size0);
+                return 0;
+            }
+            NUP_LOG("nup: zstd direct node=%d rc=%llu expected=%llu FAILED\n",
+                    file_node, (unsigned long long)d, (unsigned long long)size0);
+        } else {
+            NUP_LOG("nup: zstd direct node=%d pread FAILED errno=%d ext=%llu\n",
+                    file_node, errno, (unsigned long long)ext_size);
+        }
+    }
 
     if (size0 > ZC_CAP) {                     /* too big to cache: decompress once */
         uint8_t* comp = nup_alloc(ext_size ? (size_t)ext_size : 1);
@@ -395,7 +436,8 @@ int nup_read_file(int file_node, uint64_t offset, void* dst, uint64_t size) {
     }
 
     uint8_t* full = zc_decompress(file_node); /* cached */
-    if (!full) return -1;
+    if (!full) { NUP_LOG("nup: zstd cache FAIL node=%d fsize=%llu ext=%llu\n",
+                         file_node, (unsigned long long)size0, (unsigned long long)ext_size); return -1; }
     memcpy(dst, full + offset, (size_t)n);
     return 0;
 }
