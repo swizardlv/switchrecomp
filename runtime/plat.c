@@ -660,8 +660,75 @@ typedef struct { PThreadFn fn; void* arg; } TArg;
 static void* tstart(void* p){ TArg a=*(TArg*)p; free(p); a.fn(a.arg); return NULL; }
 
 int plat_thread(PThreadFn fn, void* arg, size_t stack){
-  TArg* a=malloc(sizeof *a); a->fn=fn; a->arg=arg; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,stack);
-  pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED); pthread_t t; int r=pthread_create(&t,&at,tstart,a); pthread_attr_destroy(&at); return r? -1 : 0; }
+#if defined(SWR_PS5)
+  /* Measured on hardware (2026-11-09): the title reaches the first guest
+     thread after committing ~3.2 GiB of direct memory for the guest heap, and
+     pthread_create() with the 4 MiB stack kthread_start() asks for then fails
+     ("FATAL: could not create a system thread").  The small 64/256 KiB runtime
+     threads at boot do start, so the limit is resource-dependent, not a broken
+     pthread implementation.  Try a decreasing ladder, then an explicit stack
+     carved out of direct memory (which bypasses libc's anonymous mmap for the
+     stack).  Log every rung: one icon tap tells which path works and what the
+     real error code is, instead of losing the return value like before. */
+  struct { size_t size; int custom; } tries[] = {
+    { stack,     0 },   /* what the caller asked for */
+    { 1u<<20,    0 },
+    { 256u<<10,  0 },
+    { 0,         0 },   /* libc default stack */
+    { stack,     1 },   /* explicit direct-memory stack */
+    { 1u<<20,    1 },
+  };
+  const unsigned ntry = (unsigned)(sizeof tries/sizeof *tries);
+  for(unsigned i=0;i<ntry;i++){
+    size_t sz=tries[i].size;
+    void* custom=NULL;
+    pthread_attr_t at; int ar=pthread_attr_init(&at);
+    if(ar){ LOG("thread: try=%u pthread_attr_init rc=%d, giving up\n",i,ar); return -1; }
+    int sr=0;
+    if(tries[i].custom){
+      if(sz < (64u<<10)) sz=64u<<10;
+      sz=(sz+0xFFFull)&~0xFFFull;
+      custom=ps5_alloc_large(sz);
+      if(!custom){
+        LOG("thread: try=%u custom stack alloc %llu KiB FAILED\n",
+            i,(unsigned long long)(sz>>10));
+        pthread_attr_destroy(&at); continue;
+      }
+      sr=pthread_attr_setstack(&at,custom,sz);
+    } else if(sz){
+      sr=pthread_attr_setstacksize(&at,sz);
+    }
+    int dr=pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
+    TArg* a=(TArg*)malloc(sizeof *a);
+    if(!a){
+      LOG("thread: try=%u TArg malloc FAILED (CRT heap exhausted?)\n",i);
+      if(custom) ps5_free_large(custom,sz);
+      pthread_attr_destroy(&at); continue;
+    }
+    a->fn=fn; a->arg=arg;
+    pthread_t t; int r=pthread_create(&t,&at,tstart,a);
+    int e=errno;
+    pthread_attr_destroy(&at);
+    LOG("thread: try=%u stack=%llu KiB custom=%d attr=%d/%d/%d pthread_create rc=%d errno=%d\n",
+        i,(unsigned long long)(sz>>10),tries[i].custom,ar,sr,dr,r,e);
+    if(!r){
+      LOG("thread: started tid=%llx stack=%llu KiB custom=%d (a custom stack stays mapped for the process lifetime)\n",
+          (unsigned long long)(uintptr_t)t,(unsigned long long)(sz>>10),tries[i].custom);
+      return 0;
+    }
+    free(a);
+    if(custom) ps5_free_large(custom,sz);
+  }
+  LOG("thread: all %u attempts failed, requested stack=%llu KiB\n",
+      ntry,(unsigned long long)(stack>>10));
+  return -1;
+#else
+  TArg* a=malloc(sizeof *a); if(!a) return -1; a->fn=fn; a->arg=arg;
+  pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,stack);
+  pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED); pthread_t t;
+  int r=pthread_create(&t,&at,tstart,a); pthread_attr_destroy(&at); return r? -1 : 0;
+#endif
+}
 
 void plat_thread_exit(void){ pthread_exit(NULL); }
 

@@ -145,7 +145,7 @@ void kthread_start(KThread* t){
 #else
   size_t stack_sz = (size_t)64 << 20;
 #endif
-  if(plat_thread(thread_body,t,stack_sz)) fatal("could not create a system thread");
+  if(plat_thread(thread_body,t,stack_sz)) fatal("could not create a system thread (see the 'thread: try=' diagnostics above)");
 }
 
 void svc_exit_thread(KThread* t){
