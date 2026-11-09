@@ -109,19 +109,21 @@ static int am_csg(SvcObj* o, IpcCtx* c){           /* ICommonStateGetter */
    Answering cmd 2000 empty made the SDK store handle 0, so svcSendSyncRequest(0)
    failed and BootWithRemoteMemory called nn::diag::AbortImpl(). */
 static int gsv_session(SvcObj* o, IpcCtx* c){
-  extern int ipc_warn_once(const char*,u32);
+  extern int ipc_warn_once(const char*,u32); (void)o;
   if(ipc_warn_once(o->name,c->cmd)){
     u32 q[6]; memcpy(q,c->msg,24);
     LOG("GSV:GraphicsSupervisor cmd %u (tipc=%d type=%u) hdr %08x %08x %08x %08x %08x %08x\n",
         c->cmd,c->tipc,c->type,q[0],q[1],q[2],q[3],q[4],q[5]); }
-  switch(c->cmd){
-    case 4:                       /* BootWithRemoteMemory */
-    case 11:                      /* SetCurrentProcessHandle */
-    case 101:                     /* CreateContext */
-    case 401: case 402:           /* CreateGpuContext / InitializeGpuContext */
-      return 0;
-  }
-  return quiet_ok(o,c); }
+  /* Every GSV UserSession command succeeds with no output.  A static audit of
+     all 280 generated C files found 47 distinct TIPC command numbers reaching
+     this session (Gsv / NativeMemory / Syncpt / Display / Gpu / Camera /
+     VideoDecoder / VideoEncoder / GraphicsFrame / NvDrv), while only 5 were
+     implemented before.  On a host with no GSV + NVDrv2 + NVN2 stack the boot
+     chain is replaced by the symbol-level HLE hooks in kernel.c, but any path
+     that still reaches here must answer OK rather than make nnSdk abort.
+     Each distinct command is logged once above, so the next run reveals the
+     complete remaining set in one pass. */
+  return 0; }
 
 static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
   switch(c->cmd){
@@ -147,7 +149,13 @@ static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
       g_gsv_handle=h;
       LOG("am: GetGraphicsSupervisor -> handle %x (type=%u tipc=%d domain=%d)\n",
           h,c->type,c->tipc,c->is_domain);
-      out_move_h(c,h); return 0; }
+      out_move_h(c,h);
+      /* Belt and braces: hardware logs showed the SDK retaining handle 0 even
+         with the KHandle present in the special section (msg+12) and in the
+         domain object-id slot.  Mirror it into the raw CMIF payload too, so
+         whichever field nnSdk's reply parser reads it sees a valid handle. */
+      out32(c,h); out32(c,h);
+      return 0; }
   }
   return quiet_ok(o,c); }
 

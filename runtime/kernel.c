@@ -566,6 +566,65 @@ static const char* gsym(u64 a){
   snprintf(o,200," <%.150s+%llx>",(const char*)GP(g_gstr[g_gsyms[best].mod]+g_gsyms[best].name_off),(unsigned long long)(a-g_gsyms[best].addr));
   return o; }
 
+/* ============================================================ [S2] symbol-level HLE hooks
+   Switch 2 SDK 22 boots the GPU through
+     nv::InitializeGraphics -> nn::gs::sdk::BootGraphicsSystem
+       -> nn::gsv/nn::nvsrv::BootWithRemoteMemory -> GSV TIPC UserSession.
+   On a host there is no GSV / NVDrv2 / NVN2 stack, so walking that chain only
+   produces a sequence of nn::diag::Abort calls (here Result 0x30af3).  The
+   nxnative ports of the very same two dumps (Bananza, OOT SDK 22.2.8) replace
+   these SDK functions wholesale with HLE_FORCE instead of emulating GSV.
+
+   SwitchRecomp reaches exported SDK functions through CALLDYN -> swr_lookup
+   -> g_disp, so a host function can be installed by overwriting that dispatch
+   slot (the same mechanism hle_install() uses for its heap-lock stubs).
+   Matching by mangled symbol name, not hard-coded guest addresses, keeps this
+   working for other Switch 2 dumps.  A small address fallback covers symbols
+   that are not exported in .dynsym. */
+static void hle_s2_stub_ok(CPU* c, u64 pc){ (void)pc; c->x[0]=0; }   /* Result OK */
+
+static const char* const g_s2_hook_syms[]={
+  "_ZN2nn2gs3sdk18BootGraphicsSystemEPvm",                 /* BootGraphicsSystem */
+  "_ZN2nv18InitializeGraphicsEPvm",                        /* nv::InitializeGraphics(void*, u64) */
+  "_ZN2nv9InitCheckEv",                                    /* nv::InitCheck */
+  "_ZN2nn2gs3sdk30CheckGraphicsSystemInitializedEPKcm",   /* [S2] abort unless boot ran */
+  "_ZN2nn5nvsrv20BootWithRemoteMemoryE",                   /* nvsrv boot (0x30af3) */
+  "_ZN2nn3gsv20BootWithRemoteMemoryE",                     /* gsv boot */
+  "_ZN2nn6camera3sdk19CreateCameraContextE",               /* camera: 0x30af3 on no GSV */
+  NULL
+};
+/* Verified guest address for Bananza's BootGraphicsSystem (backtrace
+   a8519e0 = +0x70).  Used only if the symbol scan misses it. */
+static const u64 g_s2_hook_addrs[]={ 0xA851970ull, 0 };
+
+void swr_install_s2_hooks(void){
+  extern GuestFn* g_disp; extern u64 g_code_lo, g_code_hi;
+  if(!g_mod || !g_disp) return;
+  const int NS=(int)(sizeof(g_s2_hook_syms)/sizeof(g_s2_hook_syms[0]))-1;
+  int hits[16]={0};
+  for(u32 i=0;i<g_mod->nentries;i++){
+    u64 a=g_mod->entry_addr[i]; if(a<g_code_lo || a>=g_code_hi) continue;
+    const char* s=gsym(a); if(!s || !s[0]) continue;
+    /* gsym() returns the *nearest* symbol; require an exact match (+0) so a
+       neighbouring exported symbol cannot be hooked by accident. */
+    if(!strstr(s,"+0>")) continue;
+    for(int k=0;k<NS;k++) if(strstr(s,g_s2_hook_syms[k])){
+      g_disp[(a-g_code_lo)/4]=hle_s2_stub_ok; hits[k]++;
+      LOG("hle: [S2] hook %s @ %llx -> stub_ok\n",g_s2_hook_syms[k],(unsigned long long)a); }
+  }
+  for(int k=0;k<NS;k++) if(!hits[k])
+    LOG("hle: [S2] hook %s NOT FOUND by symbol\n",g_s2_hook_syms[k]);
+  for(int j=0;g_s2_hook_addrs[j];j++){ u64 a=g_s2_hook_addrs[j];
+    if(a<g_code_lo || a>=g_code_hi) continue;
+    const char* s=gsym(a);
+    /* Never patch a hard-coded address on a different dump: the symbol must
+       still agree, otherwise OOT could lose an unrelated function. */
+    if(!strstr(s,"BootGraphicsSystem")){
+      LOG("hle: [S2] addr fallback %llx skipped (%s)\n",(unsigned long long)a,s); continue; }
+    LOG("hle: [S2] addr fallback %llx (%s) -> stub_ok\n",(unsigned long long)a,s);
+    g_disp[(a-g_code_lo)/4]=hle_s2_stub_ok; }
+}
+
 static void guest_backtrace(CPU* c){
   WARN("  pc=%llx lr=%llx sp=%llx fp=%llx\n",(unsigned long long)c->pc,(unsigned long long)c->x[30],(unsigned long long)c->x[31],(unsigned long long)c->x[29]);
   { /* this also runs from the crash handler: a fault here would kill the report */

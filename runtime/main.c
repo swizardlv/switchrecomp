@@ -565,6 +565,10 @@ int swr_main(int argc, char** argv){
   LOG("stage: gpu_init\n"); gpu_init();
   LOG("stage: snxvk_gpu_init\n"); { extern void snxvk_gpu_init(void); snxvk_gpu_init(); }
   LOG("stage: hle_install\n"); { extern void hle_install(void); hle_install(); }
+  /* [S2] replace the GPU driver's boot chain at the SDK-function level.
+     Must run after loader_load() (guest .dynsym) and after hle_install() so
+     nothing overwrites our dispatch slots afterwards. */
+  LOG("stage: s2_hle_hooks\n"); { extern void swr_install_s2_hooks(void); swr_install_s2_hooks(); }
   LOG("stage: video_init\n"); video_init(g_mod->title? g_mod->title : g_exename);
   { extern void plat_prof_start(int); if(g_opt_prof){ plat_prof_start(0); LOG("profile: active (profile.txt every 10 s)\n"); } }
   LOG("stage: kernel_run_main\n");
