@@ -30,3 +30,6 @@ __pycache__/
 
 # local agent working notes (environment-specific, not part of the source)
 .workbuddy/
+
+# console log pulls / build runs (large, machine-specific)
+runs/

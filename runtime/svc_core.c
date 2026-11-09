@@ -64,7 +64,13 @@ static int storage_acc_disp(SvcObj* o, IpcCtx* c){
     case 0: out64(c,s->size); return 0;
     /* compare against size-off, off+n can wrap around if off is huge */
     case 10: { u64 off=in64(c,0), a, n; buf_in(c,0,&a,&n); if(off>s->size || n>s->size-off) return RC(128,503); memcpy(s->d+off,GP(a),n); return 0; }
-    case 11: { u64 off=in64(c,0), a, n; buf_out(c,0,&a,&n); if(off>s->size) return RC(128,503); if(n>s->size-off) n=s->size-off; memcpy(GP(a),s->d+off,n); return 0; }
+    case 11: { u64 off=in64(c,0), a, n; buf_out(c,0,&a,&n); if(off>s->size) return RC(128,503); if(n>s->size-off) n=s->size-off;
+      /* An am storage created with size 0 makes Read return OK with zero
+         bytes, which the game sees as a truncated/empty resource.  Say so
+         explicitly instead of letting it look like a generic IPC stub miss. */
+      if(!n){ static int w; if(w++<8) LOG("ipc: IStorageAccessor::Read off=%llu -> EMPTY storage (size=%llu)\n",
+                                          (unsigned long long)off,(unsigned long long)s->size); }
+      if(n) memcpy(GP(a),s->d+off,n); return 0; }
   }
   return stub_ok(o,c); }
 

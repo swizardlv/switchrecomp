@@ -26,7 +26,10 @@ FILES = (
 VERDICT_KEYS = ('FATAL', 'window OK', 'window FAILED', 'segment ', 'reserve ',
                 'commit selftest', 'decommit selftest', 'statically linked',
                 'RomFS', 'npdm', 'error', 'failed', 'SWR_PS5_PROBE',
-                'thread: ', 'hle: [S2]', 'badcall: ')
+                'thread: ', 'hle: [S2]', 'badcall: ',
+                'nup: pkg', 'aliases', 'NO-FILE', 'PADDING',
+                'NEVER WROTE OUTPUT', 'unresolved in',
+                'kernel service census', 'LoadResult')
 
 
 def opener():

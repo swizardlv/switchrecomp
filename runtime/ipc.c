@@ -79,11 +79,20 @@ int buf_in(IpcCtx* c, int i, u64* a, u64* s){
   *a=0; *s=0; return 0; }
 
 int buf_out(IpcCtx* c, int i, u64* a, u64* s){
-  if(i<c->nb && c->b[i].addr && c->b[i].size) return buf_b(c,i,a,s);
-  if(i<c->nc && c->c[i].addr) return buf_cs(c,i,a,s);
-  if(c->nc==1 && i>0 && c->c[0].addr){ *a=0; *s=0; return 0; }
-  if(i<c->nb) return buf_b(c,i,a,s);
-  *a=0; *s=0; return 0; }
+  /* Handlers memcpy() straight into GP(a) instead of using the out*() reply
+     helpers.  Record that as produced output here, once, instead of making
+     every one of ~20 dispatch branches remember to set c->direct_out.  This
+     is what removes the census false positives ("IStorageAccessor cmd 11
+     returned OK but wrote NO output") while still flagging stub_ok defaults,
+     which never call buf_out() at all. */
+  int r=0;
+  if(i<c->nb && c->b[i].addr && c->b[i].size) r=buf_b(c,i,a,s);
+  else if(i<c->nc && c->c[i].addr) r=buf_cs(c,i,a,s);
+  else if(c->nc==1 && i>0 && c->c[0].addr){ *a=0; *s=0; return 0; }
+  else if(i<c->nb) r=buf_b(c,i,a,s);
+  else { *a=0; *s=0; return 0; }
+  if(r && *a && *s) c->direct_out=1;
+  return r; }
 
 void buf_x_out(IpcCtx* c, int i, u64 a, u64 s){ if(c->nx_out<MAX_BUFS){ c->x_out_addr[c->nx_out]=a; c->x_out_size[c->nx_out]=s; c->nx_out++; } (void)i; }
 

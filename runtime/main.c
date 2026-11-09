@@ -186,6 +186,10 @@ void crash_report(void* host_pc, void* fault, int sig){
 #ifdef SWR_PS5
   swr_dump_bad_calls();
 #endif
+  /* Dump the full service/import surface BEFORE the register+code dump: one
+     crash now exposes every still-empty IPC command and unresolved GOT slot,
+     instead of only the single branch that happened to fault. */
+  { extern void kernel_crash_census(void); kernel_crash_census(); }
   /* PIE diagnostics: print an offset relative to a symbol whose ELF address is
      known from nm. Locally, pc_off = (pc_rel + nm(crash_report)) maps straight
      into llvm-addr2line, whatever ASLR base the console picked. */

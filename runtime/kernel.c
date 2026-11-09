@@ -617,9 +617,26 @@ static int s2_guest_ptr(u64 a, u64 n){
 /* GP(a) indexes a PROT_NONE reservation: writing an uncommitted page would
    fault.  Only touch a guest output buffer inside a committed block. */
 static int s2_guest_ok(u64 a, u64 n){
-  if(!s2_guest_ptr(a,n)) return 0;
-  MemBlock b; mem_query(a,&b);
-  return b.state!=MS_FREE && b.state!=MS_INACCESSIBLE && a+n<=b.addr+b.size; }
+  if(!n || !s2_guest_ptr(a,n)) return 0;
+  /* Walk EVERY block the write spans.  A single mem_query(a) only proved the
+     first block was committed, so a buffer straddling two blocks could have
+     its second half land in a PROT_NONE hole; and a read-only code/data block
+     would fault the host on memcpy.  GP() indexes the 128 GiB reservation, so
+     both checks must happen before any HLE stub writes an output object. */
+  static u32 refused;
+  for(u64 p=a; p<a+n; ){
+    MemBlock b; mem_query(p,&b);
+    const char* why = (b.state==MS_FREE || b.state==MS_INACCESSIBLE)? "uncommitted"
+                    : (!(b.perm & PERM_W))? "read-only" : 0;
+    u64 e=b.addr+b.size; if(e<=p) why="zero-length block";
+    if(why){
+      u32 k=__atomic_fetch_add(&refused,1,__ATOMIC_RELAXED);
+      if(k<8) LOG("hle: [S2] guest write refused a=%llx n=%llu p=%llx (%s)\n",
+                  (unsigned long long)a,(unsigned long long)n,(unsigned long long)p,why);
+      return 0; }
+    p = e<a+n ? e : a+n;
+  }
+  return 1; }
 
 static void s2_put(u64 a, const void* p, u64 n){
   if(s2_guest_ok(a,n)) memcpy(GP(a),p,n); }
@@ -753,7 +770,7 @@ void swr_install_s2_hooks(void){
     if(!strstr(s,"+0>")) continue;
     /* One-pass diagnostics: list every vi / camera export so a differently
        mangled SDK can be covered from the log without another round trip. */
-    if(strstr(s,"2nn2vi") && nvi++<48)
+    if(strstr(s,"2nn2vi") && nvi++<128)
       LOG("hle: [S2] vi export %llx (%s)\n",(unsigned long long)a,s);
     if(strstr(s,"CameraContext") && ncam++<12)
       LOG("hle: [S2] camera export %llx (%s)\n",(unsigned long long)a,s);
@@ -872,6 +889,17 @@ static void dump_unresolved(void){
 }
 
 static void kernel_dump_code(u64 ra);
+
+/* One-shot full census from the crash path.  svcBreak and the 12 s frontend
+   dump are both too late for a SIGSEGV at ~1.9 s: without this, every host
+   crash loses the whole remaining SVC / IPC / unresolved-import surface and
+   the next run only reveals ONE more missing command. */
+void kernel_crash_census(void){
+  svc_dump_census();
+  ipc_dump_stats();
+  dump_unresolved();
+}
+
 void kernel_dump_regs(CPU* c){
   if(c->pc<0x1000 || getenv("SWR_UNRES")) dump_unresolved();
   for(int i=0;i<31;i+=4) WARN("  x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx\n",i,(unsigned long long)c->x[i],i+1,(unsigned long long)c->x[i+1],i+2,(unsigned long long)c->x[i+2],i+3,(unsigned long long)(i+3<32?c->x[i+3]:0));

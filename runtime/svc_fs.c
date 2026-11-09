@@ -78,9 +78,12 @@ static PMutex g_romlock;
 
 typedef struct DNode { char* name; int parent; int first_child, next_sib, first_file; u32 off; } DNode;
 
-typedef struct FNode { char* name; int parent, next_sib; u32 off; u64 size; int nup_node; } FNode;
+typedef struct FNode { char* name; int parent, next_sib; u32 off; u64 size; int nup_node;
+                       int alias_of;   /* >=0: metadata-only alias of fn[alias_of], shares its data */
+                       u64 data_rel;   /* file data offset relative to rdata_off */ } FNode;
 
 static DNode* dn; static int ndn, capdn; static FNode* fn; static int nfn, capfn;
+static int g_nup_alias;   /* .zs aliases published into the RomFS metadata */
 
 /* capdn/capfn > 0  => CRT-heap realloc growth (flat-folder fallback path).
    capdn/capfn <= 0 => arrays were preallocated via ps5_alloc_large; never grow. */
@@ -103,7 +106,8 @@ static int add_dir(const char* name, int parent){ if(ndn==capdn) grow_dn();
   DNode* d=&dn[ndn]; d->name=store_name(name); d->parent=parent; d->first_child=-1; d->next_sib=-1; d->first_file=-1; return ndn++; }
 
 static int add_file(const char* name, int parent, u64 size, int nup_node){ if(nfn==capfn) grow_fn();
-  FNode* f=&fn[nfn]; f->name=store_name(name); f->parent=parent; f->next_sib=-1; f->size=size; f->nup_node=nup_node; return nfn++; }
+  FNode* f=&fn[nfn]; f->name=store_name(name); f->parent=parent; f->next_sib=-1; f->size=size; f->nup_node=nup_node;
+  f->alias_of=-1; f->data_rel=0; return nfn++; }
 
 static int cmpname(const void* a, const void* b){ return strcmp(*(char* const*)a,*(char* const*)b); }
 
@@ -154,20 +158,35 @@ static void finalize_romfs(void){
   rfiles=(RFile*)ps5_alloc_large((nfn?nfn:1)*sizeof(RFile));
   if(!rfiles){ LOG("RomFS: rfiles alloc failed\n"); return; }
   for(int i=0;i<nfn;i++){
+    u8* e=rmeta+fmt+fn[i].off; u32 w[2]={dn[fn[i].parent].off, fn[i].next_sib>=0? fn[fn[i].next_sib].off : 0xFFFFFFFFu};
+    memcpy(e,w,8);
+    if(fn[i].alias_of>=0){
+      /* Metadata-only alias: publish the logical (no .zs) name pointing at the
+         ORIGINAL's data.  It must not advance `data`, must not add an RFile
+         (two RFiles with the same off would break the binary search), and must
+         not change rtotal.  Only the extra metadata entry grows foff/rdata_off,
+         and the game reads that from the RomFS header, so offsets stay
+         self-consistent. */
+      u64 rel=fn[fn[i].alias_of].data_rel;
+      memcpy(e+8,&rel,8); memcpy(e+16,&fn[i].size,8);
+      u32 h=rhash(dn[fn[i].parent].off,fn[i].name)%fhc; u32 nl=(u32)strlen(fn[i].name);
+      memcpy(e+0x18,&fh[h],4); fh[h]=fn[i].off; memcpy(e+0x1C,&nl,4); memcpy(e+0x20,fn[i].name,nl);
+      continue;
+    }
     /* MUST be a 64-bit mask: "~0xFu" is an unsigned int, so & against it
        zeroed the high 32 bits of `data` on every iteration.  Bananza has
        9,152,723,867 bytes of file data; the wrap made rtotal 542 MB while
        the file table still advertised offsets past it, so nn::fs::ReadFile
        got RC(2,6001)=0x2EE202 (ResultInvalidArgument) and aborted. */
     data=(data+0xF)&~0xFull;
+    fn[i].data_rel=data;
     if(fn[i].size){
       RFile* r=&rfiles[nrfiles];
       r->path=fn[i].name; r->off=rdata_off+data; r->size=fn[i].size; r->nup_node=fn[i].nup_node;
       if(r->nup_node>=0) nup_file_extent(r->nup_node,&r->extent_offset,&r->extent_size,&r->codec);
       nrfiles++;
     }
-    u8* e=rmeta+fmt+fn[i].off; u32 w[2]={dn[fn[i].parent].off, fn[i].next_sib>=0? fn[fn[i].next_sib].off : 0xFFFFFFFFu};
-    memcpy(e,w,8); memcpy(e+8,&data,8); memcpy(e+16,&fn[i].size,8);
+    memcpy(e+8,&data,8); memcpy(e+16,&fn[i].size,8);
     u32 h=rhash(dn[fn[i].parent].off,fn[i].name)%fhc; u32 nl=(u32)strlen(fn[i].name);
     memcpy(e+0x18,&fh[h],4); fh[h]=fn[i].off; memcpy(e+0x1C,&nl,4); memcpy(e+0x20,fn[i].name,nl);
     data+=fn[i].size; }
@@ -178,9 +197,14 @@ static void finalize_romfs(void){
     memcpy(e+16,&dh[h],4); dh[h]=dn[i].off; memcpy(e+20,&nl,4); memcpy(e+24,dn[i].name,nl); }
   rtotal=rdata_off+data;
   qsort(rfiles,nrfiles,sizeof(RFile),rf_cmp);
-  LOG("RomFS: %d folders, %d files, data=%llu rdata_off=%llu rtotal=%llu (%.1f MB)\n",
-      ndn,nfn,(unsigned long long)data,(unsigned long long)rdata_off,
+  LOG("RomFS: %d folders, %d files (%d .zs aliases), data=%llu rdata_off=%llu rtotal=%llu (%.1f MB)\n",
+      ndn,nfn,g_nup_alias,(unsigned long long)data,(unsigned long long)rdata_off,
       (unsigned long long)rtotal,(double)rtotal/1048576.0);
+  /* Prove on the console that logical names are actually published, and that
+     they point at the same data offset as the physical .zs entry. */
+  for(int i=0,k=0;i<nfn && k<6;i++) if(fn[i].alias_of>=0){
+    LOG("RomFS: alias '%s' -> '%s' data_rel=%llu size=%llu\n", fn[i].name, fn[fn[i].alias_of].name,
+        (unsigned long long)fn[fn[i].alias_of].data_rel,(unsigned long long)fn[i].size); k++; }
 }
 
 static void romfs_build(const char* dir){
@@ -211,7 +235,37 @@ static void nup_scan(int dir_node, int di){
   for(int k=0;k<nchild;k++){
     int node=kids[k]; char nm[1536]; nup_node_name(node,nm,sizeof nm);
     if(nup_node_is_dir(node)){ int c=add_dir(nm,di); if(lastd<0) dn[di].first_child=c; else dn[lastd].next_sib=c; lastd=c; nup_scan(node,c); }
-    else { u64 fsz=0; nup_file_size(node,&fsz); int f=add_file(nm,di,fsz,node); if(lastf<0) dn[di].first_file=f; else fn[lastf].next_sib=f; lastf=f; }
+    else { u64 fsz=0; nup_file_size(node,&fsz); int f=add_file(nm,di,fsz,node); if(lastf<0) dn[di].first_file=f; else fn[lastf].next_sib=f; lastf=f;
+      /* The SDK's resource layer (Ares) looks files up by their LOGICAL name,
+         which has no .zs suffix, while the NUP stores the physical compressed
+         file as "<name>.zs".  Verified on the Bananza container 2026-11-09:
+         System/AddressTable/Product.100.Nin_Ounce_NVN2.atbl.byml.zs (a BYML)
+         lists "GameData/GameDataList.Product.100.byml" and
+         "Shop/ItemShopElement.alsarc", but only the .zs names exist in the
+         tree.  Without the alias nn::fs misses the metadata entry and the game
+         logs "LoadResult = 7" for both files, then dereferences the empty
+         resource object (SIGSEGV).  Publish both names; the alias is a
+         metadata-only entry sharing the original's data offset, so it does not
+         consume data space and does not shift any other file's offset. */
+      size_t L=strlen(nm);
+      if(L>3 && L<sizeof nm && !strcmp(nm+L-3,".zs")){
+        char alias[1536]; memcpy(alias,nm,L-3); alias[L-3]=0;
+        /* Never shadow a real uncompressed file of the same name in this
+           directory (e.g. ResourceCategoryTable.Nin_Ounce_NVN2.byml exists
+           without a .zs twin).  Publishing a compressed alias for it would
+           feed zstd bytes to a caller that expects BYML. */
+        int conflict=0;
+        for(int j=0;j<nchild;j++){
+          int kn=kids[j]; if(kn==node || nup_node_is_dir(kn)) continue;
+          char knm[1536]; nup_node_name(kn,knm,sizeof knm);
+          if(!strcmp(knm,alias)){ conflict=1; break; }
+        }
+        if(!conflict){
+          int a=add_file(alias,di,fsz,node); fn[a].alias_of=f;
+          fn[lastf].next_sib=a; lastf=a; g_nup_alias++;
+        }
+      }
+    }
   }
   free(kids);
 }
@@ -224,7 +278,7 @@ static int romfs_build_nup(void){
      ~78k nodes; doing this on the tiny PS5 CRT heap would exhaust it and
      deadlock the console (see docs/ps5_splash_hang_analysis.md, root cause 2).
      capdn/capfn = -1 disables the CRT-heap realloc growth path in add_dir/add_file. */
-  capdn=-1; capfn=-1; dn=NULL; fn=NULL; ndn=0; nfn=0;
+  capdn=-1; capfn=-1; dn=NULL; fn=NULL; ndn=0; nfn=0; g_nup_alias=0;
   dn = (DNode*)ps5_alloc_large(sizeof(DNode)*(total+16));
   fn = (FNode*)ps5_alloc_large(sizeof(FNode)*(total+16));
   if(!dn || !fn){ LOG("RomFS: index arrays alloc failed (nodes=%d)\n", total); return 0; }
@@ -234,7 +288,10 @@ static int romfs_build_nup(void){
      166,433 nodes.  The earlier "pool + 2 bytes/node" estimate asked for only
      2.3 MiB and ran dry at ~43%, so names were silently truncated. */
   u64 name_bytes = nup_name_bytes();
-  g_name_cap = name_bytes + (u64)total*8 + 4096;
+  /* Aliases duplicate a second (shorter) name for every .zs file, so the arena
+     needs roughly twice the container's name bytes.  Under-budgeting used to
+     truncate names silently at ~43% of the index. */
+  g_name_cap = name_bytes*2 + (u64)total*16 + 4096;
   g_name_overflow = 0;
   LOG("RomFS: index %d nodes, names %llu bytes -> arena %.1f MB\n",
       total, (unsigned long long)name_bytes, (double)g_name_cap/1048576.0);
@@ -344,19 +401,39 @@ static FILE* rf_open(const char* path){
   if(openf[lru].f) fclose(openf[lru].f);
   openf[lru].f=fopen(path,"rb"); openf[lru].path=path; openf[lru].last=++openclk; return openf[lru].f; }
 
+/* Structured read trace: one console run shows every RomFS read, which file it
+   landed in, and (crucially) which ones fell into padding / found no file at
+   all.  Rate-limited so gameplay stays cheap. */
+static u32 g_rr_trace_n;
+static void rr_trace(u64 off, u64 size, const char* what, const char* name, u64 delta){
+  u32 n=__atomic_fetch_add(&g_rr_trace_n,1,__ATOMIC_RELAXED);
+  if(n>=128 && (n&255)) return;
+  LOG("romfs: read off=%llu sz=%llu -> %-8s %s +%llu\n",
+      (unsigned long long)off,(unsigned long long)size,what,
+      name? name : "-",(unsigned long long)delta);
+}
+
 int romfs_read(u64 off, void* dst, u64 size){
   u8* d=dst;
   if(rraw){ pm_lock(&g_romlock); int r=plat_pread(rraw,d,size,off); pm_unlock(&g_romlock); return r<0? -1 : 0; }
-  if(off<rmeta_size){ u64 n=rmeta_size-off; if(n>size) n=size; memcpy(d,rmeta+off,n); d+=n; off+=n; size-=n; }
+  if(off<rmeta_size){ u64 n=rmeta_size-off; if(n>size) n=size;
+    /* Metadata reads are the game's RomFS name lookups.  Logging the offsets
+       lets an offline replay map them back to the exact hash bucket / file
+       entry the game was probing, so one console run reveals which logical
+       names missed instead of only the first one that crashed. */
+    rr_trace(off,n,"META",0,0);
+    memcpy(d,rmeta+off,n); d+=n; off+=n; size-=n; }
   pm_lock(&g_romlock);
   while(size){
     int lo=0, hi=nrfiles-1, k=-1;
     while(lo<=hi){ int m=(lo+hi)/2; if(rfiles[m].off<=off){ k=m; lo=m+1; } else hi=m-1; }
-    if(k<0){ memset(d,0,size); break; }
+    if(k<0){ rr_trace(off,size,"NO-FILE",0,0); memset(d,0,size); break; }
     RFile* f=&rfiles[k];
     if(off>=f->off+f->size){ /* inter-file padding */
+      rr_trace(off,size,"PADDING",0,off-(f->off+f->size));
       u64 nx= k+1<nrfiles? rfiles[k+1].off : rtotal; u64 n=nx>off? nx-off : size; if(n>size) n=size; if(!n) n=size; memset(d,0,n); d+=n; off+=n; size-=n; continue; }
     u64 n=f->off+f->size-off; if(n>size) n=size;
+    rr_trace(off,size,"HIT",f->path+g_romdir_len,off-f->off);
     if(!f->logged){ f->logged=1; LOG("romfs: %s (%.1f KB)\n",f->path+g_romdir_len,(double)f->size/1024.0); }
     if(f->nup_node>=0){
       if(nup_read_file(f->nup_node, off-f->off, d, n) < 0){ memset(d,0,n); }

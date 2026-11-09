@@ -233,22 +233,35 @@ int nup_open(const char* path) {
     G.base_romfs_dir = -1;
 
     /* Choose the romfs directory: prefer the Base package, else the first
-     * package that actually carries a romfs. */
+     * package that actually carries a romfs.
+     *
+     * Verified 2026-11-09 that this is CORRECT for the deployed title, not a
+     * bug: the packaged /app0/swr_data/exefs/main is 20,865,633 bytes, which is
+     * the base package's main; the update package's main is 22,513,362 bytes.
+     * The game therefore legitimately reads Product.100 AddressTable and 100
+     * resources (ReleaseVersion : 100).  Switching to the update romfs here
+     * would MISPAIR the 1.0.0 program with 3.2.0 data.
+     *
+     * TODO (explicitly deferred by the user until base runs): merge the base,
+     * update and addon romfs trees into one index (update > addon > base for
+     * duplicate names).  Log every package now so that work has the numbers. */
     int fallback = -1;
     for (uint32_t i = 0; i < package_count; i++) {
         const uint8_t* p = toc + G.pkg_at + i * 0x40;
         uint32_t root   = rd32(p + 8);
         uint32_t exefs  = rd32(p + 12);
         uint32_t romfs  = rd32(p + 16);
+        uint32_t version= rd32(p + 20);
         uint8_t  kind   = toc[G.pkg_at + i * 0x40 + 24];
-        (void)root; (void)exefs;
+        NUP_LOG("nup: pkg%u kind=%u version=%u root=%u exefs=%u romfs=%u\n",
+                i, (unsigned)kind, version, root, exefs, romfs);
         if (romfs != 0xFFFFFFFFu && romfs < G.ndirs) {
-            if (kind == 0) { G.base_romfs_dir = (int)romfs; break; }
+            if (kind == 0 && G.base_romfs_dir < 0) G.base_romfs_dir = (int)romfs;
             if (fallback < 0) fallback = (int)romfs;
         }
     }
     if (G.base_romfs_dir < 0) G.base_romfs_dir = fallback;
-    NUP_LOG("nup: parsed dirs=%u files=%u pool=%u base_romfs=%d\n",
+    NUP_LOG("nup: parsed dirs=%u files=%u pool=%u base_romfs=%d (single-package mode)\n",
             (unsigned)dir_count, (unsigned)file_count, G.pool_size, G.base_romfs_dir);
     return 1;
 }
