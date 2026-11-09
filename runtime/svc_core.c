@@ -941,6 +941,22 @@ static int audout_disp(SvcObj* o, IpcCtx* c){
 
 static SvcObj* new_audout(void){ return svcobj_new("audout:u",audout_disp,0); }
 
+/* aud:u (deprecated AudioController) used by Bananza's old SDK: the generic
+   stub returned no handles, so a fresh audio thread waited on handle 0 and spun
+   ~16M times/sec.  cmd 2 (OpenAudioOut/OpenAudioRenderer) now returns a real
+   IAudioOut subsession plus its buffer-event handle, so the thread blocks on a
+   valid KEvent instead of burning a core. */
+static int audu_disp(SvcObj* o, IpcCtx* c){
+  (void)o;
+  if(c->cmd==0) return 0;                          /* Initialize / RegisterClient */
+  if(c->cmd==2){
+    SvcObj* a=aout_new(2);                          /* IAudioOut, 2ch default */
+    out_obj(c,a);                                   /* subsession */
+    out_copy_h(c,ev_handle(((AudOut*)a->data)->ev)); /* sync event handle */
+    return 0; }
+  return quiet_ok(o,c); }
+static SvcObj* new_audu(void){ return svcobj_new("aud:u",audu_disp,0); }
+
 /* hwopus, packets get decoded with libopus. sonic 1 (sega ages) spins on the same packet forever after the logos
    if it gets "0 bytes used, 0 samples". input is { u32 size (big endian), u32 final_range } and then the opus
    packet, consumed = size + 8. output is interleaved s16 at the rate and channel count the decoder was opened with */
@@ -1237,6 +1253,7 @@ void svc_core_init(void){
   svc_register("friend:u",new_friend); svc_register("friend:a",new_friend); svc_register("friend:v",new_friend);
   svc_register("ns:am2",new_ns); svc_register("ns:ec",new_ns); svc_register("ns:rid",new_ns); svc_register("ns:rt",new_ns); svc_register("ns:web",new_ns); svc_register("ns:ro",new_ns);
   svc_register("audren:u",new_audren); svc_register("audout:u",new_audout); svc_register("audin:u",new_audout); svc_register("hwopus",new_hwopus);
+  svc_register("aud:u",new_audu);
   svc_register("bsd:u",new_bsd); svc_register("bsd:s",new_bsd); svc_register("ssl",new_ssl);
   svc_register("prepo:u",new_prepo); svc_register("prepo:a",new_prepo); svc_register("prepo:a2",new_prepo); svc_register("psm",new_psm);
   svc_register("fatal:u",new_fatal); svc_register("csrng",new_csrng); svc_register("mm:u",new_mm);

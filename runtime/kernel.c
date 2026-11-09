@@ -363,7 +363,13 @@ static u32 svc_wait_sync(KThread* t, u64 hptr, u32 n, i64 timeout, u32* out_idx)
   KObj* objs[64]; u32 hs[64];
   for(u32 i=0;i<n;i++) hs[i]=gr32(hptr+i*4);
   pm_lock(&g_klock);
-  for(u32 i=0;i<n;i++){ objs[i]=h_get_nl(hs[i]); if(!objs[i] || !objs[i]->is_signaled){ pm_unlock(&g_klock); if(!objs[i]){ static u32 nw; if(nw++<20 || !(nw&0xFFFF)) WARN("WaitSynchronization: invalid handle %x (%u times)\n",hs[i],nw); } return R_BADHANDLE; } }
+  for(u32 i=0;i<n;i++){ objs[i]=h_get_nl(hs[i]); if(!objs[i] || !objs[i]->is_signaled){ pm_unlock(&g_klock); if(!objs[i]){
+        /* a stubbed service (e.g. aud:u) hands back handle 0; the caller's audio
+           thread then spins svcWaitSynchronization on it.  Sleeping ~1 ms and
+           returning timeout turns the ~16M/sec busy-loop into a throttled one
+           instead of pegging a core and flooding the log. */
+        if(hs[i]==0){ plat_sleep_ns(1000000); return R_TIMEOUT; }
+        static u32 nw; if(nw++<20 || !(nw&0xFFFF)) WARN("WaitSynchronization: invalid handle %x (%u times)\n",hs[i],nw); } return R_BADHANDLE; } }
   if(t->cancel){ t->cancel=0; pm_unlock(&g_klock); return R_CANCELLED; }
   u64 end= timeout<0? 0 : plat_ns()+(u64)timeout;
   for(;;){
@@ -1164,6 +1170,23 @@ static void hle_s2_nv_err   (CPU* c,u64 pc){ hle_s2_nv(c,pc,2); }
 static void hle_s2_nv_device(CPU* c,u64 pc){ hle_s2_nv(c,pc,3); }
 static void hle_s2_nv_handle(CPU* c,u64 pc){ hle_s2_nv(c,pc,4); }
 
+/* Bananza Switch 2 shader-reflection lookup at 0x884f2c0: the engine reads a
+   material-stage binary-reflection object pointer from +0x68 of the stage
+   struct and passes it as x0.  When the reflection symbol is unbound the
+   pointer is null or a low sentinel (0x10000000041 observed), and the
+   recompiled function dereferences it (ldr x22,[x0,#0xd8]) -> SIGSEGV at ~5.5 s.
+   Guard: x0 null/unmapped -> return -1 (not-found index; the caller stores w0
+   into a u32 array and skips the unbound slot); otherwise run the real fn. */
+static GuestFn g_s2_orig_gfb;
+static void hle_s2_gfb(CPU* c, u64 pc){
+  u64 p=c->x[0];
+  if(p==0){ c->x[0]=(u64)-1; c->pc=c->x[30]; return; }
+  MemBlock b; mem_query(p,&b);
+  if(b.state==MS_FREE || b.state==MS_INACCESSIBLE){ c->x[0]=(u64)-1; c->pc=c->x[30]; return; }
+  if(g_s2_orig_gfb) g_s2_orig_gfb(c,pc);
+  else c->pc=c->x[30];
+}
+
 /* Match a distinctive mangled substring rather than the full symbol: exported
    names carry parameter suffixes that differ between dumps.  Keep the matching
    string specific enough to exclude lookalikes -- an earlier table used bare
@@ -1348,6 +1371,19 @@ void swr_install_s2_hooks(void){
      gr32(0xa966710ull)==0x7100281fu && gr32(0xa966718ull)==0x7100781fu){
     g_disp[(0xa966700ull-g_code_lo)/4]=hle_s2_true;
     LOG("hle: [S2] hooked nn::oe graphics scale mode @ a966700 -> 1 (Docked)\n");
+  }
+  /* shader-reflection null-pointer guard: hook 0x884f2c0 only when its prologue
+     still matches this dump's binary (pacibsp + ldr x22,[x0,#0xd8] at +0x1c), so
+     OOT or a different build never loses an unrelated function.  The guarded fn
+     reads a material-stage reflection object from x0 and crashes on a null /
+     sentinel pointer; we return -1 (not-found) instead and run the real fn when
+     x0 is a valid mapping. */
+  if(0x884f2c0ull>=g_code_lo && 0x884f2c0ull<g_code_hi &&
+     gr32(0x884f2c0ull)==0xd503237fu && gr32(0x884f2c0ull+0x1c)==0xf9406c16u){
+    u64 slot=(0x884f2c0ull-g_code_lo)/4;
+    g_s2_orig_gfb=g_disp[slot];
+    g_disp[slot]=hle_s2_gfb;
+    LOG("hle: [S2] hooked shader-reflection lookup @ 884f2c0 (x0-guard -> -1)\n");
   }
 }
 
