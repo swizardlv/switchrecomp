@@ -727,8 +727,8 @@ static void s2_vsync_tick(void* p){
   (void)p;
   for(;;){ plat_sleep_ns(16666667); if(g_vi_vsync_ev) kevent_signal(g_vi_vsync_ev); }
 }
-static void hle_s2_vi_vsync(CPU* c, u64 pc){
-  (void)pc; u64 out=c->x[0];
+static void hle_s2_vi_vsync_impl(CPU* c, u64 pc, u64 out){
+  (void)pc;
   if(!g_vi_vsync_ev){
     g_vi_vsync_ev=kevent_new("vi vsync",1);   /* auto-clear, one tick per wait */
     kobj_ref(&g_vi_vsync_ev->o);
@@ -748,6 +748,10 @@ static void hle_s2_vi_vsync(CPU* c, u64 pc){
   { static int nv; if(nv++<8)
       LOG("hle: [S2] vi vsync -> handles %x/%x at %llx\n",r,w,(unsigned long long)out); }
   c->x[0]=0; c->pc=c->x[30]; }
+static void hle_s2_vi_vsync(CPU* c, u64 pc){ hle_s2_vi_vsync_impl(c,pc,c->x[0]); }
+/* DefaultDisplay::Duplicate*Event(SystemEventType* out) is a member function:
+   x0 is `this` (DefaultDisplay*), x1 is `out`. */
+static void hle_s2_vi_vsync_mem(CPU* c, u64 pc){ hle_s2_vi_vsync_impl(c,pc,c->x[1]); }
 static void hle_s2_vi_vsync_try(CPU* c, u64 pc){
   (void)pc;
   u64 f=__atomic_add_fetch(&g_s2_vi_frames,1,__ATOMIC_RELAXED);
@@ -756,6 +760,8 @@ static void hle_s2_vi_vsync_try(CPU* c, u64 pc){
   c->x[0]=1; c->pc=c->x[30]; }
 
 static void hle_s2_ok(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_OK); }
+static void hle_s2_true(CPU* c, u64 pc){ (void)pc; c->x[0]=1; c->pc=c->x[30]; }
+static void hle_s2_vi_native_ret(CPU* c, u64 pc){ (void)pc; c->x[0]=S2_VI_OBJ_NATIVE; c->pc=c->x[30]; }
 static void hle_s2_init(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_INIT_GFX); }
 static void hle_s2_meminfo(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_MEM_INFO); }
 static void hle_s2_camera(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_CAMERA); }
@@ -778,48 +784,136 @@ static void hle_s2_vi_vrr(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_VRR); }
    -> nn::diag::Abort(0x30af3) -> svcBreak (verified 2026-11-09, run 1619).
 
    The slot addresses are DISCOVERED from the dump's own symbol table, so the
-   same code works on OOT: four otherwise-unused NvOsDrv/nvn exports become
+   same code works on OOT: otherwise-unused NvOsDrv/NvRm/nvn exports become
    trampolines whose dispatch entries we own.  Every requested NVN name is
-   logged, so one run exposes the whole NVN surface the game actually uses. */
+   logged (both via nvnBootstrapLoader and nvnDeviceGetProcAddress), so one
+   run exposes the whole NVN surface the game actually uses. */
 #define S2_NVN_OBJ_TRUE   0x100001400ull
 #define S2_NVN_OBJ_HANDLE 0x100001500ull
 static u64 g_nvn_slot_true, g_nvn_slot_zero, g_nvn_slot_proc, g_nvn_slot_obj;
-static u32 g_nvn_lookups;
+static u64 g_nvn_slot_int, g_nvn_slot_acq;
+static u64 g_nvn_scratch;
+static u32 g_nvn_lookups, g_nvn_calls;
+
+static u64 s2_nvn_scratch_addr(void){
+  if(!g_nvn_scratch){
+    g_nvn_scratch=kmem_alloc(16ull<<20,MS_NORMAL,PERM_RW);
+    LOG("hle: [S2] allocated 16 MiB NVN scratch buffer at %llx\n",(unsigned long long)g_nvn_scratch);
+  }
+  return g_nvn_scratch? g_nvn_scratch : S2_NVN_OBJ_TRUE;
+}
 
 /* guest is a flat reservation: only read a string inside a committed block */
 static int s2_cstr(u64 a, char* out, int cap){
   if(a<AS_BASE || a>=AS_SIZE) return 0;
   MemBlock b; mem_query(a,&b);
-  if(b.state==MS_FREE || b.state==MS_INACCESSIBLE) return 0;
+  if(b.state==MS_FREE || b.state==MS_INACCESSIBLE || !(b.perm&PERM_R)) return 0;
   u64 room=b.addr+b.size-a; if(room>=(u64)cap) room=(u64)cap-1;
   const char* p=(const char*)GP(a); int i=0;
-  for(; i<(int)room; i++){ out[i]=p[i]; if(!p[i]) return 1; }
-  out[i]=0; return 1; }
+  for(; i<(int)room; i++){
+    unsigned char ch=(unsigned char)p[i];
+    if(!ch) return i>0;
+    if(ch<0x20 || ch>=0x7F) return 0;
+    out[i]=(char)ch;
+  }
+  out[i]=0; return 0; }
 
-static void hle_s2_nvn_true(CPU* c,u64 pc){ (void)pc; c->x[0]=1; c->pc=c->x[30]; }
-static void hle_s2_nvn_zero(CPU* c,u64 pc){ (void)pc; c->x[0]=0; c->pc=c->x[30]; }
-static void hle_s2_nvn_obj (CPU* c,u64 pc){ (void)pc; c->x[0]=S2_NVN_OBJ_TRUE; c->pc=c->x[30]; }
-static void hle_s2_nvn_proc(CPU* c,u64 pc){ (void)pc; c->x[0]=g_nvn_slot_true; c->pc=c->x[30]; }
+static void hle_s2_nvn_true(CPU* c,u64 pc){
+  (void)pc;
+  u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
+  if(k<64) LOG("hle: [S2] nvn call TRUE  x0=%llx x1=%llx x2=%llx lr=%llx\n",
+               (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+               (unsigned long long)c->x[2],(unsigned long long)c->x[30]);
+  c->x[0]=1; c->pc=c->x[30]; }
+static void hle_s2_nvn_zero(CPU* c,u64 pc){
+  (void)pc;
+  u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
+  if(k<64) LOG("hle: [S2] nvn call ZERO  x0=%llx x1=%llx x2=%llx lr=%llx\n",
+               (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+               (unsigned long long)c->x[2],(unsigned long long)c->x[30]);
+  c->x[0]=0; c->pc=c->x[30]; }
+static void hle_s2_nvn_obj(CPU* c,u64 pc){
+  (void)pc;
+  u64 a=s2_nvn_scratch_addr();
+  u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
+  if(k<64) LOG("hle: [S2] nvn call OBJ   x0=%llx x1=%llx -> %llx lr=%llx\n",
+               (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+               (unsigned long long)a,(unsigned long long)c->x[30]);
+  c->x[0]=a; c->pc=c->x[30]; }
+/* nvnDeviceGetInteger(const NVNdevice *device, NVNdeviceInfo pname, int *v):
+   Note that in NVN, device can be NULL for static queries, so check x0/x1 if
+   x2 is not a pointer.  Leaving *v uninitialized (0 or stack garbage) causes
+   pool/descriptor size calculations and ring loops to spin or divide by 0. */
+static void hle_s2_nvn_int(CPU* c,u64 pc){
+  (void)pc;
+  u32 pname=(u32)c->x[1]; u64 out=c->x[2];
+  if(!s2_guest_ok(out,4) && s2_guest_ok(c->x[1],4)){ pname=(u32)c->x[0]; out=c->x[1]; }
+  i32 val=4096;
+  /* NVN_DEVICE_INFO_API_MAJOR_VERSION=0 (55), MINOR=1 (13), uniform/texture/
+     sampler descriptor sizes (256/32), reserved handles (256), alignments (4096). */
+  if(pname==0) val=55;
+  else if(pname==1) val=13;
+  else if(pname>=2 && pname<=16) val=256;
+  if(s2_guest_ok(out,4)) memcpy(GP(out),&val,4);
+  static u32 nint; u32 k=__atomic_fetch_add(&nint,1,__ATOMIC_RELAXED);
+  if(k<96) LOG("hle: [S2] nvn GetInteger pname=%u (%#x) out=%llx -> %d lr=%llx\n",
+               pname,pname,(unsigned long long)out,val,(unsigned long long)c->x[30]);
+  c->x[0]=1; c->pc=c->x[30]; }
+/* nvnWindowAcquireTexture(NVNwindow *window, NVNsync * presentSync, int *idx) -> 0 (SUCCESS) */
+static void hle_s2_nvn_acq(CPU* c,u64 pc){
+  (void)pc;
+  i32 idx=0;
+  if(s2_guest_ok(c->x[2],4)) memcpy(GP(c->x[2]),&idx,4);
+  else if(s2_guest_ok(c->x[1],4)) memcpy(GP(c->x[1]),&idx,4);
+  static u32 nacq; u32 k=__atomic_fetch_add(&nacq,1,__ATOMIC_RELAXED);
+  if(k<16) LOG("hle: [S2] nvn WindowAcquireTexture -> idx=0 SUCCESS lr=%llx\n",(unsigned long long)c->x[30]);
+  c->x[0]=0; c->pc=c->x[30]; }
+
+static u64 s2_nvn_resolve(const char* nm, int ok){
+  u64 slot=g_nvn_slot_true;
+  if(!ok) return slot;
+  if(strstr(nm,"ProcAddress") || strstr(nm,"GetProc") || strstr(nm,"BootstrapLoader"))
+    slot=g_nvn_slot_proc? g_nvn_slot_proc : slot;
+  else if(strstr(nm,"GetInteger") || strstr(nm,"GetSize") || strstr(nm,"GetAlignment") ||
+          strstr(nm,"GetOffset") || strstr(nm,"GetTotal") || strstr(nm,"GetCommandMemory") ||
+          strstr(nm,"GetControlMemory"))
+    slot=g_nvn_slot_int? g_nvn_slot_int : (g_nvn_slot_obj? g_nvn_slot_obj : slot);
+  else if(strstr(nm,"AcquireTexture"))
+    slot=g_nvn_slot_acq? g_nvn_slot_acq : (g_nvn_slot_zero? g_nvn_slot_zero : slot);
+  else if(strstr(nm,"Map") || strstr(nm,"Alloc") || strstr(nm,"Create") ||
+          strstr(nm,"GetMemory") || strstr(nm,"GetAddress") || strstr(nm,"GetHandle") ||
+          strstr(nm,"GetRowStride") || strstr(nm,"GetStorage"))
+    slot=g_nvn_slot_obj? g_nvn_slot_obj : slot;
+  else if(strstr(nm,"SyncWait") || strstr(nm,"Wait") || strstr(nm,"WalkDebug") ||
+          strstr(nm,"Set") || strstr(nm,"Bind") || strstr(nm,"Draw") || strstr(nm,"Clear") ||
+          strstr(nm,"Submit") || strstr(nm,"Finish") || strstr(nm,"Flush") ||
+          strstr(nm,"Finalize") || strstr(nm,"Destroy") || strstr(nm,"Free") ||
+          strstr(nm,"Reset") || strstr(nm,"Barrier") || strstr(nm,"Fence") ||
+          strstr(nm,"Copy") || strstr(nm,"Present") || strstr(nm,"Begin") || strstr(nm,"End") ||
+          strstr(nm,"Update") || strstr(nm,"Discard") || strstr(nm,"Invalidate") ||
+          strstr(nm,"Restore") || strstr(nm,"Register") || strstr(nm," dispatch") || strstr(nm,"Dispatch"))
+    slot=g_nvn_slot_zero? g_nvn_slot_zero : slot;
+  return slot;
+}
+
+static void hle_s2_nvn_proc(CPU* c,u64 pc){
+  /* nvnDeviceGetProcAddress(const NVNdevice *device, const char *name):
+     x0 is `device` (often NULL or a guest struct ptr), x1 is `name`.
+     Check x1 first, then x0 in case a single-arg loader calls through here. */
+  char nm[128];
+  int ok=s2_cstr(c->x[1],nm,sizeof nm);
+  if(!ok) ok=s2_cstr(c->x[0],nm,sizeof nm);
+  u32 k=__atomic_fetch_add(&g_nvn_lookups,1,__ATOMIC_RELAXED);
+  u64 slot=s2_nvn_resolve(nm,ok);
+  if(k<600) LOG("hle: [S2] nvn lookup #%u %-58s -> %llx (via GetProcAddress)%s\n",
+                k,ok?nm:"<?>",(unsigned long long)slot,gsym(pc));
+  c->x[0]=slot; c->pc=c->x[30]; }
 
 static void hle_s2_nvn_bootstrap(CPU* c,u64 pc){
   char nm[128]; int ok=s2_cstr(c->x[0],nm,sizeof nm);
+  if(!ok) ok=s2_cstr(c->x[1],nm,sizeof nm);
   u32 k=__atomic_fetch_add(&g_nvn_lookups,1,__ATOMIC_RELAXED);
-  /* Four distinct slots: boolean-ish calls must return true, void/state calls
-     get zero, object/address getters get an opaque guest object, and proc
-     lookups get another trampoline.  Handing one address to all 523 names
-     would also work for CALLDYN, but some SDKs sanity-check distinct entries. */
-  u64 slot=g_nvn_slot_true;
-  if(ok){
-    if(strstr(nm,"ProcAddress") || strstr(nm,"GetProc") || strstr(nm,"BootstrapLoader"))
-      slot=g_nvn_slot_proc? g_nvn_slot_proc : slot;
-    else if(strstr(nm,"Map") || strstr(nm,"Alloc") || strstr(nm,"Create") || strstr(nm,"GetMemory") || strstr(nm,"GetAddress"))
-      slot=g_nvn_slot_obj? g_nvn_slot_obj : slot;
-    else if(strstr(nm,"Set") || strstr(nm,"Bind") || strstr(nm,"Draw") || strstr(nm,"Clear") ||
-            strstr(nm,"Submit") || strstr(nm,"Finish") || strstr(nm,"Flush") ||
-            strstr(nm,"Finalize") || strstr(nm,"Destroy") || strstr(nm,"Free") ||
-            strstr(nm,"Reset") || strstr(nm,"Barrier") || strstr(nm,"Fence") || strstr(nm,"Copy"))
-      slot=g_nvn_slot_zero? g_nvn_slot_zero : slot;
-  }
+  u64 slot=s2_nvn_resolve(nm,ok);
   if(k<600) LOG("hle: [S2] nvn lookup #%u %-58s -> %llx%s\n",
                 k,ok?nm:"<?>",(unsigned long long)slot,gsym(pc));
   c->x[0]=slot; c->pc=c->x[30]; }
@@ -875,8 +969,14 @@ static const struct { const char* sym; GuestFn fn; } g_s2_hooks[]={
   {"2nn2vi10InitializeE", hle_s2_ok},
   {"2nn2vi8FinalizeE", hle_s2_ok},
   {"2nn2vi18OpenDefaultDisplayE", hle_s2_vi_display},
+  {"2nn2vi11OpenDisplayE", hle_s2_vi_display},
   {"2nn2vi11CreateLayerE", hle_s2_vi_layer},
   {"2nn2vi15GetNativeWindowE", hle_s2_vi_native},
+  {"2nn2vi5Layer15GetNativeWindowEv", hle_s2_vi_native_ret},
+  {"2nn2vi7Display6IsOpenEv", hle_s2_true},
+  {"2nn2vi5Layer6IsOpenEv", hle_s2_true},
+  {"2nn2vi6detail13IsInitializedEv", hle_s2_true},
+  {"2nn2vi6detail16IsDefaultDisplayE", hle_s2_true},
   {"2nn2vi20GetLatestFrameNumberE", hle_s2_vi_frameno},
   {"2nn2vi32GetDefaultDisplayPanelIdentifierE", hle_s2_vi_panel},
   {"2nn2vi12ListDisplaysE", hle_s2_vi_listdisp},
@@ -888,7 +988,9 @@ static const struct { const char* sym; GuestFn fn; } g_s2_hooks[]={
      the Get/Duplicate calls must hand back an initialized SystemEventType. */
   {"2nn2vi20GetDisplayVsyncEventE", hle_s2_vi_vsync},
   {"2nn3vi23sdk19DuplicateVsyncEventE", hle_s2_vi_vsync},
-  {"2nn2vi6detail14DefaultDisplay19DuplicateVsyncEventE", hle_s2_vi_vsync},
+  {"2nn2vi6detail14DefaultDisplay19DuplicateVsyncEventE", hle_s2_vi_vsync_mem},
+  {"2nn2vi6detail14DefaultDisplay25DuplicateRefreshRateEventE", hle_s2_vi_vsync_mem},
+  {"2nn2vi6detail14DefaultDisplay23DuplicateHdrStatusEventE", hle_s2_vi_vsync_mem},
   {"2nn3vi217TryWaitVsyncEventE", hle_s2_vi_vsync_try},
   {"2nn3vi219TimedWaitVsyncEventE", hle_s2_vi_vsync_try},
   {"2nn3vi214WaitVsyncEventE", hle_s2_ok},
@@ -929,8 +1031,10 @@ void swr_install_s2_hooks(void){
       g_disp[(a-g_code_lo)/4]=g_s2_hooks[k].fn; hits[k]++; matched=1;
       LOG("hle: [S2] hook %s @ %llx (%s)\n",g_s2_hooks[k].sym,(unsigned long long)a,s); }
     /* The rest of nn::vi (HDR / VRR / crop / scaling / frame history ...) all
-       return Result OK on the host; cover every export, not just the list. */
-    if(!matched && strstr(s,"2nn2vi")){
+       return Result OK on the host; cover every export except pure stack value
+       classes (LayerCreationSettings getters/constructors must keep their
+       recompiled code or GetWidth/GetHeight return 0). */
+    if(!matched && strstr(s,"2nn2vi") && !strstr(s,"LayerCreationSettings")){
       g_disp[(a-g_code_lo)/4]=hle_s2_ok; nvifb++;
       LOG("hle: [S2] vi fallback %llx (%s) -> stub_ok\n",(unsigned long long)a,s); }
 
@@ -945,7 +1049,7 @@ void swr_install_s2_hooks(void){
       if(nvcensus++<256) LOG("hle: [S2] nvn bootstrap %llx (%s)\n",(unsigned long long)a,s);
     }
 
-    /* NV driver family.  Four exports double as the NVN null-device slots;
+    /* NV driver family.  Six exports double as the NVN null-device slots;
        they must be classified BEFORE the generic NV stub so their dispatch
        entries keep the trampoline semantics.  All NV exports are logged so a
        single run shows the whole surface on this dump. */
@@ -967,6 +1071,12 @@ void swr_install_s2_hooks(void){
       } else if(is_nvn_obj){
         g_nvn_slot_obj=a; g_disp[slot]=hle_s2_nvn_obj; nnv++;
         LOG("hle: [S2] nvn slot OBJ   %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"NvRmMemGetSize")){
+        g_nvn_slot_int=a; g_disp[slot]=hle_s2_nvn_int; nnv++;
+        LOG("hle: [S2] nvn slot INT   %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"NvRmMemPin")){
+        g_nvn_slot_acq=a; g_disp[slot]=hle_s2_nvn_acq; nnv++;
+        LOG("hle: [S2] nvn slot ACQ   %llx (%s)\n",(unsigned long long)a,s);
       } else if(is_nvos || strstr(s,"MemHandleAlloc") || strstr(s,"MemHandleFree") || strstr(s,"ChannelOpen")){
         GuestFn fn=hle_s2_nv_ok;
         if(strstr(s,"GpuGetGpukDevice")) fn=hle_s2_nv_device;
@@ -980,10 +1090,11 @@ void swr_install_s2_hooks(void){
      this dump; otherwise leave the loader alone rather than returning 0. */
   if(a_nvn_boot && g_nvn_slot_true){
     g_disp[(a_nvn_boot-g_code_lo)/4]=hle_s2_nvn_bootstrap;
-    LOG("hle: [S2] NVN takeover installed: bootstrap=%llx true=%llx zero=%llx proc=%llx obj=%llx\n",
+    LOG("hle: [S2] NVN takeover installed: bootstrap=%llx true=%llx zero=%llx proc=%llx obj=%llx int=%llx acq=%llx\n",
         (unsigned long long)a_nvn_boot,(unsigned long long)g_nvn_slot_true,
         (unsigned long long)g_nvn_slot_zero,(unsigned long long)g_nvn_slot_proc,
-        (unsigned long long)g_nvn_slot_obj);
+        (unsigned long long)g_nvn_slot_obj,(unsigned long long)g_nvn_slot_int,
+        (unsigned long long)g_nvn_slot_acq);
   } else {
     LOG("hle: [S2] NVN takeover NOT installed: bootstrap=%llx true=%llx\n",
         (unsigned long long)a_nvn_boot,(unsigned long long)g_nvn_slot_true);
@@ -1324,7 +1435,38 @@ static void sample_thread(KThread* t){
   void* h=__atomic_load_n(&t->host,__ATOMIC_ACQUIRE); if(!h) return;
   u64 pcs[64]; int n=0;
   for(int k=0;k<64;k++){ u64 pc; if(plat_thread_pc(h,&pc)) pcs[n++]=pc; plat_sleep_ns(2000000); }
-  if(!n) return;
+  if(!n){
+    /* On PS5 plat_thread_pc returns 0 (no host RIP sampler), so a running
+       thread used to produce no live register or code dump at all -- only its
+       stale t->sleep_x from an earlier SleepThread call.  Dump the live CPU
+       state and 192 words around c->pc and c->x[30] directly. */
+    u64 pc=t->cpu.pc, lr=t->cpu.x[30];
+    LOG("    thread %llu: live guest state (host PC sampling unavailable): pc=%llx%s lr=%llx%s sp=%llx fp=%llx\n",
+        (unsigned long long)t->id,(unsigned long long)pc,gsym(pc),(unsigned long long)lr,gsym(lr),
+        (unsigned long long)t->cpu.x[31],(unsigned long long)t->cpu.x[29]);
+    LOG("    live regs:");
+    for(int r=0;r<31;r++) LOG("%s x%d=%llx",(r%6==0)?"\n     ":"",r,(unsigned long long)t->cpu.x[r]);
+    LOG("\n");
+    for(int r=0;r<29;r++){
+      u64 a=t->cpu.x[r]&~7ull; MemBlock b; if(a<AS_BASE || a>=AS_SIZE) continue; mem_query(a,&b);
+      if(b.state==MS_FREE || b.state==MS_INACCESSIBLE || !(b.perm&1)) continue;
+      LOG("    live mem x%d [%llx]:",r,(unsigned long long)a);
+      for(int j=0;j<8 && a+j*8+8<=b.addr+b.size;j++) LOG(" %llx",(unsigned long long)gr64(a+j*8));
+      LOG("\n");
+    }
+    u64 hot=pc&~3ull;
+    if(hot>=AS_BASE && hot<AS_SIZE){
+      MemBlock b; mem_query(hot,&b);
+      if(b.state!=MS_FREE && b.state!=MS_INACCESSIBLE && (b.perm&1)){
+        u64 a = hot>b.addr+0x100 ? hot-0x100 : b.addr;
+        LOG("    live code around pc (%llx) from %llx:",(unsigned long long)hot,(unsigned long long)a);
+        for(int i=0;i<192 && a+i*4<b.addr+b.size;i++) LOG("%s%08x",(i%16==0)?"\n     ":" ",gr32(a+i*4));
+        LOG("\n");
+      }
+    }
+    if((lr&~3ull) && (lr&~3ull)!=hot) kernel_dump_code(lr);
+    return;
+  }
   struct { u64 ga, lo, hi; char mod[48]; int c; } H[16]; int nh=0;
   for(int k=0;k<n;k++){ u64 ga=0, off=0; char mod[48]=""; int g=host_to_guest(pcs[k],&ga,&off);
     if(!g){ if(!plat_addr_module(pcs[k],mod,sizeof mod,&off)){ snprintf(mod,sizeof mod,"?"); off=pcs[k]; } off&=~0x3Full; }
@@ -1369,7 +1511,9 @@ void kernel_dump_threads(void){
   /* threads spinning on SleepThread: dump regs + nearby code */
   { {
     for(int i=0;i<g_nthreads;i++){ KThread* t=g_threads[i]; if(!t || t->state==2 || t->wait_kind!=0 || !t->sleep_n) continue;
-      LOG("thread %llu looping on SleepThread (%llu times) from lr=%llx\n    regs:",(unsigned long long)t->id,(unsigned long long)t->sleep_n,(unsigned long long)t->sleep_lr);
+      LOG("thread %llu %s on SleepThread (%llu times) from lr=%llx (now pc=%llx)\n    regs:",
+          (unsigned long long)t->id,t->sleep_n>1?"looping":"past",(unsigned long long)t->sleep_n,
+          (unsigned long long)t->sleep_lr,(unsigned long long)t->cpu.pc);
       for(int r=0;r<31;r++) LOG("%s x%d=%llx",(r%6==0)?"\n     ":"",r,(unsigned long long)t->sleep_x[r]);
       LOG("\n");
       for(int r=0;r<31;r++){ u64 a=t->sleep_x[r]&~7ull; MemBlock b; if(a<AS_BASE || a>=AS_SIZE) continue; mem_query(a,&b);
@@ -1405,7 +1549,9 @@ void kernel_dump_threads(void){
       u64 fp=t->cpu.x[29], ras[4]; int nra=0; ras[nra++]=t->sleep_lr;
       for(int j=0;j<3 && fp>=AS_BASE && fp<AS_SIZE && !(fp&7);j++){ MemBlock b; mem_query(fp,&b); if(b.state==MS_FREE || b.state==MS_INACCESSIBLE) break; ras[nra++]=gr64(fp+8); fp=gr64(fp); }
       for(int j=0;j<nra;j++) kernel_dump_code(ras[j]); }
-    KThread* m=g_main; if(m){ u64 fp=m->cpu.x[29]; for(int j=0;j<4 && fp>=AS_BASE && fp<AS_SIZE && !(fp&7);j++){ MemBlock b; mem_query(fp,&b); if(b.state==MS_FREE || b.state==MS_INACCESSIBLE) break; kernel_dump_code(gr64(fp+8)); fp=gr64(fp); } } } }
+    KThread* m=g_main; if(m){
+      if(m->cpu.pc) kernel_dump_code(m->cpu.pc);
+      u64 fp=m->cpu.x[29]; for(int j=0;j<4 && fp>=AS_BASE && fp<AS_SIZE && !(fp&7);j++){ MemBlock b; mem_query(fp,&b); if(b.state==MS_FREE || b.state==MS_INACCESSIBLE) break; kernel_dump_code(gr64(fp+8)); fp=gr64(fp); } } } }
   /* address waits: the last arbiter calls on each address (w=wait starts, W=wait returns, S=signal, before/after =
      the word in memory around the call) and the memory around it */
   { u64 seen[64]; int ns=0;

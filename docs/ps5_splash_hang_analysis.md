@@ -335,3 +335,40 @@ void logf_(const char* fmt, ...){
 | **4** | `tools/ps5/ps5build.py:24` & `backend_headless.c` | 链接了无头测试后端 `backend_headless.c`，从未调用 `sceVideoOut` / `sceSystemServiceHideSplashScreen` | 系统合成器 `SceShellCore` 永远不隐藏启动封面图（`pic0.dds`） | 中（接入 `libSceVideoOut` / `HideSplashScreen`） |
 | **5** | `runtime/ps5_crt.c:52` & `runtime/kernel.c:120` | `sighandler` 首次读 TLS 触发 `malloc()`；每个 Guest 线程申请 64 MiB 宿主栈 | 缺页信号处理重入 `malloc` 死锁；多线程耗尽宿主栈空间 | 低（静态池分配 TLS + 4 MiB 线程栈） |
 | **6** | `runtime/plat.c:25` | `logf_` 仅 `fflush()` 未 `fsync()` | 整机死机时 UFS2 页缓存未刷盘，`swr.log` 为 0 字节 | 极低（增加 `fsync(fileno(out))`） |
+
+---
+
+## 六、 2026-11-09 实机日志演进（`1453` → `1636`）与 `5d1507b` 复盘及增强修复
+
+### 1. 五轮实机日志验证结果（前五项根因已全部打通）
+
+在 `runs/ps5log_20261109_1453` 至 `runs/ps5log_20261109_1636` 的连续实机验证中，上述根因 1～6 已全部验证通过：
+
+1. **RomFS (NUP) 挂载 (`0.17s → 0.23s`)**：8.65 GiB 的 `/app0/swr_data/romfs.nup` 通过 `pread` + Direct Memory (`ps5_alloc_large`) 在 **60 ms** 内完成 2,909 个目录、75,238 个文件的索引。
+2. **PS5 视频输出 (`1.02s → 1.06s`)**：`HideSplashScreen rc=0`、`sceVideoOutOpen` + 32 MiB Direct Memory 帧缓冲注册成功，并完成首帧翻转 `first_light flip rc=0`。
+3. **3.23 GiB 堆内存与多线程栈 (`1.06s → 2.56s`)**：成功提交 1,616 个 2 MiB Direct Memory 颗粒（`0x1100000000..0x11ca000000`）；当系统默认 `pthread_create` 栈耗尽报 `rc=35 (EAGAIN)` 时自动回退到 `custom=1`（4 MiB Direct Memory 自定义栈），拉起 `thread 80..90` 共 11 个游戏线程。
+4. **核心资产与 Zstd 直解 (`2.28s → 2.57s`)**：成功读取并解压 `HeapDef`、`ResourceSizeTable`、`ResourceCategoryTable`、`VibrationWaves`、`ProjectGraphicsParam`、`AudioSystem`、`BgmSystem`、`Level`、`PhiveConfig`、`GameDataList`、`Stage`、`VoxelHeapSize`、`UIScreen`、`MaterialTextureInfoList` 以及 **`primitive_drawer_nvn2_shader.bin`**。
+5. **NVN 接管消除 `svcBreak` (`1619` → `1636`)**：`1619` 在加载完 `primitive_drawer_nvn2_shader.bin` 后进入 SDK 内部 NVN 驱动触发 `NvOsDrvGpuGetGpukDevice -> nn::diag::Abort(0x00030af3)`；`0919512` 接管 `nvnBootstrapLoader` 后，`1636` 彻底消除了 `svcBreak`，进程稳定运行超过 225 秒。
+
+### 2. 对 `hy4` 最新提交 `5d1507b`（`PS5: applet/vsync 事件链修复 + 挂起一次性普查`）的技术复盘
+
+#### （1）`5d1507b` 中合理且有价值的改动
+* **`svc_wait_sync` 支持 `KEvent->autoclear` (`runtime/kernel.c`)**：此前 `kevent_new(name, 1)` 设置了 `autoclear=1`，但 `svc_wait_sync` 唤醒时从未清零 `signaled`，补齐该逻辑符合 Horizon OS 内核语义。
+* **`nn::vi::GetDisplayVsyncEvent` 构造真实 `SystemEventType` + 60 Hz 宿主定时器 (`runtime/kernel.c`)**：填充 `+0x10=1, +0x13=1, +0x14=r, +0x18=w, +0x28=2` 并由 `s2_vsync_tick` 每 16.67 ms 触发一次，避免了渲染循环在空 `SystemEventType` 上永久阻塞。
+* **`IApplicationFunctions` cmd 130..210 共享通知事件 (`runtime/svc_core.c`)**：消除了 `thread 81` 在死事件 `appfn ev` 上永久睡眠的问题。
+* **新增 `wait:` 与 `kernel event census` 诊断日志**：一次运行即可列出所有未触发的 `KEvent`。
+
+#### （2）`5d1507b` 存在的误判与遗漏（已在当前版本补齐）
+1. **误将 `thread 80 looping on SleepThread (1 times) from lr=86969e8` 当作当前卡点**：
+   * 在 `1636` 日志中，主线程 `sleep_n` 从 7 秒到 225 秒始终为 **`1`**（仅在 `0x86969e8` 处睡过 1 次 10 ms），随后早已退出该循环并深入 9 层调用栈到达 **`0x813a27c`**（7～40 秒位于 `pc=0x813a538`，225 秒推进到 `pc=0x813a63c`，调用栈为 `81398c8 <- 8732634 <- 8727ca8 <- 8722fb0 <- 875d2f0 <- 847a610 <- 847a270 <- 8479b8c <- 82ffca4 <- 8696a8c`）。
+   * 由于 PS5 上 `plat_thread_pc()` 返回 `0`，`sample_thread()` 直接返回，导致日志只打印了 `0x86969e8` 留下的陈旧 `t->sleep_x` 寄存器，而没有打印主线程在 `0x813a538` / `0x813a63c` 的实时寄存器与当前函数指令码。
+   * **修复**：在 `sample_thread()` 中当 `plat_thread_pc` 返回 `0` 时，直接转储运行线程的实时 `pc`、`lr`、`x0..x30`、各寄存器指向的内存以及 `pc` 前后 192 条指令机器码；同时将 `sleep_n == 1` 明确标记为 `past on SleepThread`。
+2. **`nvnDeviceGetProcAddress` (`hle_s2_nvn_proc`) 未读取 `x1` 函数名且未按语义分流**：
+   * `1636` 中游戏仅通过 `nvnBootstrapLoader` 查询了 `nvnDeviceInitialize` 和 `nvnDeviceGetProcAddress`，其余数百个 NVN API 全部通过 `nvnDeviceGetProcAddress(NVNdevice *dev, const char *name)`（`x0=dev, x1=name`）查询。
+   * 原 `hle_s2_nvn_proc` 忽略了 `x1` 并把所有 NVN 函数一律指向 `hle_s2_nvn_true`（恒返回 `1`），导致 `nvnDeviceGetInteger` 不写输出参数、`nvnWindowAcquireTexture` 返回错误码 `1`、`nvnSyncWait` 返回非零状态、`Map/GetAddress` 返回 `0x100001400` 小页地址。
+   * **修复**：在 `hle_s2_nvn_proc` 中解析 `x1`（回退 `x0`）并打印完整查表日志；新增 `INT`（`nvnDeviceGetInteger` 写入对齐与上限参数）、`ACQ`（`nvnWindowAcquireTexture` 写入 `idx=0` 并返回 `0`）槽位，并为 `OBJ`（`Map/GetAddress/GetMemory`）分配真实的 16 MiB RW Guest 缓冲。
+3. **`DefaultDisplay::Duplicate*Event` 成员函数 `this` 指针错位与 `nn::vi` 泛化回退误伤**：
+   * `_ZN2nn2vi6detail14DefaultDisplay19DuplicateVsyncEventEPNS_2os15SystemEventTypeE` 是 C++ 成员函数（`x0=this, x1=out`），原代码向 `x0` 写入 0x30 字节会踩坏 `DefaultDisplay` 对象；现已拆分为 `hle_s2_vi_vsync_mem`（写 `x1`）。
+   * 排除了 `2nn2vi` 泛化回退对栈上值类型 `LayerCreationSettings` 的覆盖（避免 `GetWidth`/`GetHeight` 返回 `0`），并为 `Layer::GetNativeWindow()`、`Display::IsOpen()`、`Layer::IsOpen()`、`IsInitialized()` 提供了正确的返回值桩。
+4. **`TryPopMessage` (`am_csg` cmd 1) 队列未空时重触发 `g_appfn_ev`**：
+   * `g_appfn_ev` 设为 `autoclear=1` 后，首次唤醒会清零事件，导致启动入队的 4 条消息（`0xF, 0x1, 0x1E, 0x1F`）只弹出第 1 条后事件即变为未触发；现已在 `TryPopMessage` 弹出后若 `g_nmsg > 0` 时重新 signal `g_msg_event` 与 `g_appfn_ev`。

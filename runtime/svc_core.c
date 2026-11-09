@@ -102,8 +102,16 @@ static int am_csg(SvcObj* o, IpcCtx* c){           /* ICommonStateGetter */
     case 0: out_copy_h(c,ev_handle(g_msg_event)); return 0;
     case 1: { pm_lock(&g_klock);
       if(!g_nmsg){ am_msg_event_clear_nl(); pm_unlock(&g_klock); return RC(128,3); }
-      u32 m=g_msgq[0]; memmove(g_msgq,g_msgq+1,(--g_nmsg)*4); if(!g_nmsg) am_msg_event_clear_nl(); pm_unlock(&g_klock);
-      { static int nl; if(nl<16){ nl++; LOG("applet: message %u delivered (%d left)\n",m,g_nmsg); } }
+      u32 m=g_msgq[0]; memmove(g_msgq,g_msgq+1,(--g_nmsg)*4);
+      int more=g_nmsg; if(!more) am_msg_event_clear_nl();
+      pm_unlock(&g_klock);
+      /* g_appfn_ev is auto-clear on WaitSynchronization, so when multiple
+         messages are queued at boot (0xF, 0x1, 0x1E, 0x1F) the first wait
+         clears it after popping only one message.  Re-signal while messages
+         remain so the applet thread drains the whole queue (including
+         0x1 = ChangeIntoForeground). */
+      if(more){ kevent_signal(g_msg_event); if(g_appfn_ev) kevent_signal(g_appfn_ev); }
+      { static int nl; if(nl<16){ nl++; LOG("applet: message %u delivered (%d left)\n",m,more); } }
       out32(c,m); return 0; }
     case 5: out8(c,(u8)g_opt_docked); return 0;                      /* GetOperationMode */
     case 6: out32(c,(u32)g_opt_docked); return 0;                    /* GetPerformanceMode */
