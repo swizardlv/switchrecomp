@@ -513,8 +513,22 @@ static u32 svc_get_info_(u32 id0, u32 h, u64 id1, u64* out){
     case 24: { int live=0; for(int i=0;i<g_nthreads;i++) if(g_threads[i] && g_threads[i]->state!=2) live++; *out=(u64)(live<96? 96-live : 0); return 0; }  /* FreeThreadCount: unity skips its job threads if this
                                                                                                                                                               is 0 */
     case 0xF0000002: { KThread* t=kthread_cur(); (void)t; *out=plat_ns()*192/10000; return 0; }
-    case 26: *out=1; return 0;
-    case 27: case 28: *out=0; return 0;
+    case 26: *out=1; return 0;                                  /* [14.0.0+] IsSvcPermitted */
+    case 27: case 28: *out=0; return 0;                          /* IoRegionHint / AliasRegionExtraSize */
+    /* Switch 2 / 23.0.0+ InfoTypes (switchbrew SVC#InfoType).  nnSdk 22 queries
+       ProcessPageSize (33) during nn::init::Start and uses (value-1) as an
+       alignment mask on two addresses; returning 0 makes the mask ~0, so every
+       address fails the check and nn::diag::Abort fires before the game boots.
+       4 KiB is the guest page size our mem layer actually works with. */
+    case 29: *out=0; return 0;                                  /* [S2] RemoteRegionAddress (none) */
+    case 30: *out=0; return 0;                                  /* [S2] RemoteRegionSize */
+    case 31: *out=0; return 0;                                  /* [S2] RemoteMemoryUsage */
+    case 32: *out=0; return 0;                                  /* [S2] RemoteMemoryUsagePeak */
+    case 33: *out=0x1000ull; return 0;                          /* [S2] ProcessPageSize */
+    case 34: *out=0; return 0;                                  /* [19.0.0+] TransferMemoryHint */
+    case 36: *out=(g_as36? 0x1000000000ull : AS_SIZE)-AS_BASE; return 0; /* [23.0.0+] AddressSpaceSize */
+    case 37: *out=0; return 0;                                  /* [23.0.0+] ShadowStackRegionAddress */
+    case 38: *out=0; return 0;                                  /* [23.0.0+] ShadowStackRegionSize */
     default: WARN("GetInfo %u/%llu not implemented\n",id0,(unsigned long long)id1); *out=0; return 0;
   }
   (void)h;
