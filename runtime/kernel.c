@@ -1187,6 +1187,23 @@ static void hle_s2_gfb(CPU* c, u64 pc){
   else c->pc=c->x[30];
 }
 
+/* shader/material reflection traversal helper at 0x99a6350.  The material-stage
+   reflection loop at 0x8864708 calls it four times (bl at 8864774/88647c4/
+   88647ec/8864810).  The *first* call's return value is read by the caller at
+   [x0,#0x1c] as the stage count, and the entire loop is skipped when that is <1.
+   The function is NOT recompiled -- its body is the generic interpreter
+   trampoline -- so it runs through the interpreter and dereferences an unbound
+   NVN object sentinel (0x10000000101) at +0x18, faulting with an invalid memory
+   access (crash pc=8864814 in run 2026-11-09_2031).  Returning the zero-filled
+   NVN scratch object makes [x0,#0x1c] read 0, so the caller skips the whole
+   loop (including the crashing 4th call) instead of cascading. */
+static GuestFn g_s2_orig_refl;
+static void hle_s2_refl(CPU* c, u64 pc){
+  (void)pc;
+  c->x[0]=s2_nvn_scratch_addr();
+  c->pc=c->x[30];
+}
+
 /* Match a distinctive mangled substring rather than the full symbol: exported
    names carry parameter suffixes that differ between dumps.  Keep the matching
    string specific enough to exclude lookalikes -- an earlier table used bare
@@ -1384,6 +1401,20 @@ void swr_install_s2_hooks(void){
     g_s2_orig_gfb=g_disp[slot];
     g_disp[slot]=hle_s2_gfb;
     LOG("hle: [S2] hooked shader-reflection lookup @ 884f2c0 (x0-guard -> -1)\n");
+  }
+  /* material-stage reflection helper at 0x99a6350: see hle_s2_refl above.  The
+     first call's [x0,#0x1c] (stage count) must read 0 to skip the loop, so we
+     return the zero-filled NVN scratch object on every call.  Guard on the
+     interpreter-trampoline prologue (adrp 0xf00041f0): only hook when this
+     address is the un-recompiled trampoline that crashes, never a real
+     recompiled function on a different build / dump. */
+  if(0x99a6350ull>=g_code_lo && 0x99a6350ull<g_code_hi &&
+     gr32(0x99a6350ull)==0xf00041f0u){
+    u64 slot=(0x99a6350ull-g_code_lo)/4;
+    g_s2_orig_refl=g_disp[slot];
+    g_disp[slot]=hle_s2_refl;
+    LOG("hle: [S2] hooked shader-reflection helper @ 99a6350 (-> scratch, loop skip) sym=%s\n",
+        gsym(0x99a6350ull)? gsym(0x99a6350ull): "?");
   }
 }
 
