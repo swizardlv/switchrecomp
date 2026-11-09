@@ -4,6 +4,14 @@
 /* HIPC/CMIF (+domains). requests get served on the calling thread, no server threads and no context switches */
 #include "rt.h"
 
+/* [S2] The real KHandle of the GSV TIPC session created by ISelfController
+   cmd 2000 (GetGraphicsSupervisor).  Bananza's nnSdk keeps handle 0 in its
+   GSV singleton even though the reply carries this handle in both the special
+   section and the domain object-id slot, then issues TIPC requests against 0.
+   Route those requests here instead of failing with 0xE401.  Zero until the
+   first cmd 2000, and only used for TIPC (type >= 16) messages. */
+u32 g_gsv_handle;
+
 /* ============================================================ service objects */
 SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t ds){
   SvcObj* o=calloc(1,sizeof *o); o->name=name; o->dispatch=dispatch; o->refs=1; if(ds) o->data=calloc(1,ds); return o; }
@@ -224,6 +232,20 @@ void ipc_dump_stats(void){
 void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
   CPU* cpu=&t->cpu;
   KSession* s=(KSession*)h_get_type(handle,KO_SESSION);
+  /* [S2] nnSdk's GSV singleton retains handle 0 even though GetGraphicsSupervisor
+     returned a valid KHandle.  Its BootWithRemoteMemory / SetCurrentProcessHandle /
+     CreateContext requests are TIPC (type = 16 + cmd), so they are unambiguous:
+     route handle-0 TIPC traffic to the session we created.  No other service uses
+     handle 0 for TIPC, so this cannot mask a genuine invalid-handle bug. */
+  if(!s && !handle && g_gsv_handle){
+    u32 w0=0; memcpy(&w0,GP(msg_addr),4);
+    if((w0&0xFFFF)>=16){
+      KSession* gs=(KSession*)h_get_type(g_gsv_handle,KO_SESSION);
+      if(gs){ handle=g_gsv_handle; s=gs;
+        if(ipc_warn_once("gsv:handle0",w0&0xFFFF))
+          LOG("ipc: TIPC type %u on handle 0 -> GSV handle %x\n",(unsigned)(w0&0xFFFF),g_gsv_handle); }
+    }
+  }
   if(!s){ WARN("SendSyncRequest to invalid handle %x (pc=%llx)\n",handle,(unsigned long long)cpu->pc);
     { u32 q[4]; memcpy(q,GP(msg_addr),16);
       LOG("ipc: bad-handle msg hdr %08x %08x %08x %08x (addr=%llx)\n",

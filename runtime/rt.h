@@ -200,6 +200,7 @@ void   kthread_start(KThread* t);
 void   kernel_run_main(u64 entry, u64 stack_size, int prio, int core);
 void   swr_svc(CPU* c, u32 imm);
 extern PMutex g_klock;
+extern u32 g_gsv_handle;      /* [S2] GSV TIPC session handle (see ipc.c) */
 extern u64 g_title_id;
 extern int g_exiting;
 void   process_exit(int code);

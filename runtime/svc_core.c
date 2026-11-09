@@ -110,8 +110,10 @@ static int am_csg(SvcObj* o, IpcCtx* c){           /* ICommonStateGetter */
    failed and BootWithRemoteMemory called nn::diag::AbortImpl(). */
 static int gsv_session(SvcObj* o, IpcCtx* c){
   extern int ipc_warn_once(const char*,u32);
-  if(ipc_warn_once(o->name,c->cmd))
-    LOG("GSV:GraphicsSupervisor cmd %u (tipc=%d type=%u)\n",c->cmd,c->tipc,c->type);
+  if(ipc_warn_once(o->name,c->cmd)){
+    u32 q[6]; memcpy(q,c->msg,24);
+    LOG("GSV:GraphicsSupervisor cmd %u (tipc=%d type=%u) hdr %08x %08x %08x %08x %08x %08x\n",
+        c->cmd,c->tipc,c->type,q[0],q[1],q[2],q[3],q[4],q[5]); }
   switch(c->cmd){
     case 4:                       /* BootWithRemoteMemory */
     case 11:                      /* SetCurrentProcessHandle */
@@ -137,10 +139,12 @@ static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
     case 100: case 110: case 120: return 0;
     /* [S2] GetGraphicsSupervisor: returns an output *TIPC handle*, NOT a CMIF
        object.  out_obj() degrades to a domain object id when the caller uses
-       a domain session, which leaves the SDK storing handle 0 and later
-       calling svcSendSyncRequest(0) from BootWithRemoteMemory.  Always hand
-       back a real KHandle so the GSV TIPC session is usable. */
+       a domain session, so hand back a real KHandle.  Bananza's nnSdk still
+       keeps 0 in its GSV singleton even with the handle present in the reply
+       (verified on hardware); ipc_handle() therefore routes handle-0 TIPC
+       requests to this session.  Remember the handle for that fallback. */
     case 2000: { u32 h=session_new(svcobj_new("GSV:GraphicsSupervisor",gsv_session,0));
+      g_gsv_handle=h;
       LOG("am: GetGraphicsSupervisor -> handle %x (type=%u tipc=%d domain=%d)\n",
           h,c->type,c->tipc,c->is_domain);
       out_move_h(c,h); return 0; }
