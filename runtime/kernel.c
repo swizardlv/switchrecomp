@@ -581,17 +581,79 @@ static const char* gsym(u64 a){
    Matching by mangled symbol name, not hard-coded guest addresses, keeps this
    working for other Switch 2 dumps.  A small address fallback covers symbols
    that are not exported in .dynsym. */
-static void hle_s2_stub_ok(CPU* c, u64 pc){ (void)pc; c->x[0]=0; }   /* Result OK */
+/* A GuestFn MUST emulate RET: thread_body() is an endless loop of
+   swr_lookup(c,c->pc)(c,c->pc), so a hook that only sets x0 leaves c->pc at
+   the hook's entry and the main thread re-enters it forever.  hle_ctrl_support
+   and hle_heap_locked both do c->pc=c->x[30] ("return like RET").  The first
+   version of these S2 hooks forgot it: hardware showed pc pinned at
+   nv::InitializeGraphics (a9bfdb0) with frames=0/GPU submits=0 for 50+ s and
+   no abort at all -- a hang, not a crash. */
+enum { S2_OK=0, S2_INIT_GFX, S2_MEM_INFO, S2_CAMERA };
 
-static const char* const g_s2_hook_syms[]={
-  "_ZN2nn2gs3sdk18BootGraphicsSystemEPvm",                 /* BootGraphicsSystem */
-  "_ZN2nv18InitializeGraphicsEPvm",                        /* nv::InitializeGraphics(void*, u64) */
-  "_ZN2nv9InitCheckEv",                                    /* nv::InitCheck */
-  "_ZN2nn2gs3sdk30CheckGraphicsSystemInitializedEPKcm",   /* [S2] abort unless boot ran */
-  "_ZN2nn5nvsrv20BootWithRemoteMemoryE",                   /* nvsrv boot (0x30af3) */
-  "_ZN2nn3gsv20BootWithRemoteMemoryE",                     /* gsv boot */
-  "_ZN2nn6camera3sdk19CreateCameraContextE",               /* camera: 0x30af3 on no GSV */
-  NULL
+static u64 g_s2_pool_addr, g_s2_pool_size;
+static int g_s2_pool_inited;
+
+/* nn::sf::hipc requests on the camera context: nxnative answers every command
+   with zeroed output ("no camera"), which is what the SDK expects. */
+static int s2_camera_disp(SvcObj* o, IpcCtx* c){ (void)o; (void)c; return 0; }
+
+static int s2_guest_ptr(u64 a, u64 n){
+  return a>=AS_BASE && a<AS_SIZE && n<=AS_SIZE-a; }
+
+static void hle_s2_stub(CPU* c, u64 pc, int kind){
+  static int ncalls;
+  if(ncalls++<64)
+    LOG("hle: [S2] call %llx%s kind=%d -> ret %llx\n",
+        (unsigned long long)pc,gsym(pc),kind,(unsigned long long)c->x[30]);
+  u64 out=c->x[0];
+  switch(kind){
+    case S2_INIT_GFX:                    /* nv::InitializeGraphics(pool, size) */
+      g_s2_pool_addr=out; g_s2_pool_size=c->x[1]; g_s2_pool_inited=1;
+      LOG("hle: [S2] graphics pool %llu MiB at %llx\n",
+          (unsigned long long)(g_s2_pool_size>>20),(unsigned long long)g_s2_pool_addr);
+      break;
+    case S2_MEM_INFO:                    /* nv::GetGraphicsMemoryInfo(out) */
+      /* SDK >= 11 expects 0x40 bytes of 64-bit counters; the real
+         implementation reads an NV driver object we never create. */
+      if(s2_guest_ptr(out,0x40)){
+        memset(GP(out),0,0x40);
+        if(g_s2_pool_inited){ WR64(out,g_s2_pool_size); WR64(out+16,g_s2_pool_size); }
+      }
+      break;
+    case S2_CAMERA:                      /* camera::sdk::CreateCameraContext(out) */
+      if(s2_guest_ptr(out,4)){
+        u32 h=session_new(svcobj_new("camera",s2_camera_disp,0));
+        WR32(out,h);
+        LOG("hle: [S2] camera context -> handle %x\n",h);
+      }
+      break;
+  }
+  c->x[0]=0;                            /* Result OK */
+  c->pc=c->x[30];                       /* RET */
+}
+
+static void hle_s2_ok(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_OK); }
+static void hle_s2_init(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_INIT_GFX); }
+static void hle_s2_meminfo(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_MEM_INFO); }
+static void hle_s2_camera(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_CAMERA); }
+
+/* Match a distinctive substring of the mangled name rather than the full
+   symbol: the SDK's exported names carry parameter suffixes that differ
+   between dumps (e.g. CreateCameraContextEPNS_5gsdrv18UniqueNativeHandleE).
+   Every entry here is backed by nxnative's HLE_FORCE set for the same two
+   Switch 2 dumps (Bananza / OOT SDK 22.2.8). */
+static const struct { const char* sym; GuestFn fn; } g_s2_hooks[]={
+  {"BootGraphicsSystem",           hle_s2_ok},
+  {"InitializeGraphics",           hle_s2_init},
+  {"FinalizeGraphics",             hle_s2_ok},
+  {"SetGraphicsAllocator",         hle_s2_ok},
+  {"SetGraphicsDevtoolsAllocator", hle_s2_ok},
+  {"9InitCheckE",                  hle_s2_ok},   /* nv::InitCheck */
+  {"CheckGraphicsSystemInitialized",hle_s2_ok},
+  {"GetGraphicsMemoryInfo",        hle_s2_meminfo},
+  {"DumpGraphicsMemoryInfo",       hle_s2_ok},
+  {"BootWithRemoteMemory",         hle_s2_ok},   /* nn::nvsrv + nn::gsv */
+  {"CreateCameraContext",          hle_s2_camera},
 };
 /* Verified guest address for Bananza's BootGraphicsSystem (backtrace
    a8519e0 = +0x70).  Used only if the symbol scan misses it. */
@@ -600,20 +662,20 @@ static const u64 g_s2_hook_addrs[]={ 0xA851970ull, 0 };
 void swr_install_s2_hooks(void){
   extern GuestFn* g_disp; extern u64 g_code_lo, g_code_hi;
   if(!g_mod || !g_disp) return;
-  const int NS=(int)(sizeof(g_s2_hook_syms)/sizeof(g_s2_hook_syms[0]))-1;
-  int hits[16]={0};
+  const int NS=(int)(sizeof(g_s2_hooks)/sizeof(g_s2_hooks[0]));
+  int hits[32]={0};
   for(u32 i=0;i<g_mod->nentries;i++){
     u64 a=g_mod->entry_addr[i]; if(a<g_code_lo || a>=g_code_hi) continue;
     const char* s=gsym(a); if(!s || !s[0]) continue;
     /* gsym() returns the *nearest* symbol; require an exact match (+0) so a
        neighbouring exported symbol cannot be hooked by accident. */
     if(!strstr(s,"+0>")) continue;
-    for(int k=0;k<NS;k++) if(strstr(s,g_s2_hook_syms[k])){
-      g_disp[(a-g_code_lo)/4]=hle_s2_stub_ok; hits[k]++;
-      LOG("hle: [S2] hook %s @ %llx -> stub_ok\n",g_s2_hook_syms[k],(unsigned long long)a); }
+    for(int k=0;k<NS;k++) if(strstr(s,g_s2_hooks[k].sym)){
+      g_disp[(a-g_code_lo)/4]=g_s2_hooks[k].fn; hits[k]++;
+      LOG("hle: [S2] hook %s @ %llx (%s)\n",g_s2_hooks[k].sym,(unsigned long long)a,s); }
   }
   for(int k=0;k<NS;k++) if(!hits[k])
-    LOG("hle: [S2] hook %s NOT FOUND by symbol\n",g_s2_hook_syms[k]);
+    LOG("hle: [S2] hook %s NOT FOUND by symbol\n",g_s2_hooks[k].sym);
   for(int j=0;g_s2_hook_addrs[j];j++){ u64 a=g_s2_hook_addrs[j];
     if(a<g_code_lo || a>=g_code_hi) continue;
     const char* s=gsym(a);
@@ -622,7 +684,7 @@ void swr_install_s2_hooks(void){
     if(!strstr(s,"BootGraphicsSystem")){
       LOG("hle: [S2] addr fallback %llx skipped (%s)\n",(unsigned long long)a,s); continue; }
     LOG("hle: [S2] addr fallback %llx (%s) -> stub_ok\n",(unsigned long long)a,s);
-    g_disp[(a-g_code_lo)/4]=hle_s2_stub_ok; }
+    g_disp[(a-g_code_lo)/4]=hle_s2_ok; }
 }
 
 static void guest_backtrace(CPU* c){
