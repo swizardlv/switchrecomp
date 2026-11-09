@@ -34,7 +34,11 @@ VERDICT_KEYS = ('FATAL', 'window OK', 'window FAILED', 'segment ', 'reserve ',
                 'kernel service census', 'LoadResult',
                 'nvn lookup', 'nvn slot', 'nvn export', 'nvn bootstrap',
                 'NVN takeover', 'NV family', 'nv export', 'nvdrv call',
-                'nn::Result', 'svcBreak', 'primitive_drawer')
+                'nn::Result', 'svcBreak', 'primitive_drawer',
+                'without a new image', 'looping on SleepThread',
+                'applet: queued message', 'applet: IApplicationFunctions',
+                'wait: thread', 'kernel event census', 'UNSIGNALED',
+                'wait-cond:')
 
 
 def opener():

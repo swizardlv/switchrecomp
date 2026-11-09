@@ -367,11 +367,27 @@ static u32 svc_wait_sync(KThread* t, u64 hptr, u32 n, i64 timeout, u32* out_idx)
   if(t->cancel){ t->cancel=0; pm_unlock(&g_klock); return R_CANCELLED; }
   u64 end= timeout<0? 0 : plat_ns()+(u64)timeout;
   for(;;){
-    for(u32 i=0;i<n;i++) if(objs[i]->is_signaled(objs[i])){ *out_idx=i; pm_unlock(&g_klock); return 0; }
+    for(u32 i=0;i<n;i++) if(objs[i]->is_signaled(objs[i])){
+      /* Horizon clears an auto-clear KEvent when a wait succeeds.  nxnative's
+         hle_oe.c warns that leaving a notification event signalled makes the
+         applet thread spin on a core forever; our old wait path never honoured
+         the autoclear flag at all. */
+      if(objs[i]->type==KO_EVENT && ((KEvent*)objs[i])->autoclear) ((KEvent*)objs[i])->signaled=0;
+      *out_idx=i; pm_unlock(&g_klock); return 0; }
     if(timeout==0){ pm_unlock(&g_klock); return R_TIMEOUT; }
     i64 rem=-1; if(timeout>0){ u64 now=plat_ns(); if(now>=end){ pm_unlock(&g_klock); return R_TIMEOUT; } rem=(i64)(end-now); }
     /* n==0 is a plain sleep that CancelSynchronization ends (nn::os MultiWait with only user objects) */
     t->woken=0; t->wait_kind=1; t->wait_name= n? objs[0]->name : "sleep"; t->wait_timeout=timeout;
+    /* One census-style line instead of guessing which event never fires:
+       print every object being waited on and whether it is signalled.  Rate
+       limited because a healthy game polls (service,cmd) pairs every frame. */
+    { static u32 nw; u32 k=__atomic_fetch_add(&nw,1,__ATOMIC_RELAXED);
+      if(k<48 || !(k&0x3FF)){
+        LOG("wait: thread %llu on %u objs%s:",(unsigned long long)t->id,n,
+            timeout<0? " (infinite)" : "");
+        for(u32 i=0;i<n && i<8;i++) LOG(" [%x %s sig=%d]",hs[i],
+            objs[i]->name? objs[i]->name : "?",objs[i]->is_signaled(objs[i]));
+        LOG("\n"); } }
     for(u32 i=0;i<n;i++) waiter_add(objs[i],t);
     sleep_nl(t,rem);
     for(u32 i=0;i<n;i++) waiter_del(objs[i],t);
@@ -698,6 +714,47 @@ static void hle_s2_stub(CPU* c, u64 pc, int kind){
   c->pc=c->x[30];                       /* RET */
 }
 
+/* ---- nn::vi vsync: a real SystemEvent instead of an empty Result-OK stub --
+   The generated SDK code for nn::os::CreateSystemEvent (sdk F_A5B8580) shows
+   the layout of nn::os::SystemEventType on this dump: the two kernel handles
+   live at +0x14/+0x18, +0x10 is the clear mode, +0x13 is an init marker and
+   +0x28 is the state (2 = system event made by svcCreateEvent).  Returning an
+   all-zero structure made every Wait/TryWait fail, which is exactly what the
+   10 ms SleepThread poll loop in run 1636 was doing.  A 60 Hz host ticker
+   signals the event so an infinite wait is paced, not deadlocked. */
+static KEvent* g_vi_vsync_ev;
+static void s2_vsync_tick(void* p){
+  (void)p;
+  for(;;){ plat_sleep_ns(16666667); if(g_vi_vsync_ev) kevent_signal(g_vi_vsync_ev); }
+}
+static void hle_s2_vi_vsync(CPU* c, u64 pc){
+  (void)pc; u64 out=c->x[0];
+  if(!g_vi_vsync_ev){
+    g_vi_vsync_ev=kevent_new("vi vsync",1);   /* auto-clear, one tick per wait */
+    kobj_ref(&g_vi_vsync_ev->o);
+    plat_thread(s2_vsync_tick,NULL,64*1024);
+    LOG("hle: [S2] vi vsync event created, 60 Hz host tick started\n");
+  }
+  u32 r=h_new(&g_vi_vsync_ev->o), w=h_new(&g_vi_vsync_ev->o);
+  if(s2_guest_ok(out,0x30)){
+    u8 z[0x30]; memset(z,0,sizeof z);
+    z[0x10]=1;                                   /* auto clear */
+    z[0x13]=1;                                   /* initialized */
+    memcpy(z+0x14,&r,4); memcpy(z+0x18,&w,4);    /* read / write handles */
+    z[0x28]=2;                                   /* system event */
+    memcpy(GP(out),z,sizeof z);
+  } else { static int nw; if(nw++<4)
+      LOG("hle: [S2] vi vsync write refused a=%llx\n",(unsigned long long)out); }
+  { static int nv; if(nv++<8)
+      LOG("hle: [S2] vi vsync -> handles %x/%x at %llx\n",r,w,(unsigned long long)out); }
+  c->x[0]=0; c->pc=c->x[30]; }
+static void hle_s2_vi_vsync_try(CPU* c, u64 pc){
+  (void)pc;
+  u64 f=__atomic_add_fetch(&g_s2_vi_frames,1,__ATOMIC_RELAXED);
+  { static int nv; if(nv++<8) LOG("hle: [S2] vi vsync TryWait -> true (frame %llu)\n",
+                                  (unsigned long long)f); }
+  c->x[0]=1; c->pc=c->x[30]; }
+
 static void hle_s2_ok(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_OK); }
 static void hle_s2_init(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_INIT_GFX); }
 static void hle_s2_meminfo(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_MEM_INFO); }
@@ -826,6 +883,19 @@ static const struct { const char* sym; GuestFn fn; } g_s2_hooks[]={
   {"2nn2vi21QueryDisplayHdrStatusE", hle_s2_vi_hdrstatus},
   {"2nn2vi25QueryDisplayHdrPaperWhiteE", hle_s2_vi_paperwhite},
   {"2nn2vi24QueryDisplayVrrSupportedE", hle_s2_vi_vrr},
+  /* vsync event chain: the generic vi fallback returns x0=0 for every one of
+     these.  TryWait/TimedWait must return TRUE or the game polls forever, and
+     the Get/Duplicate calls must hand back an initialized SystemEventType. */
+  {"2nn2vi20GetDisplayVsyncEventE", hle_s2_vi_vsync},
+  {"2nn3vi23sdk19DuplicateVsyncEventE", hle_s2_vi_vsync},
+  {"2nn2vi6detail14DefaultDisplay19DuplicateVsyncEventE", hle_s2_vi_vsync},
+  {"2nn3vi217TryWaitVsyncEventE", hle_s2_vi_vsync_try},
+  {"2nn3vi219TimedWaitVsyncEventE", hle_s2_vi_vsync_try},
+  {"2nn3vi214WaitVsyncEventE", hle_s2_ok},
+  {"2nn3vi215ClearVsyncEventE", hle_s2_ok},
+  {"2nn3vi216CreateVsyncEventE", hle_s2_ok},
+  {"2nn3vi217DestroyVsyncEventE", hle_s2_ok},
+  {"2nn3vi225InitializeMultiWaitHolderE", hle_s2_ok},
 };
 /* Verified Bananza addresses, used only if the symbol scan misses them.  Each
    carries the mangled substring gsym() must report at that address, so a
@@ -1373,5 +1443,40 @@ void kernel_dump_threads(void){
         LOG("    %02x %llx %llx %llx %llx -> %x %llx  lr=%llx\n",r->imm,(unsigned long long)r->a[0],(unsigned long long)r->a[1],(unsigned long long)r->a[2],(unsigned long long)r->a[3],r->res,(unsigned long long)r->o1,(unsigned long long)r->lr); }
       LOG("  last IPCs:\n");
       for(u32 qn_=g_ipc_ring_n, q=qn_>32? qn_-32 : 0; q<qn_; q++) LOG("    %s\n",g_ipc_ring[q&31]); } }
+  /* ---- hang censuses: which KEvent is never signalled, and the exact fields
+         the SleepThread poll loop is waiting on.  One run exposes the whole
+         surface instead of guessing one event at a time. -------------------- */
+  if(g_dump_sample){
+    int tot=0, unsig=0, shown=0;
+    LOG("kernel event census:\n");
+    pm_lock(&g_klock);
+    for(int i=1;i<MAXH;i++){
+      KObj* o=htab[i]; if(!o || o->type!=KO_EVENT) continue;
+      KEvent* e=(KEvent*)o; tot++;
+      if(e->signaled) continue;
+      unsig++;
+      if(shown++<64) LOG("  UNSIGNALED h=%x %-22s autoclear=%d waiters=%d\n",
+          ((u32)hgen[i]<<15)|(u32)i, o->name? o->name : "?", e->autoclear, o->nwait);
+    }
+    pm_unlock(&g_klock);
+    LOG("kernel event census: %d events, %d still clear\n",tot,unsig);
+  }
+  if(g_dump_sample && g_main && g_main->sleep_n){
+    u64 o=g_main->sleep_x[19];
+    if(o>=AS_BASE && o<AS_SIZE){
+      MemBlock b; mem_query(o,&b);
+      if(b.state!=MS_FREE && b.state!=MS_INACCESSIBLE && (b.perm&1)){
+        u64 p=gr64(o+56);
+        LOG("wait-cond: x19=%llx flag(+0x50)=%x member(+0x38)=%llx\n",
+            (unsigned long long)o,(unsigned)gr32(o+80),(unsigned long long)p);
+        if(p>=AS_BASE && p<AS_SIZE){
+          MemBlock pb; mem_query(p,&pb);
+          if(pb.state!=MS_FREE && pb.state!=MS_INACCESSIBLE && (pb.perm&1))
+            LOG("wait-cond: member[+0x120]=%llx (loop exits when this or the flag is non-zero)\n",
+                (unsigned long long)gr64(p+288));
+        }
+      }
+    }
+  }
   LOG("---------------------------------------\n"); fflush(NULL);
 }

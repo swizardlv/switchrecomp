@@ -49,11 +49,26 @@ static SvcObj* quiet(const char* name){ return svcobj_new(name,quiet_ok,0); }
 static u32 ev_handle(KEvent* e){ return h_new(&e->o); }
 
 /* ================================================================ am */
-static KEvent* g_msg_event; static u32 g_msgq[16]; static int g_nmsg;
+static KEvent* g_msg_event, *g_appfn_ev; static u32 g_msgq[16]; static int g_nmsg;
 static KEvent* g_launch_ev; static KEvent* g_res_ev; static KEvent* g_opmode_ev;
 static u64 g_user_id[2]={0x0123456789ABCDEFull,0xFEDCBA9876543210ull};
 
-static void am_push_msg(u32 m){ pm_lock(&g_klock); if(g_nmsg<16) g_msgq[g_nmsg++]=m; pm_unlock(&g_klock); kevent_signal(g_msg_event); }
+/* nxnative (dm/host/hle_oe.c) documents the rule for the applet notification
+   event: signalled while a notification is queued, cleared when the last one
+   is popped.  IApplicationFunctions cmd 130/140/150/160/210 used to return a
+   fresh, permanently-clear "appfn ev" every call; on PS5 run 1636 thread 81
+   sat on that object for 225 s while the main thread polled a flag only the
+   applet thread can set.  Both event getters now share one queue-driven event. */
+static void am_msg_event_clear_nl(void){
+  g_msg_event->signaled=0;
+  if(g_appfn_ev) g_appfn_ev->signaled=0;
+}
+static void am_push_msg(u32 m){
+  pm_lock(&g_klock); if(g_nmsg<16) g_msgq[g_nmsg++]=m; int left=g_nmsg; pm_unlock(&g_klock);
+  kevent_signal(g_msg_event);
+  if(g_appfn_ev) kevent_signal(g_appfn_ev);
+  { static int np; if(np++<12) LOG("applet: queued message %u (%d pending), msg+appfn events signaled\n",m,left); }
+}
 
 /* IStorage / IStorageAccessor */
 typedef struct { u8* d; u64 size; } StorageData;
@@ -86,8 +101,8 @@ static int am_csg(SvcObj* o, IpcCtx* c){           /* ICommonStateGetter */
   switch(c->cmd){
     case 0: out_copy_h(c,ev_handle(g_msg_event)); return 0;
     case 1: { pm_lock(&g_klock);
-      if(!g_nmsg){ g_msg_event->signaled=0; pm_unlock(&g_klock); return RC(128,3); }
-      u32 m=g_msgq[0]; memmove(g_msgq,g_msgq+1,(--g_nmsg)*4); if(!g_nmsg) g_msg_event->signaled=0; pm_unlock(&g_klock);
+      if(!g_nmsg){ am_msg_event_clear_nl(); pm_unlock(&g_klock); return RC(128,3); }
+      u32 m=g_msgq[0]; memmove(g_msgq,g_msgq+1,(--g_nmsg)*4); if(!g_nmsg) am_msg_event_clear_nl(); pm_unlock(&g_klock);
       { static int nl; if(nl<16){ nl++; LOG("applet: message %u delivered (%d left)\n",m,g_nmsg); } }
       out32(c,m); return 0; }
     case 5: out8(c,(u8)g_opt_docked); return 0;                      /* GetOperationMode */
@@ -190,7 +205,9 @@ static int am_appfn(SvcObj* o, IpcCtx* c){         /* IApplicationFunctions */
     case 40: out8(c,0); return 0;                                      /* NotifyRunning */
     case 50: out64(c,0x1111222233334444ull); out64(c,0x5555666677778888ull); return 0;
     case 60: case 61: return 0;
-    case 130: case 140: case 150: case 160: case 210: out_copy_h(c,ev_handle(kevent_new("appfn ev",0))); return 0;   /* events (210 only exists in newer SDKs) */
+    case 130: case 140: case 150: case 160: case 210: { /* events (210 only exists in newer SDKs) */
+      static int ne; if(ne++<8) LOG("applet: IApplicationFunctions cmd %u -> queue-driven notification event\n",c->cmd);
+      out_copy_h(c,ev_handle(g_appfn_ev? g_appfn_ev : g_msg_event)); return 0; }
     case 141: return RC(128,2);
     case 170: out8(c,0); return 0;
   }
@@ -1186,11 +1203,11 @@ static SvcObj* new_ngc(void){ return svcobj_new("ngc:u",ngc_disp,0); }
 
 void svc_core_init(void){
   swr_audio_init();
-  g_msg_event=kevent_new("applet msg",0); g_launch_ev=kevent_new("launchable",0); g_res_ev=kevent_new("res change",0); g_opmode_ev=kevent_new("opmode",0);
+  g_msg_event=kevent_new("applet msg",0); g_appfn_ev=kevent_new("appfn notify",1); g_launch_ev=kevent_new("launchable",0); g_res_ev=kevent_new("res change",0); g_opmode_ev=kevent_new("opmode",0);
   g_aud_ev=kevent_new("audio renderer",0);
   pm_init(&g_aout_lk);
   /* the runtime keeps signaling these, so we hold a reference and a game closing its handles can't free them */
-  kobj_ref(&g_msg_event->o); kobj_ref(&g_launch_ev->o); kobj_ref(&g_res_ev->o); kobj_ref(&g_opmode_ev->o); kobj_ref(&g_aud_ev->o);
+  kobj_ref(&g_msg_event->o); kobj_ref(&g_appfn_ev->o); kobj_ref(&g_launch_ev->o); kobj_ref(&g_res_ev->o); kobj_ref(&g_opmode_ev->o); kobj_ref(&g_aud_ev->o);
   plat_thread(audio_clock,NULL,64*1024);
   if(plat_thread(aout_clock,NULL,256*1024)) WARN("audout: timer thread unavailable, using frontend playback pump\n");
   am_push_msg(0xF);          /* FocusStateChanged */
