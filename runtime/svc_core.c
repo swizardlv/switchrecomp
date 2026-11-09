@@ -109,7 +109,9 @@ static int am_csg(SvcObj* o, IpcCtx* c){           /* ICommonStateGetter */
    Answering cmd 2000 empty made the SDK store handle 0, so svcSendSyncRequest(0)
    failed and BootWithRemoteMemory called nn::diag::AbortImpl(). */
 static int gsv_session(SvcObj* o, IpcCtx* c){
-  (void)o;
+  extern int ipc_warn_once(const char*,u32);
+  if(ipc_warn_once(o->name,c->cmd))
+    LOG("GSV:GraphicsSupervisor cmd %u (tipc=%d type=%u)\n",c->cmd,c->tipc,c->type);
   switch(c->cmd){
     case 4:                       /* BootWithRemoteMemory */
     case 11:                      /* SetCurrentProcessHandle */
@@ -133,9 +135,15 @@ static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
     case 90: out64(c,0); return 0;                                     /* GetAccumulatedSuspendedTickValue */
     case 91: out_copy_h(c,ev_handle(kevent_new("suspend",0))); return 0;
     case 100: case 110: case 120: return 0;
-    /* [S2] GetGraphicsSupervisor: returns an output TIPC handle, NOT a CMIF
-       object.  out_obj() -> session_new() gives exactly such a handle. */
-    case 2000: out_obj(c,svcobj_new("GSV:GraphicsSupervisor",gsv_session,0)); return 0;
+    /* [S2] GetGraphicsSupervisor: returns an output *TIPC handle*, NOT a CMIF
+       object.  out_obj() degrades to a domain object id when the caller uses
+       a domain session, which leaves the SDK storing handle 0 and later
+       calling svcSendSyncRequest(0) from BootWithRemoteMemory.  Always hand
+       back a real KHandle so the GSV TIPC session is usable. */
+    case 2000: { u32 h=session_new(svcobj_new("GSV:GraphicsSupervisor",gsv_session,0));
+      LOG("am: GetGraphicsSupervisor -> handle %x (type=%u tipc=%d domain=%d)\n",
+          h,c->type,c->tipc,c->is_domain);
+      out_move_h(c,h); return 0; }
   }
   return quiet_ok(o,c); }
 

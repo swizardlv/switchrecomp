@@ -216,7 +216,11 @@ void ipc_dump_stats(void){
 void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
   CPU* cpu=&t->cpu;
   KSession* s=(KSession*)h_get_type(handle,KO_SESSION);
-  if(!s){ WARN("SendSyncRequest to invalid handle %x (pc=%llx)\n",handle,(unsigned long long)cpu->pc); cpu->x[0]=0xE401; return; }
+  if(!s){ WARN("SendSyncRequest to invalid handle %x (pc=%llx)\n",handle,(unsigned long long)cpu->pc);
+    { u32 q[4]; memcpy(q,GP(msg_addr),16);
+      LOG("ipc: bad-handle msg hdr %08x %08x %08x %08x (addr=%llx)\n",
+          q[0],q[1],q[2],q[3],(unsigned long long)msg_addr); }
+    cpu->x[0]=0xE401; return; }
   IpcCtx* c=calloc(1,sizeof *c);
   c->th=t; c->msg=GP(msg_addr); c->msg_addr=msg_addr; c->sess=s;
   parse(c);
@@ -256,6 +260,10 @@ void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
       if(!produced && !c->rc && (c->nb || c->nc)){ st->empty++;
         if(st->empty<=3) WARN("ipc: %s cmd %u returned OK but wrote NO output (%d out bufs)\n",obj->name,c->cmd,c->nb+c->nc); } } }
   respond(c);
+  if(c->cmd==2000){
+    u32 q[4]; memcpy(q,c->msg,16);
+    LOG("ipc: cmd2000 reply hdr %08x %08x %08x %08x (move=%d obj=%d tipc=%d dom=%d)\n",
+        q[0],q[1],q[2],q[3],c->nout_move,c->nout_objs,c->tipc,c->is_domain); }
   if(c->is_domain) svcobj_unref(obj);           /* drop the ref from domain_get */
   free(c);
 }
