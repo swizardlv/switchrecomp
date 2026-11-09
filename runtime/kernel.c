@@ -588,10 +588,24 @@ static const char* gsym(u64 a){
    version of these S2 hooks forgot it: hardware showed pc pinned at
    nv::InitializeGraphics (a9bfdb0) with frames=0/GPU submits=0 for 50+ s and
    no abort at all -- a hang, not a crash. */
-enum { S2_OK=0, S2_INIT_GFX, S2_MEM_INFO, S2_CAMERA };
+enum {
+  S2_OK=0, S2_INIT_GFX, S2_MEM_INFO, S2_CAMERA,
+  S2_VI_DISPLAY, S2_VI_LAYER, S2_VI_NATIVE,
+  S2_VI_FRAME_NO, S2_VI_PANEL_ID, S2_VI_LIST_DISP,
+  S2_VI_HDR_STATUS, S2_VI_PAPER_WHITE, S2_VI_VRR
+};
 
-static u64 g_s2_pool_addr, g_s2_pool_size;
+static u64 g_s2_pool_addr, g_s2_pool_size, g_s2_vi_frames;
 static int g_s2_pool_inited;
+
+/* nn::vi has no host service.  nxnative hands out host static objects for the
+   display / layer / native window; here a guest address is just an offset in
+   the flat 128 GB reservation, so use three distinct values in the committed
+   low alias area.  Every SDK function consuming them is hooked, so they are
+   never dereferenced. */
+#define S2_VI_OBJ_DISPLAY 0x100001000ull
+#define S2_VI_OBJ_LAYER   0x100001100ull
+#define S2_VI_OBJ_NATIVE  0x100001200ull
 
 /* nn::sf::hipc requests on the camera context: nxnative answers every command
    with zeroed output ("no camera"), which is what the SDK expects. */
@@ -600,11 +614,26 @@ static int s2_camera_disp(SvcObj* o, IpcCtx* c){ (void)o; (void)c; return 0; }
 static int s2_guest_ptr(u64 a, u64 n){
   return a>=AS_BASE && a<AS_SIZE && n<=AS_SIZE-a; }
 
+/* GP(a) indexes a PROT_NONE reservation: writing an uncommitted page would
+   fault.  Only touch a guest output buffer inside a committed block. */
+static int s2_guest_ok(u64 a, u64 n){
+  if(!s2_guest_ptr(a,n)) return 0;
+  MemBlock b; mem_query(a,&b);
+  return b.state!=MS_FREE && b.state!=MS_INACCESSIBLE && a+n<=b.addr+b.size; }
+
+static void s2_put(u64 a, const void* p, u64 n){
+  if(s2_guest_ok(a,n)) memcpy(GP(a),p,n); }
+static void s2_zero(u64 a, u64 n){
+  if(s2_guest_ok(a,n)) memset(GP(a),0,n); }
+
 static void hle_s2_stub(CPU* c, u64 pc, int kind){
   static int ncalls;
-  if(ncalls++<64)
-    LOG("hle: [S2] call %llx%s kind=%d -> ret %llx\n",
-        (unsigned long long)pc,gsym(pc),kind,(unsigned long long)c->x[30]);
+  if(ncalls++<128)
+    LOG("hle: [S2] call %llx%s kind=%d x0=%llx x1=%llx x2=%llx x3=%llx -> ret %llx\n",
+        (unsigned long long)pc,gsym(pc),kind,
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+        (unsigned long long)c->x[2],(unsigned long long)c->x[3],
+        (unsigned long long)c->x[30]);
   u64 out=c->x[0];
   switch(kind){
     case S2_INIT_GFX:                    /* nv::InitializeGraphics(pool, size) */
@@ -615,24 +644,38 @@ static void hle_s2_stub(CPU* c, u64 pc, int kind){
     case S2_MEM_INFO:                    /* nv::GetGraphicsMemoryInfo(out) */
       /* SDK >= 11 expects 0x40 bytes of 64-bit counters; the real
          implementation reads an NV driver object we never create. */
-      if(s2_guest_ptr(out,0x40)){
-        /* WR64/WR32 expand through MP(a), which needs the generated code's
-           local `M`; write through GP() directly instead.  Little-endian on
-           both sides, and memcpy tolerates an unaligned guest pointer. */
-        memset(GP(out),0,0x40);
-        if(g_s2_pool_inited){
-          u64 sz=g_s2_pool_size;
-          memcpy(GP(out),&sz,8); memcpy(GP(out+16),&sz,8);
-        }
+      s2_zero(out,0x40);
+      if(g_s2_pool_inited && s2_guest_ok(out,0x40)){
+        u64 sz=g_s2_pool_size;
+        memcpy(GP(out),&sz,8); memcpy(GP(out+16),&sz,8);
       }
       break;
     case S2_CAMERA:                      /* camera::sdk::CreateCameraContext(out) */
-      if(s2_guest_ptr(out,4)){
+      if(s2_guest_ok(out,4)){
         u32 h=session_new(svcobj_new("camera",s2_camera_disp,0));
         memcpy(GP(out),&h,4);
         LOG("hle: [S2] camera context -> handle %x\n",h);
       }
       break;
+    case S2_VI_DISPLAY: case S2_VI_LAYER: case S2_VI_NATIVE: {
+      u64 obj = kind==S2_VI_DISPLAY ? S2_VI_OBJ_DISPLAY :
+                kind==S2_VI_LAYER   ? S2_VI_OBJ_LAYER   : S2_VI_OBJ_NATIVE;
+      s2_put(out,&obj,8); break; }
+    case S2_VI_FRAME_NO: {
+      u64 f=++g_s2_vi_frames; s2_put(out,&f,8); break; }
+    case S2_VI_PANEL_ID: s2_zero(out,0x18); break;
+    case S2_VI_LIST_DISP:                 /* returns a count, not a Result */
+      s2_zero(out,0x60);
+      if(s2_guest_ok(out,0x60)){
+        memcpy(GP(out),"Default",8);
+        u8 one=1; memcpy(GP(out+0x40),&one,1);
+        u64 lim[3]={1,1920,1080}; memcpy(GP(out+0x48),lim,24);
+      }
+      c->x[0]=1; c->pc=c->x[30]; return;
+    case S2_VI_HDR_STATUS:              /* SDR: off, fmt 0, peak 0 */
+      s2_zero(c->x[0],1); s2_zero(c->x[1],4); s2_zero(c->x[2],2); break;
+    case S2_VI_PAPER_WHITE: { u16 nits=203; s2_put(out,&nits,2); break; }
+    case S2_VI_VRR: s2_zero(out,1); break;
   }
   c->x[0]=0;                            /* Result OK */
   c->pc=c->x[30];                       /* RET */
@@ -642,53 +685,101 @@ static void hle_s2_ok(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_OK); }
 static void hle_s2_init(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_INIT_GFX); }
 static void hle_s2_meminfo(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_MEM_INFO); }
 static void hle_s2_camera(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_CAMERA); }
+static void hle_s2_vi_display(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_DISPLAY); }
+static void hle_s2_vi_layer(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_LAYER); }
+static void hle_s2_vi_native(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_NATIVE); }
+static void hle_s2_vi_frameno(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_FRAME_NO); }
+static void hle_s2_vi_panel(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_PANEL_ID); }
+static void hle_s2_vi_listdisp(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_LIST_DISP); }
+static void hle_s2_vi_hdrstatus(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_HDR_STATUS); }
+static void hle_s2_vi_paperwhite(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_PAPER_WHITE); }
+static void hle_s2_vi_vrr(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_VRR); }
 
-/* Match a distinctive substring of the mangled name rather than the full
-   symbol: the SDK's exported names carry parameter suffixes that differ
-   between dumps (e.g. CreateCameraContextEPNS_5gsdrv18UniqueNativeHandleE).
+/* Match a distinctive mangled substring rather than the full symbol: exported
+   names carry parameter suffixes that differ between dumps.  Keep the matching
+   string specific enough to exclude lookalikes -- an earlier table used bare
+   "InitializeGraphics" / "9InitCheckE" / "BootWithRemoteMemory" and silently
+   hooked nn::gs3sdk::InitializeGraphicsAllocator, nandroid::ESDS::InitCheck
+   and nn::gs3sdk::CanBootWithRemoteMemory as well.
    Every entry here is backed by nxnative's HLE_FORCE set for the same two
-   Switch 2 dumps (Bananza / OOT SDK 22.2.8). */
+   Switch 2 dumps (Bananza / OOT SDK 22.2.8): dm/gfx/hle_nv.c and hle_vi.c. */
 static const struct { const char* sym; GuestFn fn; } g_s2_hooks[]={
-  {"BootGraphicsSystem",           hle_s2_ok},
-  {"InitializeGraphics",           hle_s2_init},
-  {"FinalizeGraphics",             hle_s2_ok},
-  {"SetGraphicsAllocator",         hle_s2_ok},
-  {"SetGraphicsDevtoolsAllocator", hle_s2_ok},
-  {"9InitCheckE",                  hle_s2_ok},   /* nv::InitCheck */
-  {"CheckGraphicsSystemInitialized",hle_s2_ok},
-  {"GetGraphicsMemoryInfo",        hle_s2_meminfo},
-  {"DumpGraphicsMemoryInfo",       hle_s2_ok},
-  {"BootWithRemoteMemory",         hle_s2_ok},   /* nn::nvsrv + nn::gsv */
-  {"CreateCameraContext",          hle_s2_camera},
+  {"2nn2gs3sdk18BootGraphicsSystemE", hle_s2_ok},
+  {"2nv18InitializeGraphicsE", hle_s2_init},
+  {"2nv16FinalizeGraphicsE", hle_s2_ok},
+  {"2nv20SetGraphicsAllocatorE", hle_s2_ok},
+  {"2nv28SetGraphicsDevtoolsAllocatorE", hle_s2_ok},
+  {"2nv9InitCheckE", hle_s2_ok},
+  {"2nn2gs3sdk30CheckGraphicsSystemInitializedE", hle_s2_ok},
+  {"2nv21GetGraphicsMemoryInfoE", hle_s2_meminfo},
+  {"2nv22DumpGraphicsMemoryInfoE", hle_s2_ok},
+  {"20BootWithRemoteMemoryE", hle_s2_ok},       /* nn::nvsrv / nn::gsv / gpu::sdk */
+  {"2nn6camera3sdk19CreateCameraContextE", hle_s2_camera},
+  /* nn::vi: nxnative's hle_vi.c takes over the entire display subsystem.  The
+     crucial one is nn::vi::Initialize -- without it the SDK's own
+     vi::sdk::Initialize asks the graphics server for a user session, gets
+     0x30af3 and calls nn::diag::Abort(Result). */
+  {"2nn2vi10InitializeE", hle_s2_ok},
+  {"2nn2vi8FinalizeE", hle_s2_ok},
+  {"2nn2vi18OpenDefaultDisplayE", hle_s2_vi_display},
+  {"2nn2vi11CreateLayerE", hle_s2_vi_layer},
+  {"2nn2vi15GetNativeWindowE", hle_s2_vi_native},
+  {"2nn2vi20GetLatestFrameNumberE", hle_s2_vi_frameno},
+  {"2nn2vi32GetDefaultDisplayPanelIdentifierE", hle_s2_vi_panel},
+  {"2nn2vi12ListDisplaysE", hle_s2_vi_listdisp},
+  {"2nn2vi21QueryDisplayHdrStatusE", hle_s2_vi_hdrstatus},
+  {"2nn2vi25QueryDisplayHdrPaperWhiteE", hle_s2_vi_paperwhite},
+  {"2nn2vi24QueryDisplayVrrSupportedE", hle_s2_vi_vrr},
 };
-/* Verified guest address for Bananza's BootGraphicsSystem (backtrace
-   a8519e0 = +0x70).  Used only if the symbol scan misses it. */
-static const u64 g_s2_hook_addrs[]={ 0xA851970ull, 0 };
+/* Verified Bananza addresses, used only if the symbol scan misses them.  Each
+   carries the mangled substring gsym() must report at that address, so a
+   different dump (OOT) can never lose an unrelated function. */
+static const struct { u64 addr; const char* sym; } g_s2_hook_addrs[]={
+  {0xA851970ull,"BootGraphicsSystem"},        /* nn::gs3sdk::BootGraphicsSystem */
+  {0xA9A7E40ull,"2nn2vi10InitializeE"},       /* nn::vi::Initialize */
+  {0,0}
+};
 
 void swr_install_s2_hooks(void){
   extern GuestFn* g_disp; extern u64 g_code_lo, g_code_hi;
   if(!g_mod || !g_disp) return;
   const int NS=(int)(sizeof(g_s2_hooks)/sizeof(g_s2_hooks[0]));
-  int hits[32]={0};
+  int hits[48]={0}, nvi=0, ncam=0, nvifb=0;
   for(u32 i=0;i<g_mod->nentries;i++){
     u64 a=g_mod->entry_addr[i]; if(a<g_code_lo || a>=g_code_hi) continue;
     const char* s=gsym(a); if(!s || !s[0]) continue;
     /* gsym() returns the *nearest* symbol; require an exact match (+0) so a
        neighbouring exported symbol cannot be hooked by accident. */
     if(!strstr(s,"+0>")) continue;
+    /* One-pass diagnostics: list every vi / camera export so a differently
+       mangled SDK can be covered from the log without another round trip. */
+    if(strstr(s,"2nn2vi") && nvi++<48)
+      LOG("hle: [S2] vi export %llx (%s)\n",(unsigned long long)a,s);
+    if(strstr(s,"CameraContext") && ncam++<12)
+      LOG("hle: [S2] camera export %llx (%s)\n",(unsigned long long)a,s);
+    int matched=0;
     for(int k=0;k<NS;k++) if(strstr(s,g_s2_hooks[k].sym)){
-      g_disp[(a-g_code_lo)/4]=g_s2_hooks[k].fn; hits[k]++;
+      g_disp[(a-g_code_lo)/4]=g_s2_hooks[k].fn; hits[k]++; matched=1;
       LOG("hle: [S2] hook %s @ %llx (%s)\n",g_s2_hooks[k].sym,(unsigned long long)a,s); }
+    /* The rest of nn::vi (HDR / VRR / crop / scaling / frame history ...) all
+       return Result OK on the host; cover every export, not just the list. */
+    if(!matched && strstr(s,"2nn2vi")){
+      g_disp[(a-g_code_lo)/4]=hle_s2_ok; nvifb++;
+      LOG("hle: [S2] vi fallback %llx (%s) -> stub_ok\n",(unsigned long long)a,s); }
   }
-  for(int k=0;k<NS;k++) if(!hits[k])
-    LOG("hle: [S2] hook %s NOT FOUND by symbol\n",g_s2_hooks[k].sym);
-  for(int j=0;g_s2_hook_addrs[j];j++){ u64 a=g_s2_hook_addrs[j];
+  int nhit=0;
+  for(int k=0;k<NS;k++){
+    if(!hits[k]) LOG("hle: [S2] hook %s NOT FOUND by symbol\n",g_s2_hooks[k].sym);
+    else nhit++; }
+  LOG("hle: [S2] installed: %d/%d explicit hooks, %d vi fallbacks, %d vi exports, %d camera exports\n",
+      nhit,NS,nvifb,nvi,ncam);
+  for(int j=0;g_s2_hook_addrs[j].addr;j++){ u64 a=g_s2_hook_addrs[j].addr;
     if(a<g_code_lo || a>=g_code_hi) continue;
     const char* s=gsym(a);
     /* Never patch a hard-coded address on a different dump: the symbol must
        still agree, otherwise OOT could lose an unrelated function. */
-    if(!strstr(s,"BootGraphicsSystem")){
-      LOG("hle: [S2] addr fallback %llx skipped (%s)\n",(unsigned long long)a,s); continue; }
+    if(!s || !strstr(s,g_s2_hook_addrs[j].sym)){
+      LOG("hle: [S2] addr fallback %llx skipped (%s)\n",(unsigned long long)a,s?s:"?"); continue; }
     LOG("hle: [S2] addr fallback %llx (%s) -> stub_ok\n",(unsigned long long)a,s);
     g_disp[(a-g_code_lo)/4]=hle_s2_ok; }
 }
