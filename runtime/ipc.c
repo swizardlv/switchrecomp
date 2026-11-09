@@ -137,6 +137,13 @@ static void parse(IpcCtx* c){
 static void respond(IpcCtx* c){
   u8* m=c->msg; memset(m,0,0x100);
   int dom= c->is_domain!=0 && !c->tipc;
+  /* [S2] ISelfController cmd 2000 (GetGraphicsSupervisor) is issued as a
+     CMIF domain request (type 6, domain=2), but nnSdk consumes the result as
+     a real TIPC KHandle and immediately calls svcSendSyncRequest on it.
+     Mirror the move handle into the domain object-id slot as well, so either
+     reply interpretation yields the very same valid KHandle. */
+  int gsv_dom= dom && c->cmd==2000 && c->nout_move>0;
+  u32 ndom_objs= gsv_dom? 1u : (u32)c->nout_objs;
   u32 nhandles=c->nout_copy+c->nout_move;
   if(!dom) nhandles+=c->nout_objs;           /* out objects become new session handles */
   u32 w0=0; w0|=(u32)(c->nx_out&15)<<16;
@@ -146,7 +153,7 @@ static void respond(IpcCtx* c){
   u32 pad_bytes=((hdr_words*4+15)&~15)-hdr_words*4;
   /* SFCO(16) + payload; domains add a 16 byte header and object ids */
   u32 payload=(c->out_size+3)&~3u;
-  u32 data_bytes=16+payload+(dom? 16+c->nout_objs*4 : 0);
+  u32 data_bytes=16+payload+(dom? 16+ndom_objs*4 : 0);
   u32 ndata=(pad_bytes+data_bytes+3)/4+ (16/4);   /* same slack the real kernel leaves */
   memcpy(m,&w0,4);
   u32 w1=ndata|(special? 0x80000000u : 0); memcpy(m+4,&w1,4);
@@ -165,13 +172,14 @@ static void respond(IpcCtx* c){
     memcpy(p,&c->rc,4); memcpy(p+4,c->out,payload); return; }
   u8* d=m+(((p-m)+15)&~15);
   if(dom){
-    u32 n=c->nout_objs; memcpy(d,&n,4); d+=16;
+    memcpy(d,&ndom_objs,4); d+=16;
   }
   u32 magic=0x4F434653; memcpy(d,&magic,4); u32 ver=0; memcpy(d+4,&ver,4); memcpy(d+8,&c->rc,4); memcpy(d+12,&c->token,4);
   memcpy(d+16,c->out,payload);
   if(dom){
     u8* o=d+16+payload;
-    for(int i=0;i<c->nout_objs;i++){
+    if(gsv_dom){ memcpy(o,&c->out_move[0],4); }
+    else for(int i=0;i<c->nout_objs;i++){
       u32 id=domain_add(c->sess->domain,c->out_objs[i]);
       memcpy(o+i*4,&id,4); }
   }
@@ -224,6 +232,9 @@ void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
   IpcCtx* c=calloc(1,sizeof *c);
   c->th=t; c->msg=GP(msg_addr); c->msg_addr=msg_addr; c->sess=s;
   parse(c);
+  if(c->cmd==2000){ u32 q[8]; memcpy(q,c->msg,32);
+    LOG("ipc: cmd2000 request hdr %08x %08x %08x %08x %08x %08x %08x %08x (type=%u tipc=%d dom=%d)\n",
+        q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],c->type,c->tipc,c->is_domain); }
   cpu->x[0]=0;
   if(c->type==2 || c->type==15){ /* client closes the handle itself afterwards */ free(c); return; }
   if(c->type==5 || c->type==7){ /* control */
@@ -261,9 +272,10 @@ void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
         if(st->empty<=3) WARN("ipc: %s cmd %u returned OK but wrote NO output (%d out bufs)\n",obj->name,c->cmd,c->nb+c->nc); } } }
   respond(c);
   if(c->cmd==2000){
-    u32 q[4]; memcpy(q,c->msg,16);
-    LOG("ipc: cmd2000 reply hdr %08x %08x %08x %08x (move=%d obj=%d tipc=%d dom=%d)\n",
-        q[0],q[1],q[2],q[3],c->nout_move,c->nout_objs,c->tipc,c->is_domain); }
+    u32 q[8]; memcpy(q,c->msg,32);
+    LOG("ipc: cmd2000 reply hdr %08x %08x %08x %08x %08x %08x %08x %08x (move=%d obj=%d tipc=%d dom=%d)\n",
+        q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],
+        c->nout_move,c->nout_objs,c->tipc,c->is_domain); }
   if(c->is_domain) svcobj_unref(obj);           /* drop the ref from domain_get */
   free(c);
 }
