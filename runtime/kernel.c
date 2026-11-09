@@ -910,9 +910,11 @@ static void s2_nvn_track_set_storage(CPU* c){
     }
   }
   /* Case 2: nvnMemoryPoolBuilderSetStorage(builder=x0, memory=x1, size=x2)
-     where x1 is a non-stack guest allocation and x2 is its byte size. */
+     where x1 is a non-stack guest allocation and x2 is its byte size.
+     Check 64 bytes at x1 rather than the entire x2 span since large pools
+     (e.g. 676 MiB at lr=0x849c808) can span multiple MemBlock regions. */
   if(x1>=AS_BASE && x1<AS_SIZE && !(x1>=0x1300000000ull && x1<0x1300200000ull) &&
-     x2>=0x20ull && x2<=0x40000000ull && s2_guest_ok(x1,x2)){
+     x2>=0x20ull && x2<=0x40000000ull && s2_guest_ok(x1,64)){
     s2_nvn_record_builder(x0, x1, x2);
     return;
   }
@@ -943,10 +945,10 @@ static void s2_nvn_track_init(CPU* c){
    Allocate the 40-byte slot table in its own dedicated kmem_alloc block so
    guest buffer writes to g_nvn_scratch never overwrite slot states. */
 static void s2_nvn_heal_pool(CPU* c){
-  u64 mgr=c->x[19];
-  if(!s2_guest_ok(mgr,0xb20)) return;
   u64 lr=c->x[30];
   if(lr<0x8138000ull || lr>0x813c000ull) return;
+  u64 mgr=c->x[19];
+  if(!s2_guest_ok(mgr,0xb20)) return;
   u32 cap=0; u64 arr=0; u16 rsv=0;
   memcpy(&cap,GP(mgr+0xaa0),4);
   memcpy(&arr,GP(mgr+0xaa8),8);
@@ -1338,6 +1340,15 @@ void swr_install_s2_hooks(void){
       LOG("hle: [S2] addr fallback %llx skipped (%s)\n",(unsigned long long)a,s?s:"?"); continue; }
     LOG("hle: [S2] addr fallback %llx (%s) -> stub_ok\n",(unsigned long long)a,s);
     g_disp[(a-g_code_lo)/4]=hle_s2_ok; }
+  /* Bananza Switch 2 nn::oe graphics scale mode helper at 0xa966700:
+     verifies `cmp w0, #10` (0x7100281f) at +0x10 and `cmp w0, #30` (0x7100781f)
+     at +0x18 before hooking to hle_s2_true (returns 1 = Docked / 20). */
+  if(0xa966700ull>=g_code_lo && 0xa966720ull<g_code_hi &&
+     s2_guest_ok(0xa966710ull,12) &&
+     gr32(0xa966710ull)==0x7100281fu && gr32(0xa966718ull)==0x7100781fu){
+    g_disp[(0xa966700ull-g_code_lo)/4]=hle_s2_true;
+    LOG("hle: [S2] hooked nn::oe graphics scale mode @ a966700 -> 1 (Docked)\n");
+  }
 }
 
 static void guest_backtrace(CPU* c){

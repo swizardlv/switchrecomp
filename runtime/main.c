@@ -89,6 +89,18 @@ static void interp_guard(CPU* c, u64 pc){
          (unsigned long long)pc,(unsigned long long)lr,(unsigned long long)n,
          (unsigned long long)c->x[0],(unsigned long long)c->x[1],
          (unsigned long long)c->x[2],(unsigned long long)c->x[8]);
+  /* In Switch 2 nn::oe graphics scale / performance mode query (0xa966700 ->
+     0xa9667ec), x1 points to an output u32 on the stack that must be 10, 20,
+     or 30 (otherwise 0xa966724 calls nn::detail::UnexpectedDefaultImpl ->
+     svcBreak, run 1943).  Populate *x1 = 20 (Docked) / 10 (Handheld). */
+  if(lr>=0xa966600ull && lr<0xa966900ull && c->x[1]>=AS_BASE && c->x[1]+4<=AS_SIZE){
+    MemBlock b; mem_query(c->x[1],&b);
+    if(b.state!=MS_FREE && b.state!=MS_INACCESSIBLE && (b.perm&PERM_W)){
+      extern int g_opt_docked;
+      u32 mode = g_opt_docked ? 20u : 10u;
+      memcpy(GP(c->x[1]),&mode,4);
+    }
+  }
   c->x[0]=0; c->pc=lr;                 /* resume after the failing BLR/BR */
 }
 #endif

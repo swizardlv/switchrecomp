@@ -80,24 +80,56 @@ static uint64_t rd64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v;
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
 #endif
+#ifdef SWR_PS5
+#include <pthread.h>
+extern void* ps5_alloc_large(uint64_t size);
+extern void  ps5_free_large(void* p, uint64_t size);
+static pthread_mutex_t g_zc_mtx = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 static void* nup_alloc(uint64_t sz) {
     if (sz == 0) sz = 1;
     void* p = mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) {
-        /* Once the 128 GiB guest VA window is reserved, PS5 anonymous mmap
-           starts failing with ENOMEM (the console log shows errno=12 for even
-           4 MiB requests).  A silent NULL here used to zero-fill a whole game
-           resource, so make it visible. */
+    if (p != MAP_FAILED) return p;
+#ifdef SWR_PS5
+    /* Once the 128 GiB guest VA window is reserved on PS5, anonymous mmap
+       returns ENOMEM (errno=12).  Fall back to ps5_alloc_large (direct memory)
+       so zstd-compressed archives > 32 KiB (such as Project.Nin_Ounce_NVN2.release.sarc.zs,
+       645 KiB in run 1943) decompress cleanly instead of failing with LoadResult = -1. */
+    p = ps5_alloc_large(sz);
+    if (p) return p;
+#endif
+    {
         static uint32_t w;
         uint32_t k = __atomic_fetch_add(&w, 1, __ATOMIC_RELAXED);
-        if (k < 16) NUP_LOG("nup: alloc mmap(%llu) FAILED errno=%d\n",
+        if (k < 16) NUP_LOG("nup: alloc(%llu) FAILED errno=%d\n",
                             (unsigned long long)sz, errno);
-        return NULL;
     }
-    return p;
+    return NULL;
 }
 static void nup_free(void* p, uint64_t sz) {
-    if (p) munmap(p, (size_t)(sz ? sz : 1));
+    if (!p) return;
+#ifdef SWR_PS5
+    ps5_free_large(p, sz ? sz : 1);
+#else
+    munmap(p, (size_t)(sz ? sz : 1));
+#endif
+}
+
+/* Reusable scratch buffer for compressed zstd extents so we never allocate/free
+   2 MiB direct-memory granules per file read. */
+static uint8_t* g_comp_buf;
+static uint64_t g_comp_cap;
+static uint8_t* nup_get_comp_buf(uint64_t need) {
+    if (need == 0) need = 1;
+    if (need <= g_comp_cap && g_comp_buf) return g_comp_buf;
+    uint64_t cap = need < (16uLL << 20) ? (16uLL << 20) : ((need + (2uLL << 20) - 1) & ~((2uLL << 20) - 1));
+    uint8_t* nb = (uint8_t*)nup_alloc(cap);
+    if (!nb) return NULL;
+    if (g_comp_buf) nup_free(g_comp_buf, g_comp_cap);
+    g_comp_buf = nb;
+    g_comp_cap = cap;
+    return g_comp_buf;
 }
 
 /* ---- zstd decompress cache (LRU, capacity capped) ---- */
@@ -115,7 +147,7 @@ static uint8_t* zc_get(int node) {
     return NULL;
 }
 
-/* Decompress file `node` (already validated) into a freshly malloc'd buffer and
+/* Decompress file `node` (already validated) into a freshly allocated buffer and
  * cache it. Returns NULL on failure. Caller must NOT free a cached pointer. */
 static uint8_t* zc_decompress(int node) {
     uint8_t* cached = zc_get(node);
@@ -132,21 +164,20 @@ static uint8_t* zc_decompress(int node) {
     while (zc_bytes + size0 > ZC_CAP && zc_n > 0) {
         int mi = 0;
         for (int i = 1; i < zc_n; i++) if (zc[i].tick < zc[mi].tick) mi = i;
-        nup_free(zc[mi].data, zc[mi].size);   /* zc data is mmap'd, never free() */
+        nup_free(zc[mi].data, zc[mi].size);
         zc_bytes -= zc[mi].size;
         zc[mi] = zc[--zc_n];
     }
     if (zc_n >= ZC_MAX) return NULL;
 
-        uint8_t* comp = nup_alloc(ext_size ? (size_t)ext_size : 1);
-        uint8_t* out  = nup_alloc(size0 ? (size_t)size0 : 1);
-        if (!comp || !out) { nup_free(comp, ext_size); nup_free(out, size0); return NULL; }
+    uint8_t* comp = nup_get_comp_buf(ext_size ? ext_size : 1);
+    uint8_t* out  = (uint8_t*)nup_alloc(size0 ? (size_t)size0 : 1);
+    if (!comp || !out) { nup_free(out, size0); return NULL; }
 
-        if (pread(G.fd, comp, (size_t)ext_size, (off_t)ext_off) != (ssize_t)ext_size) {
-            nup_free(comp, ext_size); nup_free(out, size0); return NULL;
-        }
-        size_t d = ZSTD_decompress(out, (size_t)size0, comp, (size_t)ext_size);
-    nup_free(comp, ext_size);
+    if (pread(G.fd, comp, (size_t)ext_size, (off_t)ext_off) != (ssize_t)ext_size) {
+        nup_free(out, size0); return NULL;
+    }
+    size_t d = ZSTD_decompress(out, (size_t)size0, comp, (size_t)ext_size);
     if (ZSTD_isError(d) || d != (size_t)size0) { nup_free(out, size0); return NULL; }
 
     zc[zc_n].node = node;
@@ -419,26 +450,78 @@ int nup_read_file(int file_node, uint64_t offset, void* dst, uint64_t size) {
         }
     }
 
+#ifdef SWR_PS5
+    pthread_mutex_lock(&g_zc_mtx);
+#endif
+    /* Whole-file read for larger zstd files (> 32 KiB, e.g. Project.Nin_Ounce_NVN2.release.sarc.zs
+       at 645 KiB): decompress directly from the reusable compressed buffer into dst
+       when not already cached, avoiding any extra buffer allocation if cache is full. */
+    if (offset == 0 && size >= size0 && !zc_get(file_node)) {
+        uint8_t* comp = nup_get_comp_buf(ext_size ? ext_size : 1);
+        if (comp && pread(G.fd, comp, (size_t)ext_size, (off_t)ext_off) == (ssize_t)ext_size) {
+            size_t d = ZSTD_decompress(dst, (size_t)size0, comp, (size_t)ext_size);
+            if (!ZSTD_isError(d) && d == (size_t)size0) {
+#ifdef SWR_PS5
+                pthread_mutex_unlock(&g_zc_mtx);
+#endif
+                NUP_LOG("nup: zstd direct-large node=%d ext=%llu -> %llu OK\n",
+                        file_node, (unsigned long long)ext_size, (unsigned long long)size0);
+                return 0;
+            }
+        }
+    }
+
     if (size0 > ZC_CAP) {                     /* too big to cache: decompress once */
-        uint8_t* comp = nup_alloc(ext_size ? (size_t)ext_size : 1);
-        if (!comp) return -1;
+        uint8_t* comp = nup_get_comp_buf(ext_size ? ext_size : 1);
+        if (!comp) {
+#ifdef SWR_PS5
+            pthread_mutex_unlock(&g_zc_mtx);
+#endif
+            return -1;
+        }
         uint8_t* full = nup_alloc(size0 ? (size_t)size0 : 1);
-        if (!full) { nup_free(comp, ext_size); return -1; }
+        if (!full) {
+#ifdef SWR_PS5
+            pthread_mutex_unlock(&g_zc_mtx);
+#endif
+            return -1;
+        }
         if (pread(G.fd, comp, (size_t)ext_size, (off_t)ext_off) != (ssize_t)ext_size) {
-            nup_free(comp, ext_size); nup_free(full, size0); return -1;
+            nup_free(full, size0);
+#ifdef SWR_PS5
+            pthread_mutex_unlock(&g_zc_mtx);
+#endif
+            return -1;
         }
         size_t d = ZSTD_decompress(full, (size_t)size0, comp, (size_t)ext_size);
-        nup_free(comp, ext_size);
-        if (ZSTD_isError(d) || d != (size_t)size0) { nup_free(full, size0); return -1; }
+        if (ZSTD_isError(d) || d != (size_t)size0) {
+            nup_free(full, size0);
+#ifdef SWR_PS5
+            pthread_mutex_unlock(&g_zc_mtx);
+#endif
+            return -1;
+        }
         memcpy(dst, full + offset, (size_t)n);
         nup_free(full, size0);
+#ifdef SWR_PS5
+        pthread_mutex_unlock(&g_zc_mtx);
+#endif
         return 0;
     }
 
     uint8_t* full = zc_decompress(file_node); /* cached */
-    if (!full) { NUP_LOG("nup: zstd cache FAIL node=%d fsize=%llu ext=%llu\n",
-                         file_node, (unsigned long long)size0, (unsigned long long)ext_size); return -1; }
+    if (!full) {
+#ifdef SWR_PS5
+        pthread_mutex_unlock(&g_zc_mtx);
+#endif
+        NUP_LOG("nup: zstd cache FAIL node=%d fsize=%llu ext=%llu\n",
+                file_node, (unsigned long long)size0, (unsigned long long)ext_size);
+        return -1;
+    }
     memcpy(dst, full + offset, (size_t)n);
+#ifdef SWR_PS5
+    pthread_mutex_unlock(&g_zc_mtx);
+#endif
     return 0;
 }
 
