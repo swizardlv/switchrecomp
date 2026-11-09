@@ -616,14 +616,20 @@ static void hle_s2_stub(CPU* c, u64 pc, int kind){
       /* SDK >= 11 expects 0x40 bytes of 64-bit counters; the real
          implementation reads an NV driver object we never create. */
       if(s2_guest_ptr(out,0x40)){
+        /* WR64/WR32 expand through MP(a), which needs the generated code's
+           local `M`; write through GP() directly instead.  Little-endian on
+           both sides, and memcpy tolerates an unaligned guest pointer. */
         memset(GP(out),0,0x40);
-        if(g_s2_pool_inited){ WR64(out,g_s2_pool_size); WR64(out+16,g_s2_pool_size); }
+        if(g_s2_pool_inited){
+          u64 sz=g_s2_pool_size;
+          memcpy(GP(out),&sz,8); memcpy(GP(out+16),&sz,8);
+        }
       }
       break;
     case S2_CAMERA:                      /* camera::sdk::CreateCameraContext(out) */
       if(s2_guest_ptr(out,4)){
         u32 h=session_new(svcobj_new("camera",s2_camera_disp,0));
-        WR32(out,h);
+        memcpy(GP(out),&h,4);
         LOG("hle: [S2] camera context -> handle %x\n",h);
       }
       break;
