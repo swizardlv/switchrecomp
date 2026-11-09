@@ -131,7 +131,7 @@ static uint8_t* zc_decompress(int node) {
         uint8_t* out  = nup_alloc(size0 ? (size_t)size0 : 1);
         if (!comp || !out) { nup_free(comp, ext_size); nup_free(out, size0); return NULL; }
 
-        if (pread(G.fd, comp, (size_t)ext_size, (off_t)(G.blob_offset + ext_off)) != (ssize_t)ext_size) {
+        if (pread(G.fd, comp, (size_t)ext_size, (off_t)ext_off) != (ssize_t)ext_size) {
             nup_free(comp, ext_size); nup_free(out, size0); return NULL;
         }
         size_t d = ZSTD_decompress(out, (size_t)size0, comp, (size_t)ext_size);
@@ -332,6 +332,11 @@ int nup_file_size(int file_node, uint64_t* size) {
     return 0;
 }
 
+/* NUP v1 extent offsets are ABSOLUTE offsets into the container file (the TOC
+ * validates ext_off >= blob_off).  Verified against nupread.py: seeking ext_off
+ * and decompressing reproduces every file's SHA-256; adding blob_offset does
+ * not.  Callers must pread(fd, ..., ext_off + file_offset), never
+ * blob_offset + ext_off. */
 int nup_file_extent(int file_node, uint64_t* extent_offset, uint64_t* extent_size, int* codec) {
     uint32_t fi = (uint32_t)file_node - G.ndirs;
     if (file_node < 0 || fi >= G.nfiles) return -1;
@@ -354,7 +359,7 @@ int nup_read_file(int file_node, uint64_t offset, void* dst, uint64_t size) {
     uint64_t n = size; if (offset + n > size0) n = size0 - offset;
 
     if (codec == 0) { /* raw: direct pread from the blob (no mmap of the giant file) */
-        if (pread(G.fd, dst, (size_t)n, (off_t)(G.blob_offset + ext_off + offset)) != (ssize_t)n) return -1;
+        if (pread(G.fd, dst, (size_t)n, (off_t)(ext_off + offset)) != (ssize_t)n) return -1;
         return 0;
     }
 
@@ -365,7 +370,7 @@ int nup_read_file(int file_node, uint64_t offset, void* dst, uint64_t size) {
         if (!comp) return -1;
         uint8_t* full = nup_alloc(size0 ? (size_t)size0 : 1);
         if (!full) { nup_free(comp, ext_size); return -1; }
-        if (pread(G.fd, comp, (size_t)ext_size, (off_t)(G.blob_offset + ext_off)) != (ssize_t)ext_size) {
+        if (pread(G.fd, comp, (size_t)ext_size, (off_t)ext_off) != (ssize_t)ext_size) {
             nup_free(comp, ext_size); nup_free(full, size0); return -1;
         }
         size_t d = ZSTD_decompress(full, (size_t)size0, comp, (size_t)ext_size);

@@ -154,7 +154,12 @@ static void finalize_romfs(void){
   rfiles=(RFile*)ps5_alloc_large((nfn?nfn:1)*sizeof(RFile));
   if(!rfiles){ LOG("RomFS: rfiles alloc failed\n"); return; }
   for(int i=0;i<nfn;i++){
-    data=(data+0xF)&~0xFu;
+    /* MUST be a 64-bit mask: "~0xFu" is an unsigned int, so & against it
+       zeroed the high 32 bits of `data` on every iteration.  Bananza has
+       9,152,723,867 bytes of file data; the wrap made rtotal 542 MB while
+       the file table still advertised offsets past it, so nn::fs::ReadFile
+       got RC(2,6001)=0x2EE202 (ResultInvalidArgument) and aborted. */
+    data=(data+0xF)&~0xFull;
     if(fn[i].size){
       RFile* r=&rfiles[nrfiles];
       r->path=fn[i].name; r->off=rdata_off+data; r->size=fn[i].size; r->nup_node=fn[i].nup_node;
@@ -173,7 +178,9 @@ static void finalize_romfs(void){
     memcpy(e+16,&dh[h],4); dh[h]=dn[i].off; memcpy(e+20,&nl,4); memcpy(e+24,dn[i].name,nl); }
   rtotal=rdata_off+data;
   qsort(rfiles,nrfiles,sizeof(RFile),rf_cmp);
-  LOG("RomFS: %d folders, %d files, %.1f MB\n",ndn,nfn,(double)rtotal/1048576.0);
+  LOG("RomFS: %d folders, %d files, data=%llu rdata_off=%llu rtotal=%llu (%.1f MB)\n",
+      ndn,nfn,(unsigned long long)data,(unsigned long long)rdata_off,
+      (unsigned long long)rtotal,(double)rtotal/1048576.0);
 }
 
 static void romfs_build(const char* dir){
@@ -369,7 +376,7 @@ static int romstorage(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 0: { u64 off=in64(c,0), sz=in64(c,8), a, bs; buf_out(c,0,&a,&bs); if(sz>bs) sz=bs;
       if(off>rtotal) return RC(2,6001); if(off+sz>rtotal) sz=rtotal-off;
-      romfs_read(off,GP(a),sz); return 0; }
+      romfs_read(off,GP(a),sz); c->direct_out=1; return 0; }
     case 4: out64(c,rtotal); return 0;
     case 1: case 2: case 3: return RC(2,6300);
     case 5: { u8 z[0x40]; memset(z,0,sizeof z); outbytes(c,z,0x40); return 0; }

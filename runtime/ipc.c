@@ -248,7 +248,11 @@ void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
   { u32 i=__atomic_fetch_add(&g_ipc_ring_n,1,__ATOMIC_RELAXED)&31; u32 in0=0,in1=0; memcpy(&in0,c->raw,4); memcpy(&in1,c->raw+4,4); snprintf(g_ipc_ring[i],80,"%s cmd %u (in %x %x) -> %x",obj->name,c->cmd,in0,in1,c->rc); }
   { IpcStat* st=ist_get(obj->name,c->cmd);
     if(st){ st->n++;
-      int produced = c->nout_copy + c->nout_move + c->nout_objs + c->nx_out + (c->out_size?1:0);
+      /* RomFS/IStorage handlers memcpy straight into the guest out buffer via
+         GP(a) instead of going through out*() helpers; count that as output
+         too, otherwise the census flags every successful read as "empty". */
+      int produced = c->nout_copy + c->nout_move + c->nout_objs + c->nx_out
+                     + (c->out_size?1:0) + c->direct_out;
       if(!produced && !c->rc && (c->nb || c->nc)){ st->empty++;
         if(st->empty<=3) WARN("ipc: %s cmd %u returned OK but wrote NO output (%d out bufs)\n",obj->name,c->cmd,c->nb+c->nc); } } }
   respond(c);

@@ -224,6 +224,7 @@ typedef struct IpcCtx {
   u32 out_copy[8], out_move[8]; int nout_copy, nout_move;
   struct SvcObj* out_objs[8]; int nout_objs;
   u64 x_out_addr[MAX_BUFS], x_out_size[MAX_BUFS]; int nx_out;
+  int direct_out;   /* handler wrote straight into an out buffer via GP(a) */
   struct KSession* sess;
 } IpcCtx;
 
