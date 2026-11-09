@@ -20,7 +20,8 @@ DIRS = (
     '/devlog/system', '/data',
 )
 FILES = (
-    '/data/switchrecomp/swr.log', '/data/switchrecomp/va_probe.log',
+    '/data/switchrecomp/swr.log', '/data/switchrecomp/threads.txt',
+    '/data/switchrecomp/va_probe.log',
     '/data/ps5_probe.log', '/data/switchrecomp/swr.ini',
 )
 VERDICT_KEYS = ('FATAL', 'window OK', 'window FAILED', 'segment ', 'reserve ',
