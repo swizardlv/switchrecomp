@@ -821,14 +821,115 @@ static int s2_cstr(u64 a, char* out, int cap){
   out[0]=0; return 0; }
 
 /* Track unique NVN caller return addresses so new call sites are always logged
-   even after high-frequency loops exhaust the initial call counter. */
+   even after high-frequency loops exhaust the initial call counter.
+   Once the 512-entry table is full, treat further unseen LRs as seen (return 1)
+   so high-frequency loops never spam LOG()/fsync() on every iteration. */
 static int s2_nvn_lr_seen(u64 lr){
-  static u64 seen[128]; static u32 nseen;
+  static u64 seen[512]; static u32 nseen;
   u32 n=__atomic_load_n(&nseen,__ATOMIC_RELAXED);
-  for(u32 i=0;i<n && i<128;i++) if(seen[i]==lr) return 1;
+  u32 lim=n<512? n : 512;
+  for(u32 i=0;i<lim;i++) if(seen[i]==lr) return 1;
+  if(n>=512) return 1;
   u32 idx=__atomic_fetch_add(&nseen,1,__ATOMIC_RELAXED);
-  if(idx<128) seen[idx]=lr;
-  return 0; }
+  if(idx<512){ seen[idx]=lr; return 0; }
+  return 1; }
+
+/* Track NVN MemoryPoolBuilder / BufferBuilder storage bindings so that
+   nvnMemoryPoolMap / nvnMemoryPoolGetBufferAddress and nvnBufferMap /
+   nvnBufferGetAddress return the actual guest CPU buffer passed to
+   nvnMemoryPoolBuilderSetStorage(builder, memory, size) (e.g. the 1.36 MiB
+   shader archive at 0x10ae06000 in run 1923) or pool_base + offset from
+   nvnBufferBuilderSetStorage(builder, pool, offset, size), instead of
+   returning the zero-filled dummy scratch buffer 0x140000b000. */
+typedef struct { u64 key, addr, size; } S2NvnMapEnt;
+static S2NvnMapEnt g_nvn_builders[64];
+static u32 g_nvn_builder_wr;
+static S2NvnMapEnt g_nvn_objs[512];
+static u32 g_nvn_obj_wr;
+
+static int s2_nvn_lookup_obj(u64 obj, u64* out_addr, u64* out_size){
+  if(!obj) return 0;
+  u32 n=__atomic_load_n(&g_nvn_obj_wr,__ATOMIC_RELAXED);
+  u32 lim=n<512? n : 512;
+  /* Search newest entries first in case an object address was reused. */
+  for(u32 k=0;k<lim;k++){
+    u32 idx=(n-1-k)&511u;
+    if(g_nvn_objs[idx].key==obj && g_nvn_objs[idx].addr){
+      if(out_addr) *out_addr=g_nvn_objs[idx].addr;
+      if(out_size) *out_size=g_nvn_objs[idx].size;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void s2_nvn_record_builder(u64 bld, u64 addr, u64 size){
+  for(u32 i=0;i<64;i++){
+    if(g_nvn_builders[i].key==bld){
+      g_nvn_builders[i].addr=addr; g_nvn_builders[i].size=size; return;
+    }
+  }
+  u32 idx=__atomic_fetch_add(&g_nvn_builder_wr,1,__ATOMIC_RELAXED)&63u;
+  g_nvn_builders[idx].key=bld; g_nvn_builders[idx].addr=addr; g_nvn_builders[idx].size=size;
+}
+
+static int s2_nvn_lookup_builder(u64 bld, u64* out_addr, u64* out_size){
+  if(!bld) return 0;
+  for(u32 i=0;i<64;i++){
+    if(g_nvn_builders[i].key==bld && g_nvn_builders[i].addr){
+      if(out_addr) *out_addr=g_nvn_builders[i].addr;
+      if(out_size) *out_size=g_nvn_builders[i].size;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void s2_nvn_record_obj(u64 obj, u64 addr, u64 size){
+  u32 n=__atomic_load_n(&g_nvn_obj_wr,__ATOMIC_RELAXED);
+  u32 lim=n<512? n : 512;
+  for(u32 i=0;i<lim;i++){
+    if(g_nvn_objs[i].key==obj){
+      g_nvn_objs[i].addr=addr; g_nvn_objs[i].size=size; return;
+    }
+  }
+  u32 idx=__atomic_fetch_add(&g_nvn_obj_wr,1,__ATOMIC_RELAXED)&511u;
+  g_nvn_objs[idx].key=obj; g_nvn_objs[idx].addr=addr; g_nvn_objs[idx].size=size;
+}
+
+static void s2_nvn_track_set_storage(CPU* c){
+  u64 x0=c->x[0], x1=c->x[1], x2=c->x[2], x3=c->x[3];
+  if(!s2_guest_ok(x0,32)) return;
+  /* Case 1: nvnBufferBuilderSetStorage(builder=x0, pool=x1, offset=x2, size=x3) */
+  u64 pool_addr=0, pool_sz=0;
+  if(s2_nvn_lookup_obj(x1,&pool_addr,&pool_sz)){
+    if(!pool_sz || x2<pool_sz){
+      u64 bsz = (x3 && x3<=pool_sz)? x3 : (pool_sz>x2 ? pool_sz-x2 : 0x1000ull);
+      s2_nvn_record_builder(x0, pool_addr+x2, bsz);
+      return;
+    }
+  }
+  /* Case 2: nvnMemoryPoolBuilderSetStorage(builder=x0, memory=x1, size=x2)
+     where x1 is a non-stack guest allocation and x2 is its byte size. */
+  if(x1>=AS_BASE && x1<AS_SIZE && !(x1>=0x1300000000ull && x1<0x1300200000ull) &&
+     x2>=0x20ull && x2<=0x40000000ull && s2_guest_ok(x1,x2)){
+    s2_nvn_record_builder(x0, x1, x2);
+    return;
+  }
+  /* Case 3: nvnMemoryPoolBuilderSetStorage(builder=x0, memory=NULL, size=x2) */
+  if(x1==0 && x2>=0x1000ull && x2<=0x40000000ull){
+    s2_nvn_record_builder(x0, s2_nvn_scratch_addr(), x2);
+  }
+}
+
+static void s2_nvn_track_init(CPU* c){
+  u64 x0=c->x[0], x1=c->x[1];
+  if(!s2_guest_ok(x0,32) || !s2_guest_ok(x1,32)) return;
+  u64 b_addr=0, b_sz=0;
+  if(s2_nvn_lookup_builder(x1,&b_addr,&b_sz)){
+    s2_nvn_record_obj(x0, b_addr, b_sz);
+  }
+}
 
 /* In Bananza's NVN texture/sampler descriptor pool manager (F_813a27c,
    returned to at lr=0x813a538 after nvnTextureInitialize), x19 holds the
@@ -839,17 +940,11 @@ static int s2_nvn_lr_seen(u64 lr){
      *(u32*)(x19 + 0xb14) [2836] = atomic next-slot counter
    Each 40-byte slot at slot_array + idx*40 has a 32-bit state at offset +0:
      -1 (0xFFFFFFFF) = free slot (acquired via CAS(-1 -> 1) at 0x813a578 / 0x813a5fc)
-   When the descriptor pool capacity at x19+0xaa0 is 0 or slot states are 0
-   instead of -1, F_813a27c computes mask = capacity - 1 = 0xFFFFFFFF and spins
-   across all 2^32 indices (4.29 billion atomic CAS+LDADD iterations, ~45s per
-   pass at 0x813a538 -> 0x813a5c0 -> 0x813a63c) without ever finding a free
-   slot (run 1806).  Ensure the pool has a valid power-of-two capacity and
-   40-byte slot table initialized to -1 (free). */
+   Allocate the 40-byte slot table in its own dedicated kmem_alloc block so
+   guest buffer writes to g_nvn_scratch never overwrite slot states. */
 static void s2_nvn_heal_pool(CPU* c){
   u64 mgr=c->x[19];
   if(!s2_guest_ok(mgr,0xb20)) return;
-  /* Only match if mgr looks like the descriptor manager before 0x813a538:
-     check either the exact return address 0x813a538 or a caller in 0x8138000..0x813c000. */
   u64 lr=c->x[30];
   if(lr<0x8138000ull || lr>0x813c000ull) return;
   u32 cap=0; u64 arr=0; u16 rsv=0;
@@ -861,10 +956,7 @@ static void s2_nvn_heal_pool(CPU* c){
   if(!s2_guest_ok(arr,(u64)cap*40ull)){
     static u64 pool_slots_va;
     if(!pool_slots_va){
-      s2_nvn_scratch_addr();
-      /* Reserve 256 KiB at offset +0x20000 inside the 1 MiB NVN scratch region
-         (enough for 4096 * 40 = 163,840 bytes of descriptor slots). */
-      pool_slots_va = g_nvn_scratch ? (g_nvn_scratch + 0x20000ull) : 0;
+      pool_slots_va = kmem_alloc(256ull<<10,MS_NORMAL,PERM_RW);
       if(s2_guest_ok(pool_slots_va,(u64)cap*40ull)){
         u8* p=(u8*)GP(pool_slots_va);
         memset(p,0,(size_t)cap*40u);
@@ -877,8 +969,6 @@ static void s2_nvn_heal_pool(CPU* c){
     need_init=1;
   }
   if(s2_guest_ok(arr,(u64)cap*40ull)){
-    /* Ensure at least a batch of slots are marked free (-1) so the CAS at
-       0x813a578 / 0x813a5fc succeeds on the very first probe. */
     u8* p=(u8*)GP(arr);
     u32 free_cnt=0, free_tag=0xFFFFFFFFu;
     for(u32 i=0;i<cap;i++){
@@ -899,6 +989,7 @@ static void s2_nvn_heal_pool(CPU* c){
 static void hle_s2_nvn_true(CPU* c,u64 pc){
   (void)pc;
   s2_nvn_heal_pool(c);
+  s2_nvn_track_init(c);
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
   if(k<64 || !s2_nvn_lr_seen(c->x[30]))
     LOG("hle: [S2] nvn call TRUE  x0=%llx x1=%llx x2=%llx lr=%llx\n",
@@ -907,6 +998,7 @@ static void hle_s2_nvn_true(CPU* c,u64 pc){
   c->x[0]=1; c->pc=c->x[30]; }
 static void hle_s2_nvn_zero(CPU* c,u64 pc){
   (void)pc;
+  s2_nvn_track_set_storage(c);
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
   if(k<64 || !s2_nvn_lr_seen(c->x[30]))
     LOG("hle: [S2] nvn call ZERO  x0=%llx x1=%llx x2=%llx lr=%llx\n",
@@ -915,7 +1007,21 @@ static void hle_s2_nvn_zero(CPU* c,u64 pc){
   c->x[0]=0; c->pc=c->x[30]; }
 static void hle_s2_nvn_obj(CPU* c,u64 pc){
   (void)pc;
-  u64 a=s2_nvn_scratch_addr();
+  u64 a=0, sz=0;
+  if(!s2_nvn_lookup_obj(c->x[0],&a,&sz)) a=s2_nvn_scratch_addr();
+  /* Defense-in-depth for the 6x-unrolled shader stage loop at 0x847da60..0x847db98:
+     the stack buffer at sp+8 is 1152 bytes (at most 8 iterations of 144 bytes).
+     If [sp+4] / x26 underflowed to <= 0 (or exceeded 8), clamp x26 and [sp+4] to 1
+     so 0x847db7c (subs x26, x26, #1; b.ne) exits cleanly without smashing the stack. */
+  if(c->x[30]>=0x847da80ull && c->x[30]<=0x847db80ull){
+    if((i64)c->x[26]<=0 || c->x[26]>8){
+      c->x[26]=1;
+      if(s2_guest_ok(c->x[31]+4,4)){
+        i32 cnt=0; memcpy(&cnt,GP(c->x[31]+4),4);
+        if(cnt<=0 || cnt>8){ cnt=1; memcpy(GP(c->x[31]+4),&cnt,4); }
+      }
+    }
+  }
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
   if(k<64 || !s2_nvn_lr_seen(c->x[30]))
     LOG("hle: [S2] nvn call OBJ   x0=%llx x1=%llx -> %llx lr=%llx\n",
