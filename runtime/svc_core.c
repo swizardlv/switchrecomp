@@ -100,6 +100,25 @@ static int am_csg(SvcObj* o, IpcCtx* c){           /* ICommonStateGetter */
   }
   return stub_ok(o,c); }
 
+/* [S2] GSV GraphicsSupervisor / UserSession -- a TIPC session returned by
+   ISelfController cmd 2000 "GetGraphicsSupervisor" (switchbrew Applet Manager
+   services; exclusive to S2).  nn::gs::sdk::BootGraphicsSystem immediately
+   issues TIPC type 20 (=cmd 4 BootWithRemoteMemory), then 27 (cmd 11
+   SetCurrentProcessHandle) and 117 (cmd 101 CreateContext) -- these are the
+   literal x8 values in the generated code around F_A867F64.
+   Answering cmd 2000 empty made the SDK store handle 0, so svcSendSyncRequest(0)
+   failed and BootWithRemoteMemory called nn::diag::AbortImpl(). */
+static int gsv_session(SvcObj* o, IpcCtx* c){
+  (void)o;
+  switch(c->cmd){
+    case 4:                       /* BootWithRemoteMemory */
+    case 11:                      /* SetCurrentProcessHandle */
+    case 101:                     /* CreateContext */
+    case 401: case 402:           /* CreateGpuContext / InitializeGpuContext */
+      return 0;
+  }
+  return quiet_ok(o,c); }
+
 static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
   switch(c->cmd){
     case 0: { extern void process_exit(int); process_exit(0); return 0; }   /* Exit: the system kills the process, libnx just sleeps
@@ -114,6 +133,9 @@ static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
     case 90: out64(c,0); return 0;                                     /* GetAccumulatedSuspendedTickValue */
     case 91: out_copy_h(c,ev_handle(kevent_new("suspend",0))); return 0;
     case 100: case 110: case 120: return 0;
+    /* [S2] GetGraphicsSupervisor: returns an output TIPC handle, NOT a CMIF
+       object.  out_obj() -> session_new() gives exactly such a handle. */
+    case 2000: out_obj(c,svcobj_new("GSV:GraphicsSupervisor",gsv_session,0)); return 0;
   }
   return quiet_ok(o,c); }
 
@@ -136,6 +158,10 @@ static int am_appfn(SvcObj* o, IpcCtx* c){         /* IApplicationFunctions */
     case 25: out64(c,0); return 0;                                     /* ExtendSaveData */
     case 26: out64(c,0x4000000); out64(c,0x4000000); return 0;       /* GetSaveDataSize */
     case 110: out32(c,0); return 0;
+    /* [8.0.0+] GetGpuErrorDetectedSystemEvent: returns an output Event handle
+       (autoclear=false).  Answering empty would leave another handle 0 behind
+       for the S2 graphics boot path. */
+    case 130: out_copy_h(c,ev_handle(kevent_new("gpu error",0))); return 0;
     case 22: case 27: case 28: case 32: case 33: case 34: case 35: case 36: case 37: case 66: case 67: case 68: case 90: case 100: case 101: case 120: case 124: return 0;
     case 151: return RC(128,2);                                      /* TryPopFromNotificationStorageChannel: nothing queued */
     case 23: { char v[16]="1.0.0"; outbytes(c,v,16); return 0; }         /* GetDisplayVersion */
