@@ -791,7 +791,7 @@ static void hle_s2_vi_vrr(CPU* c, u64 pc){ hle_s2_stub(c,pc,S2_VI_VRR); }
 #define S2_NVN_OBJ_TRUE   0x100001400ull
 #define S2_NVN_OBJ_HANDLE 0x100001500ull
 static u64 g_nvn_slot_true, g_nvn_slot_zero, g_nvn_slot_proc, g_nvn_slot_obj;
-static u64 g_nvn_slot_int, g_nvn_slot_acq;
+static u64 g_nvn_slot_int, g_nvn_slot_size, g_nvn_slot_acq;
 static u64 g_nvn_scratch;
 static u32 g_nvn_lookups, g_nvn_calls;
 
@@ -805,6 +805,8 @@ static u64 s2_nvn_scratch_addr(void){
 
 /* guest is a flat reservation: only read a string inside a committed block */
 static int s2_cstr(u64 a, char* out, int cap){
+  if(cap<=0) return 0;
+  out[0]=0;
   if(a<AS_BASE || a>=AS_SIZE) return 0;
   MemBlock b; mem_query(a,&b);
   if(b.state==MS_FREE || b.state==MS_INACCESSIBLE || !(b.perm&PERM_R)) return 0;
@@ -812,11 +814,11 @@ static int s2_cstr(u64 a, char* out, int cap){
   const char* p=(const char*)GP(a); int i=0;
   for(; i<(int)room; i++){
     unsigned char ch=(unsigned char)p[i];
-    if(!ch) return i>0;
-    if(ch<0x20 || ch>=0x7F) return 0;
+    if(!ch){ out[i]=0; return i>0; }
+    if(ch<0x20 || ch>=0x7F){ out[0]=0; return 0; }
     out[i]=(char)ch;
   }
-  out[i]=0; return 0; }
+  out[0]=0; return 0; }
 
 static void hle_s2_nvn_true(CPU* c,u64 pc){
   (void)pc;
@@ -840,6 +842,22 @@ static void hle_s2_nvn_obj(CPU* c,u64 pc){
                (unsigned long long)c->x[0],(unsigned long long)c->x[1],
                (unsigned long long)a,(unsigned long long)c->x[30]);
   c->x[0]=a; c->pc=c->x[30]; }
+/* NVN queries returning a size_t / alignment / stride / free space in x0
+   (e.g. nvnTextureBuilderGetStorageSize, nvnTextureBuilderGetStorageAlignment,
+   nvnQueueBuilderGet*MemorySize, nvnMemoryPoolGetSize).  Returning the scratch
+   pointer (0x140000b000 = 85.9 GiB) makes the game try to allocate 85.9 GiB
+   from its 3.2 GiB heap, get NULL, and fault filling 0x0..0x200000 (run 1735).
+   4096 (0x1000) is a valid power-of-two page alignment and a small, 4-byte
+   aligned byte size so both heap allocations and CPU fill loops complete in
+   microseconds. */
+static void hle_s2_nvn_size(CPU* c,u64 pc){
+  (void)pc;
+  u64 sz=4096;
+  static u32 nsz; u32 k=__atomic_fetch_add(&nsz,1,__ATOMIC_RELAXED);
+  if(k<64) LOG("hle: [S2] nvn call SIZE  x0=%llx x1=%llx -> %llu lr=%llx\n",
+               (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+               (unsigned long long)sz,(unsigned long long)c->x[30]);
+  c->x[0]=sz; c->pc=c->x[30]; }
 /* nvnDeviceGetInteger(const NVNdevice *device, NVNdeviceInfo pname, int *v):
    Note that in NVN, device can be NULL for static queries, so check x0/x1 if
    x2 is not a pointer.  Leaving *v uninitialized (0 or stack garbage) causes
@@ -848,17 +866,17 @@ static void hle_s2_nvn_int(CPU* c,u64 pc){
   (void)pc;
   u32 pname=(u32)c->x[1]; u64 out=c->x[2];
   if(!s2_guest_ok(out,4) && s2_guest_ok(c->x[1],4)){ pname=(u32)c->x[0]; out=c->x[1]; }
-  i32 val=4096;
-  /* NVN_DEVICE_INFO_API_MAJOR_VERSION=0 (55), MINOR=1 (13), uniform/texture/
-     sampler descriptor sizes (256/32), reserved handles (256), alignments (4096). */
+  i32 val=256;
+  /* NVN_DEVICE_INFO_API_MAJOR_VERSION=0 (55), MINOR=1 (13), alignments (4096),
+     and 256 for descriptor sizes / reserved count queries (57, 58, etc.). */
   if(pname==0) val=55;
   else if(pname==1) val=13;
-  else if(pname>=2 && pname<=16) val=256;
+  else if(pname==81 || pname==85 || pname==91) val=4096;
   if(s2_guest_ok(out,4)) memcpy(GP(out),&val,4);
   static u32 nint; u32 k=__atomic_fetch_add(&nint,1,__ATOMIC_RELAXED);
   if(k<96) LOG("hle: [S2] nvn GetInteger pname=%u (%#x) out=%llx -> %d lr=%llx\n",
                pname,pname,(unsigned long long)out,val,(unsigned long long)c->x[30]);
-  c->x[0]=1; c->pc=c->x[30]; }
+  c->x[0]=0; c->pc=c->x[30]; }
 /* nvnWindowAcquireTexture(NVNwindow *window, NVNsync * presentSync, int *idx) -> 0 (SUCCESS) */
 static void hle_s2_nvn_acq(CPU* c,u64 pc){
   (void)pc;
@@ -874,15 +892,25 @@ static u64 s2_nvn_resolve(const char* nm, int ok){
   if(!ok) return slot;
   if(strstr(nm,"ProcAddress") || strstr(nm,"GetProc") || strstr(nm,"BootstrapLoader"))
     slot=g_nvn_slot_proc? g_nvn_slot_proc : slot;
-  else if(strstr(nm,"GetInteger") || strstr(nm,"GetSize") || strstr(nm,"GetAlignment") ||
-          strstr(nm,"GetOffset") || strstr(nm,"GetTotal") || strstr(nm,"GetCommandMemory") ||
-          strstr(nm,"GetControlMemory"))
-    slot=g_nvn_slot_int? g_nvn_slot_int : (g_nvn_slot_obj? g_nvn_slot_obj : slot);
+  else if(strstr(nm,"GetInteger"))
+    slot=g_nvn_slot_int? g_nvn_slot_int : slot;
   else if(strstr(nm,"AcquireTexture"))
     slot=g_nvn_slot_acq? g_nvn_slot_acq : (g_nvn_slot_zero? g_nvn_slot_zero : slot);
-  else if(strstr(nm,"Map") || strstr(nm,"Alloc") || strstr(nm,"Create") ||
-          strstr(nm,"GetMemory") || strstr(nm,"GetAddress") || strstr(nm,"GetHandle") ||
-          strstr(nm,"GetRowStride") || strstr(nm,"GetStorage"))
+  else if(((strstr(nm,"Get") || strstr(nm,"Calculate")) &&
+           (strstr(nm,"Size") || strstr(nm,"Alignment") || strstr(nm,"Stride") ||
+            strstr(nm,"Free") || strstr(nm,"Threshold") || strstr(nm,"Total"))) ||
+          strstr(nm,"GetCommandMemoryFree") || strstr(nm,"GetControlMemoryFree"))
+    slot=g_nvn_slot_size? g_nvn_slot_size : slot;
+  else if((strstr(nm,"Get") && (strstr(nm,"Offset") || strstr(nm,"MemoryUsed"))) ||
+          strstr(nm,"GetCurrentTimestamp"))
+    slot=g_nvn_slot_zero? g_nvn_slot_zero : slot;
+  else if(strstr(nm,"PoolMap") || strstr(nm,"BufferMap") ||
+          strstr(nm,"GetAddress") || strstr(nm,"GetBufferAddress") || strstr(nm,"GetTextureAddress") ||
+          strstr(nm,"GetHandle") || strstr(nm,"GetTextureHandle") || strstr(nm,"GetTexelFetchHandle") ||
+          strstr(nm,"GetImageHandle") || strstr(nm,"GetSeparate") || strstr(nm,"EndRecording") ||
+          strstr(nm,"GetMemoryPool") || strstr(nm,"GetDevice") ||
+          !strcmp(nm,"nvnEventBuilderGetStorage") ||
+          !strcmp(nm,"nvnWindowBuilderGetNativeWindow") || !strcmp(nm,"nvnWindowGetNativeWindow"))
     slot=g_nvn_slot_obj? g_nvn_slot_obj : slot;
   else if(strstr(nm,"SyncWait") || strstr(nm,"Wait") || strstr(nm,"WalkDebug") ||
           strstr(nm,"Set") || strstr(nm,"Bind") || strstr(nm,"Draw") || strstr(nm,"Clear") ||
@@ -891,7 +919,8 @@ static u64 s2_nvn_resolve(const char* nm, int ok){
           strstr(nm,"Reset") || strstr(nm,"Barrier") || strstr(nm,"Fence") ||
           strstr(nm,"Copy") || strstr(nm,"Present") || strstr(nm,"Begin") || strstr(nm,"End") ||
           strstr(nm,"Update") || strstr(nm,"Discard") || strstr(nm,"Invalidate") ||
-          strstr(nm,"Restore") || strstr(nm,"Register") || strstr(nm," dispatch") || strstr(nm,"Dispatch"))
+          strstr(nm,"Restore") || strstr(nm,"Register") || strstr(nm,"ComputeDirtyTileMap") ||
+          strstr(nm," dispatch") || strstr(nm,"Dispatch"))
     slot=g_nvn_slot_zero? g_nvn_slot_zero : slot;
   return slot;
 }
@@ -1074,6 +1103,9 @@ void swr_install_s2_hooks(void){
       } else if(strstr(s,"NvRmMemGetSize")){
         g_nvn_slot_int=a; g_disp[slot]=hle_s2_nvn_int; nnv++;
         LOG("hle: [S2] nvn slot INT   %llx (%s)\n",(unsigned long long)a,s);
+      } else if(strstr(s,"NvRmMemQueryHeapSize")){
+        g_nvn_slot_size=a; g_disp[slot]=hle_s2_nvn_size; nnv++;
+        LOG("hle: [S2] nvn slot SIZE  %llx (%s)\n",(unsigned long long)a,s);
       } else if(strstr(s,"NvRmMemPin")){
         g_nvn_slot_acq=a; g_disp[slot]=hle_s2_nvn_acq; nnv++;
         LOG("hle: [S2] nvn slot ACQ   %llx (%s)\n",(unsigned long long)a,s);
@@ -1090,11 +1122,11 @@ void swr_install_s2_hooks(void){
      this dump; otherwise leave the loader alone rather than returning 0. */
   if(a_nvn_boot && g_nvn_slot_true){
     g_disp[(a_nvn_boot-g_code_lo)/4]=hle_s2_nvn_bootstrap;
-    LOG("hle: [S2] NVN takeover installed: bootstrap=%llx true=%llx zero=%llx proc=%llx obj=%llx int=%llx acq=%llx\n",
+    LOG("hle: [S2] NVN takeover installed: bootstrap=%llx true=%llx zero=%llx proc=%llx obj=%llx int=%llx size=%llx acq=%llx\n",
         (unsigned long long)a_nvn_boot,(unsigned long long)g_nvn_slot_true,
         (unsigned long long)g_nvn_slot_zero,(unsigned long long)g_nvn_slot_proc,
         (unsigned long long)g_nvn_slot_obj,(unsigned long long)g_nvn_slot_int,
-        (unsigned long long)g_nvn_slot_acq);
+        (unsigned long long)g_nvn_slot_size,(unsigned long long)g_nvn_slot_acq);
   } else {
     LOG("hle: [S2] NVN takeover NOT installed: bootstrap=%llx true=%llx\n",
         (unsigned long long)a_nvn_boot,(unsigned long long)g_nvn_slot_true);
