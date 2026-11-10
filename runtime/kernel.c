@@ -1432,16 +1432,24 @@ void swr_install_s2_hooks(void){
      logical window is [12 GiB, 76 GiB) (ALIAS_BASE=0x300000000, g_alias_size=64G),
      so this page sits *inside* that window -- but the window is only backed per page
      when the guest actually maps/aliases an address, and the crash at 0x10000000119
-     proved this page was unbacked (hence free).  mem_map therefore claims it
+     proved this page was unbacked (hence free).       mem_map therefore claims it
      cleanly with no real allocation to collide with.  We cannot pick another
      address: 0x10000000101 is a fixed SDK magic constant, so we must map exactly
-     the page that contains it.  mem_map commits zeroed host pages (plat_vm_commit),
-     so the read resolves to 0.  Page 0 is also already mapped (mem_init), so a zero
-     read at +0x18 that yields a null nested pointer derefs safely there too. */
-  if(mem_map(0x10000000000ull, 0x2000ull, MS_NORMAL, PERM_RW)==0)
-    LOG("hle: [S2] mapped unbound-NVN-sentinel page @ 10000000000 (2 pages, zero)\n");
-  else
-    WARN("hle: [S2] could not map unbound-NVN-sentinel page @ 10000000000\n");
+     the page that contains it.
+     IMPORTANT: by the time this runs the guest has already registered a MemBlock
+     that *covers* 64 GiB (so mem_map's mem_is_free() check rejects the request
+     and the original mem_map() call failed with "could not map").  That is fine:
+     the block list is only metadata for svcQueryMemory -- actual guest access is
+     gated purely by whether the host page is committed (RW), exactly like page 0
+     in mem_init().  So we bypass the block-list check and commit the host page
+     directly, which is what makes the deref read 0 instead of SIGSEGV'ing. */
+  {
+    u8* sp = GP(0x10000000000ull);
+    if(plat_vm_commit(sp, 0x2000ull)==0)
+      LOG("hle: [S2] committed unbound-NVN-sentinel page @ 10000000000 (2 pages, zero)\n");
+    else
+      WARN("hle: [S2] could not commit unbound-NVN-sentinel page @ 10000000000\n");
+  }
 }
 
 static void guest_backtrace(CPU* c){
