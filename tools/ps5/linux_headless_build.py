@@ -159,9 +159,23 @@ def build_runtime_exe(cc, out_exe, rt_obj_dir, so_path, mod_obj, opt, asan, jobs
             raise RuntimeError('runtime compile %s failed:\n%s' % (src, (r.stderr or r.stdout)[-1500:]))
         return obj
 
+    # Collect *all* runtime compile failures in one pass instead of bailing on
+    # the first one (pool.map raises as soon as its head result fails). Keep the
+    # original srcs order for the link command.
     t0 = time.time()
+    obj_by_name, failures = {}, []
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        rt_objs = list(pool.map(_comp_rt, srcs))
+        futs = {pool.submit(_comp_rt, s): s for s in srcs}
+        for fut in as_completed(futs):
+            name = futs[fut]
+            try:
+                obj_by_name[name] = fut.result()
+            except RuntimeError as e:
+                failures.append(str(e))
+    if failures:
+        raise SystemExit('runtime compile failed (%d/%d files):\n\n%s' % (
+            len(failures), len(srcs), '\n\n'.join(sorted(failures))))
+    rt_objs = [obj_by_name[s] for s in srcs]
     print('[linux-headless] compiled %d runtime files in %.2fs (git=%s, asan=%s)' % (
         len(rt_objs), time.time() - t0, git_hash, asan), flush=True)
 

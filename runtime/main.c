@@ -185,12 +185,16 @@ static void rt_wfe(CPU* c){ (void)c; plat_yield(); }
 const RtAPI g_rtapi={swr_svc,rt_undef,rt_note_hint,rt_ticks,rt_brk,rt_fpcr,rt_sev,rt_wfe};
 
 /* ============================================================ system errors */
+/* plat.c: fsync-backed diagnostic file. Declared at file scope because both
+   blocks in crash_report() call it; a block-local extern in only one of them
+   makes the other call an implicit int declaration that conflicts. */
+extern void romfs_diag(const char*);
 void crash_report(void* host_pc, void* fault, int sig){
   KThread* t=kthread_cur();
   u64 ga=(u64)((u8*)fault-g_mem);
   /* Mirror the crash signature to the independent fsync-backed diag file so it
      survives even if the buffered log is lost. */
-  { extern void romfs_diag(const char*); char b[128];
+  { char b[128];
     snprintf(b,sizeof b,"CRASH sig=%d host_pc=%p fault=%p ga=%llx\n",sig,host_pc,fault,(unsigned long long)ga); romfs_diag(b); }
   { extern char g_diag_manopen_dir[]; char b[2048];
     snprintf(b,sizeof b,"LAST_MANOPEN=%s\n",g_diag_manopen_dir); romfs_diag(b); }
