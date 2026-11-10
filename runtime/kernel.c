@@ -369,10 +369,11 @@ static u32 svc_wait_sync(KThread* t, u64 hptr, u32 n, i64 timeout, u32* out_idx)
   pm_lock(&g_klock);
   for(u32 i=0;i<n;i++){ objs[i]=h_get_nl(hs[i]); if(!objs[i] || !objs[i]->is_signaled){ pm_unlock(&g_klock); if(!objs[i]){
         /* a stubbed service (e.g. aud:u) hands back handle 0; the caller's audio
-           thread then spins svcWaitSynchronization on it.  Sleeping ~1 ms and
-           returning timeout turns the ~16M/sec busy-loop into a throttled one
-           instead of pegging a core and flooding the log. */
-        if(hs[i]==0){ plat_sleep_ns(1000000); return R_TIMEOUT; }
+           thread at 0xa5bfad4 checks `cbnz w0, 0xa5bfac0` and loops forever if
+           WaitSynchronization returns non-zero (R_TIMEOUT).  Sleeping ~5 ms (~200 Hz
+           audio frame pace) and returning 0 with *out_idx=i lets 0xa5bfae0..0xa5bfaf4
+           exit the wait loop cleanly without pegging a core or flooding g_svc_ring. */
+        if(hs[i]==0){ plat_sleep_ns(5000000); *out_idx=i; return 0; }
         static u32 nw; if(nw++<20 || !(nw&0xFFFF)) WARN("WaitSynchronization: invalid handle %x (%u times)\n",hs[i],nw); } return R_BADHANDLE; } }
   if(t->cancel){ t->cancel=0; pm_unlock(&g_klock); return R_CANCELLED; }
   u64 end= timeout<0? 0 : plat_ns()+(u64)timeout;
@@ -998,8 +999,26 @@ static void s2_nvn_heal_pool(CPU* c){
   }
 }
 
+/* Guest page 0 (0x0..0x10000) is mapped RW in mem_init() so NULL(+off) reads
+   return 0 instead of faulting.  However, stray NULL(+off) stores write boolean
+   bytes (e.g. 0x0000010000000101) into page 0; later NULL(+off) loads in
+   F_884F2C0 (`x9=RD64(x0+208)=0; x21=RD64(x9+x8)`) read back 0x10000000101
+   instead of 0 and fault at `RD64(x21+0x18)` (0x10000000119).  Keep page 0
+   scrubbed to all-zero on HLE/SVC boundaries. */
+static inline void s2_scrub_null_page(void){
+  if(g_mem) memset(g_mem,0,0x10000);
+}
+
+static u64 s2_zero_obj_addr(void){
+  static u64 zva;
+  if(!zva) zva=kmem_alloc(0x1000,MS_NORMAL,PERM_RW);
+  if(zva && s2_guest_ok(zva,0x100)) memset(GP(zva),0,0x100);
+  return zva? zva : s2_nvn_scratch_addr();
+}
+
 static void hle_s2_nvn_true(CPU* c,u64 pc){
   (void)pc;
+  s2_scrub_null_page();
   s2_nvn_heal_pool(c);
   s2_nvn_track_init(c);
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
@@ -1010,6 +1029,7 @@ static void hle_s2_nvn_true(CPU* c,u64 pc){
   c->x[0]=1; c->pc=c->x[30]; }
 static void hle_s2_nvn_zero(CPU* c,u64 pc){
   (void)pc;
+  s2_scrub_null_page();
   s2_nvn_track_set_storage(c);
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
   if(k<64 || !s2_nvn_lr_seen(c->x[30]))
@@ -1019,6 +1039,7 @@ static void hle_s2_nvn_zero(CPU* c,u64 pc){
   c->x[0]=0; c->pc=c->x[30]; }
 static void hle_s2_nvn_obj(CPU* c,u64 pc){
   (void)pc;
+  s2_scrub_null_page();
   u64 a=0, sz=0;
   if(!s2_nvn_lookup_obj(c->x[0],&a,&sz)) a=s2_nvn_scratch_addr();
   /* Defense-in-depth for the 6x-unrolled shader stage loop at 0x847da60..0x847db98:
@@ -1183,6 +1204,7 @@ static void hle_s2_nv_handle(CPU* c,u64 pc){ hle_s2_nv(c,pc,4); }
    into a u32 array and skips the unbound slot); otherwise run the real fn. */
 static GuestFn g_s2_orig_gfb;
 static void hle_s2_gfb(CPU* c, u64 pc){
+  s2_scrub_null_page();
   u64 p=c->x[0];
   if(p==0){ c->x[0]=(u64)-1; c->pc=c->x[30]; return; }
   MemBlock b; mem_query(p,&b);
@@ -1191,21 +1213,41 @@ static void hle_s2_gfb(CPU* c, u64 pc){
   else c->pc=c->x[30];
 }
 
-/* shader/material reflection traversal helper at 0x99a6350.  The material-stage
-   reflection loop at 0x8864708 calls it four times (bl at 8864774/88647c4/
-   88647ec/8864810).  The *first* call's return value is read by the caller at
-   [x0,#0x1c] as the stage count, and the entire loop is skipped when that is <1.
-   The function is NOT recompiled -- its body is the generic interpreter
-   trampoline -- so it runs through the interpreter and dereferences an unbound
-   NVN object sentinel (0x10000000101) at +0x18, faulting with an invalid memory
-   access (crash pc=8864814 in run 2026-11-09_2031).  Returning the zero-filled
-   NVN scratch object makes [x0,#0x1c] read 0, so the caller skips the whole
-   loop (including the crashing 4th call) instead of cascading. */
+/* 0x99a6350 is a PLT stub in `main` (`adrp x16, 0xa1e5000; ldr x17, [x16, #0x1a0];
+   add x16, x16, #0x1a0; br x17`).  Because intra-module `BL 0x99a6350` in `main`
+   is compiled as a direct C call `F_99A6350(c, 0x99a6350)` rather than `CALLDYN`,
+   hooking 0x99a6350 in `g_disp` does not intercept direct `BL` calls.  However,
+   `F_99A6350` executes `CALLDYN(c->x[17])` to jump into the `sdk` export
+   `_ZN2nn4util16BinaryFileHeader13GetFirstBlockEv` (`0xa4f33f4`).  Hooking that
+   SDK export in `g_disp` intercepts all calls through 0x99a6350!
+   When called from the material-stage reflection loop at 0x8864708..0x8864850
+   (or with a NULL/invalid header pointer), return a zero-filled 4 KiB block so
+   `[x0, #0x1c]` reads 0 (stage count = 0) and guest page 0 is scrubbed before
+   any subsequent `F_884F2C0` call. */
 static GuestFn g_s2_orig_refl;
+static GuestFn g_s2_orig_hdr_gfb;
 static void hle_s2_refl(CPU* c, u64 pc){
   (void)pc;
-  c->x[0]=s2_nvn_scratch_addr();
+  s2_scrub_null_page();
+  c->x[0]=s2_zero_obj_addr();
   c->pc=c->x[30];
+}
+static void hle_s2_get_first_block(CPU* c, u64 pc){
+  s2_scrub_null_page();
+  u64 hdr=c->x[0], lr=c->x[30];
+  if((lr>=0x8864700ull && lr<=0x8864900ull) || hdr<0x10000ull || !s2_guest_ok(hdr,0x20)){
+    static u32 nskip;
+    if(nskip++<16)
+      LOG("hle: [S2] BinaryFileHeader::GetFirstBlock(hdr=%llx lr=%llx) -> zero_obj\n",
+          (unsigned long long)hdr,(unsigned long long)lr);
+    c->x[0]=s2_zero_obj_addr();
+    c->pc=lr;
+    return;
+  }
+  if(g_s2_orig_hdr_gfb){ g_s2_orig_hdr_gfb(c,pc); return; }
+  u32 off=gr32(hdr+0x10);
+  c->x[0]= off? (hdr+off) : 0;
+  c->pc=lr;
 }
 
 /* Match a distinctive mangled substring rather than the full symbol: exported
@@ -1218,6 +1260,7 @@ static void hle_s2_refl(CPU* c, u64 pc){
    Switch 2 dumps (Bananza / OOT SDK 22.2.8): dm/gfx/hle_nv.c and hle_vi.c. */
 static const struct { const char* sym; GuestFn fn; } g_s2_hooks[]={
   {"2nn2gs3sdk18BootGraphicsSystemE", hle_s2_ok},
+  {"2nn2oe20SetupGpuErrorHandlerEv", hle_s2_ok},
   {"2nv18InitializeGraphicsE", hle_s2_init},
   {"2nv16FinalizeGraphicsE", hle_s2_ok},
   {"2nv20SetGraphicsAllocatorE", hle_s2_ok},
@@ -1292,6 +1335,13 @@ void swr_install_s2_hooks(void){
       LOG("hle: [S2] vi export %llx (%s)\n",(unsigned long long)a,s);
     if(strstr(s,"CameraContext") && ncam++<12)
       LOG("hle: [S2] camera export %llx (%s)\n",(unsigned long long)a,s);
+    if(strstr(s,"2nn4util16BinaryFileHeader13GetFirstBlockEv")){
+      u64 slot=(a-g_code_lo)/4;
+      g_s2_orig_hdr_gfb=g_disp[slot];
+      g_disp[slot]=hle_s2_get_first_block;
+      LOG("hle: [S2] hook BinaryFileHeader::GetFirstBlock @ %llx (%s)\n",(unsigned long long)a,s);
+      continue;
+    }
     int matched=0;
     for(int k=0;k<NS;k++) if(strstr(s,g_s2_hooks[k].sym)){
       g_disp[(a-g_code_lo)/4]=g_s2_hooks[k].fn; hits[k]++; matched=1;
@@ -1392,6 +1442,14 @@ void swr_install_s2_hooks(void){
      gr32(0xa966710ull)==0x7100281fu && gr32(0xa966718ull)==0x7100781fu){
     g_disp[(0xa966700ull-g_code_lo)/4]=hle_s2_true;
     LOG("hle: [S2] hooked nn::oe graphics scale mode @ a966700 -> 1 (Docked)\n");
+  }
+  /* Bananza Switch 2 nn::oe::SetupGpuErrorHandler worker callback at 0xa966600:
+     SetupGpuErrorHandler (0xa966560) registers 0xa966600 with RegisterSystemWorkerHandler;
+     when invoked via BLR (CALLDYN), 0xa966624 calls nn::diag::detail::AbortImpl (runs 085900/092227). */
+  if(0xa966600ull>=g_code_lo && 0xa966628ull<g_code_hi &&
+     gr32(0xa966600ull)==0xd503237fu && gr32(0xa966620ull)==0xd65f0fffu){
+    g_disp[(0xa966600ull-g_code_lo)/4]=hle_s2_ok;
+    LOG("hle: [S2] hooked nn::oe GPU error worker callback @ a966600 -> stub_ok\n");
   }
   /* shader-reflection null-pointer guard: hook 0x884f2c0 only when its prologue
      still matches this dump's binary (pacibsp + ldr x22,[x0,#0xd8] at +0x1c), so
@@ -1605,8 +1663,10 @@ extern KShmem* kshmem_new(u64 size, const char* name);
 static void swr_svc_(CPU* c, u32 imm);
 
 void swr_svc(CPU* c, u32 imm){
+  s2_scrub_null_page();
   u64 a0=c->x[0],a1=c->x[1],a2=c->x[2];
   u64 a3=c->x[3];
+  u32 h0_in = (imm==0x18 && a2>=1 && a1>=AS_BASE && a1<AS_SIZE)? gr32(a1) : 1u;
   swr_svc_(c,imm);
   { KThread* t=kthread_cur(); if(t){ u32 k=t->svc_hist_n;
       if(k && t->svc_hist[(k-1)%24].imm==imm && t->svc_hist[(k-1)%24].lr==c->x[30]) t->svc_hist[(k-1)%24].n++;
@@ -1614,7 +1674,10 @@ void swr_svc(CPU* c, u32 imm){
         /* WaitSynchronization: keep the first handle now, the array lives on the caller's stack */
         h->h0= (imm==0x18 && a2>=1 && a1>=AS_BASE && a1<AS_SIZE)? gr32(a1) : 0; }
       t->svc_hist[(t->svc_hist_n-1)%24].res=(u32)c->x[0]; } }
-  if(imm!=0x1E && imm!=0x0B && imm!=0x10){ u32 i=__atomic_fetch_add(&g_svc_ring_n,1,__ATOMIC_RELAXED)&63; SvcRec* r=&g_svc_ring[i];
+  int skip_ring = (imm==0x1E || imm==0x0B || imm==0x10 ||
+                   (imm==0x18 && a2==1 && h0_in==0) ||
+                   ((imm==0x12 || imm==0x17) && (u32)a0==0));
+  if(!skip_ring){ u32 i=__atomic_fetch_add(&g_svc_ring_n,1,__ATOMIC_RELAXED)&63; SvcRec* r=&g_svc_ring[i];
     r->imm=imm; r->lr=c->x[30]; r->a[0]=a0; r->a[1]=a1; r->a[2]=a2; r->a[3]=a3; r->res=(u32)c->x[0]; r->o1=c->x[1]; }
   static u32 nbad; if((u32)c->x[0]==R_BADHANDLE && imm!=0x16 && (nbad++<20 || !(nbad&0xFFFF))) WARN("SVC 0x%x with invalid handle (args %llx %llx %llx) pc=%llx\n",imm,(unsigned long long)a0,(unsigned long long)a1,(unsigned long long)a2,(unsigned long long)c->pc);
 }
@@ -1658,7 +1721,9 @@ static void swr_svc_(CPU* c, u32 imm){
     x[0]=0; return; }
   case 0x10: x[0]=(u32)(t? t->core : 0); return;
   case 0x11: { KEvent* e=(KEvent*)h_get_type((u32)x[0],KO_EVENT); if(!e){ x[0]=R_BADHANDLE; return; } kevent_signal(e); x[0]=0; return; }
-  case 0x12: case 0x17: { KObj* o=h_get((u32)x[0]); if(!o){ x[0]=R_BADHANDLE; return; }
+  case 0x12: case 0x17: {
+    if((u32)x[0]==0){ x[0]=0; return; }
+    KObj* o=h_get((u32)x[0]); if(!o){ x[0]=R_BADHANDLE; return; }
     if(o->type==KO_EVENT){ KEvent* e=(KEvent*)o; pm_lock(&g_klock); int was=e->signaled; e->signaled=0; pm_unlock(&g_klock);
       x[0]= (imm==0x17 && !was)? R_BADSTATE : 0; return; }
     x[0]=0; return; }

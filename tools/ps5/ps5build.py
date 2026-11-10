@@ -557,8 +557,73 @@ def main():
             extra = [os.path.join(objdir, 'smoke.o')]
             arc = None
         else:
-            extra = [c.module_obj] if c.module_obj else []
+            # Guard against the 1.27 GB eboot.bin bloat caused by inlining swr_mp
+            # into every RD/WR macro across code_*.c (commit 5e0f3b8). If the
+            # existing libgame_code.a is > 500 MiB, restore from a pre-existing
+            # unbloated .o set in c.build (or recompile code_*.c with clean cpu.h).
             arc = c.archive
+            if arc and os.path.isfile(arc) and os.path.getsize(arc) > (500 << 20):
+                bdir = os.path.dirname(os.path.abspath(arc))
+                run.log('WARN', 'libgame_code.a is bloated (%.1f MiB > 500 MiB); rebuilding unbloated archive in %s' % (
+                    os.path.getsize(arc) / (1 << 20), bdir))
+                c_files = sorted(glob.glob(os.path.join(bdir, 'code_*.c')))
+                mod_c = os.path.join(bdir, 'module.c')
+                if os.path.isfile(mod_c):
+                    c_files = [mod_c] + c_files
+                cand_sigs = []
+                for mo in glob.glob(os.path.join(bdir, 'module.*.o')):
+                    m_sig = re.match(r'^module\.([0-9a-f]{10})\.o$', os.path.basename(mo))
+                    if not m_sig:
+                        continue
+                    sig = m_sig.group(1)
+                    objs_for_sig = [os.path.splitext(cf)[0] + '.' + sig + '.o' for cf in c_files]
+                    if all(os.path.isfile(p) for p in objs_for_sig):
+                        tot_sz = sum(os.path.getsize(p) for p in objs_for_sig)
+                        if tot_sz < (450 << 20):
+                            cand_sigs.append((tot_sz, sig, objs_for_sig))
+                if cand_sigs:
+                    cand_sigs.sort(key=lambda x: x[0])
+                    tot_sz, sig, clean_objs = cand_sigs[0]
+                    run.log('INFO', 'restoring unbloated object set sig=%s (%d objects, %.1f MiB)' % (
+                        sig, len(clean_objs), tot_sz / (1 << 20)))
+                else:
+                    sig = 'clean'
+                    run.log('INFO', 'recompiling %d game C files with restored cpu.h...' % len(c_files))
+                    cc = os.path.join(c.sdk, 'bin', 'prospero-clang')
+                    flags = ['-O' + str(c.opt), '-fno-strict-aliasing', '-fwrapv', '-w',
+                             '-I', os.path.join(c.repo, 'runtime'),
+                             '-foptimize-sibling-calls', '-fno-semantic-interposition',
+                             '-fPIC', '-fvisibility=hidden', '-fno-jump-tables',
+                             '-DSWR_PS5', '-DSWR_NO_H264', '-DSWR_NO_OPUS']
+                    def _comp_game(cf):
+                        ob = os.path.splitext(cf)[0] + '.' + sig + '.o'
+                        r = subprocess.run([cc] + flags + ['-c', cf, '-o', ob],
+                                           env=env, capture_output=True, text=True, errors='replace')
+                        if r.returncode != 0:
+                            raise RuntimeError('compile %s failed: %s' % (cf, (r.stderr or r.stdout)[-500:]))
+                        return ob
+                    with ThreadPoolExecutor(max_workers=max(8, int(c.jobs))) as pool:
+                        clean_objs = list(pool.map(_comp_game, c_files))
+                names = [os.path.basename(p) for p in clean_objs]
+                rsp = os.path.join(bdir, 'objects.rsp')
+                with open(rsp, 'w', encoding='utf-8') as fo:
+                    fo.write('\n'.join('"%s"' % n for n in names) + '\n')
+                ar = os.path.join(c.sdk, 'bin', 'prospero-ar')
+                os.remove(arc)
+                r_ar = run.cmd([ar, 'rcs', os.path.basename(arc), '@objects.rsp'], cwd=bdir, env=env, label='rebuild-game-ar')
+                if r_ar['rc']:
+                    r_ar = run.cmd([ar, 'rcs', os.path.basename(arc)] + names, cwd=bdir, env=env, label='rebuild-game-ar-direct')
+                c.module_obj = clean_objs[0]
+                c.objects_rsp = rsp
+                if a.manifest and os.path.isfile(a.manifest):
+                    try:
+                        with open(a.manifest, encoding='utf-8') as mf: mdata = json.load(mf)
+                        mdata['module_obj'] = c.module_obj
+                        mdata['objects_rsp'] = rsp
+                        with open(a.manifest, 'w', encoding='utf-8') as mf: json.dump(mdata, mf, indent=2)
+                    except Exception:
+                        pass
+            extra = [c.module_obj] if c.module_obj else []
             if not os.path.isfile(arc or ''):
                 run.issue('GAME_ARCHIVE_MISSING', arc or '(none)')
         pie = link_pie(run, c, env, envinfo, rt_objs, extra, arc, pie)

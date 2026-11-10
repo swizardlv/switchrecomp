@@ -1006,7 +1006,7 @@ int plat_vm_commit(u8* p, u64 size){
     if(failed || made || calls<=32)
       LOG("mem: commit %llu KiB at %p -> granules %llx..%llx made=%d reused=%d failed=%d pt_used %u->%u\n",
           (unsigned long long)(size>>10),(void*)p,(unsigned long long)a0,
-          (unsigned long long)a1,made,reused,pt_before,(u32)g_ps5_pt_used); }
+          (unsigned long long)a1,made,reused,failed,pt_before,(u32)g_ps5_pt_used); }
   if(failed) return -1;
   /* Exact 4 KiB protection for just the requested slice. Newly mapped
      granules are already RW; this also restores previously PROT_NONE slices. */
