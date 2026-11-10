@@ -1428,27 +1428,26 @@ void swr_install_s2_hooks(void){
      ALL call sites at once (the material-stage reflection loop at 0x8864708 /
      99a6350, the shader-reflection lookup at 884f2c0, and any future one) without
      depending on a per-address dispatch hook that the JIT later overwrites.
-     Address note: 0x10000000000 == 64 GiB.  In Bananza's 39-bit layout the alias
-     logical window is [12 GiB, 76 GiB) (ALIAS_BASE=0x300000000, g_alias_size=64G),
-     so this page sits *inside* that window -- but the window is only backed per page
-     when the guest actually maps/aliases an address, and the crash at 0x10000000119
-     proved this page was unbacked (hence free).       mem_map therefore claims it
-     cleanly with no real allocation to collide with.  We cannot pick another
-     address: 0x10000000101 is a fixed SDK magic constant, so we must map exactly
-     the page that contains it.
-     IMPORTANT: by the time this runs the guest has already registered a MemBlock
-     that *covers* 64 GiB (so mem_map's mem_is_free() check rejects the request
-     and the original mem_map() call failed with "could not map").  That is fine:
-     the block list is only metadata for svcQueryMemory -- actual guest access is
+     Address note (corrected): 0x10000000000 == 1024 GiB == 1 TiB (2^40), NOT
+     64 GiB. The earlier note mis-converted the hex. This granule therefore sits
+     far ABOVE the main 128 GiB guest window (AS_SIZE = 2^37), so a plain commit
+     against the main window failed silently ("could not commit ... @ 10000000000"
+     in run 20261110). plat.c now serves it through an on-demand high-address
+     extension window: it reserves+commits one 2 MiB granule at the exact host
+     address g_mem + 0x10000000000 (a high-address MAP_FIXED reserve is supported,
+     per ps5_va_probe), counted against the same page-table budget. We cannot
+     pick another address: 0x10000000101 is a fixed SDK magic constant, so we
+     must map exactly the granule that contains it.
+     The block list is only metadata for svcQueryMemory -- actual guest access is
      gated purely by whether the host page is committed (RW), exactly like page 0
-     in mem_init().  So we bypass the block-list check and commit the host page
+     in mem_init(). So we bypass the block-list check and commit the host granule
      directly, which is what makes the deref read 0 instead of SIGSEGV'ing. */
   {
     u8* sp = GP(0x10000000000ull);
     if(plat_vm_commit(sp, 0x2000ull)==0)
-      LOG("hle: [S2] committed unbound-NVN-sentinel page @ 10000000000 (2 pages, zero)\n");
+      LOG("hle: [S2] committed unbound-NVN-sentinel page @ 10000000000 via high-address extension (zero)\n");
     else
-      WARN("hle: [S2] could not commit unbound-NVN-sentinel page @ 10000000000\n");
+      WARN("hle: [S2] could not commit unbound-NVN-sentinel page @ 10000000000 via extension\n");
   }
 }
 
