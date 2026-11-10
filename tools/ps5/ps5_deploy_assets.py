@@ -16,10 +16,17 @@ import hashlib
 import io
 import json
 import os
+import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ps5_env   # host/port settings come from <repo>/.env (see .env.example)
+
 FILES = ('icon0.png', 'pic0.dds', 'pic1.dds')
-DIRS = ('/mnt/usb1/PPSA99201/sce_sys', '/user/appmeta/PPSA99201')
+
+
+def target_dirs(title):
+    return ('/mnt/usb1/' + title + '/sce_sys', '/user/appmeta/' + title)
 
 
 def sha(data):
@@ -28,13 +35,13 @@ def sha(data):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--host', default='192.168.88.33')
-    ap.add_argument('--port', type=int, default=2121)
+    ap.add_argument('--host', default=ps5_env.PS5_HOST)
+    ap.add_argument('--port', type=int, default=ps5_env.PS5_FTP_PORT)
     ap.add_argument('--local-dir', required=True)
     ap.add_argument('--param-json', default='',
                     help='optional param.json to also push into sce_sys (home-screen titleName)')
     ap.add_argument('--run-dir', required=True)
-    ap.add_argument('--title', default='PPSA99201')
+    ap.add_argument('--title', default=ps5_env.PS5_TITLE_ID)
     a = ap.parse_args()
     os.makedirs(a.run_dir, exist_ok=True)
     backups = os.path.join(a.run_dir, 'backup')
@@ -64,8 +71,7 @@ def main():
     ftp.set_pasv(True)
     log('connected %s:%d' % (a.host, a.port))
     try:
-        for d in DIRS:
-            d = d.replace('PPSA99201', a.title)
+        for d in target_dirs(a.title):
             try:
                 ftp.cwd(d)
             except Exception as ex:

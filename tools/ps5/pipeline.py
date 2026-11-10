@@ -21,6 +21,8 @@ ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 sys.path.insert(0, HERE)
 sys.path.insert(0, ROOT)
 
+import ps5_env   # host/port settings come from <repo>/.env (see .env.example)
+
 DEFAULT_DUMPS = '/data/dumps'
 DEFAULT_WORK = '/data/switchrecomp'
 DEFAULT_SDK = '/data/code/EglantinePS5-build56/.deps/lapy-ps5-payload-sdk-v0.42'
@@ -754,8 +756,8 @@ def main():
     ap.add_argument('--max-compile-files', type=int, default=12, help='0 = all generated C files')
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--cc', default='')
-    ap.add_argument('--ps5-host', default='192.168.88.33')
-    ap.add_argument('--ps5-port', type=int, default=2121)
+    ap.add_argument('--ps5-host', default=ps5_env.PS5_HOST)
+    ap.add_argument('--ps5-port', type=int, default=ps5_env.PS5_FTP_PORT)
     ap.add_argument('--ps5-llvm-config', default='/data/toolchains/llvm-23.1.4/bin/llvm-config')
     ap.add_argument('--ps5-boilerplate', default='/data/code/ps5-native-app-boilerplate')
     ap.add_argument('--ps5-opt', default='0', help='-O level for the PS5 cross build')
@@ -763,7 +765,7 @@ def main():
     ap.add_argument('--ps5-timeout', type=int, default=3600)
     ap.add_argument('--ps5-game-dir', default='', help='optional real --target ps5 CLI build on this game folder')
     ap.add_argument('--ps5-title', default='swr_ps5')
-    ap.add_argument('--ps5-title-id', default='PPSA99201')
+    ap.add_argument('--ps5-title-id', default=ps5_env.PS5_TITLE_ID)
     ap.add_argument('--ps5-interp-only', action='store_true', help='fast CLI build without recompiling functions')
     a = ap.parse_args()
     a.games = [x for x in a.games.split(',') if x]

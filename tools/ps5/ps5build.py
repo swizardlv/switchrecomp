@@ -17,6 +17,9 @@ Modes:
 import argparse, glob, json, os, re, shutil, subprocess, sys, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ps5_env   # host/port settings come from <repo>/.env (see .env.example)
+
 RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', 'svc_fs', 'svc_vi',
                'nvdrv', 'gpu', 'gpu_engines', 'gpu_3d', 'loader', 'main', 'nup_ps5']
 # glibc_compat.c is Linux-only: it defines fmod/fmodf, which would become
@@ -193,12 +196,24 @@ def stage_env(run, a, env):
     return run.data['env']
 
 
+def get_git_hash(repo):
+    try:
+        r = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=repo,
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return 'unknown'
+
+
 def compile_one(job):
-    src, obj, sdk, repo, opt, env = job
+    src, obj, sdk, repo, opt, env, git_hash = job
     cmd = [os.path.join(sdk, 'bin', 'prospero-clang'), '-std=gnu17', '-O' + opt, '-w',
            '-fno-strict-aliasing', '-fwrapv', '-fPIC', '-fno-jump-tables',
            '-ffunction-sections', '-fdata-sections',
            '-DSWR_PS5', '-DSWR_NO_H264', '-DSWR_NO_OPUS',
+           '-DSWR_GIT_HASH="%s"' % git_hash,
            '-I', os.path.join(repo, 'runtime'),
            '-I', os.path.join(repo, 'runtime', 'bcn'),
            '-I', os.path.join(repo, 'runtime', 'spvc'),
@@ -223,13 +238,14 @@ def compile_one(job):
 def stage_runtime(run, a, env, objdir):
     s = 'runtime'
     os.makedirs(objdir, exist_ok=True)
+    git_hash = get_git_hash(a.repo)
     extras = EXTRA_PROBE if getattr(a, 'probe', False) else EXTRA
     srcs = [os.path.join(a.repo, 'runtime', n + '.c') for n in RUNTIME_SRC + extras]
     missing = [p for p in srcs if not os.path.isfile(p)]
     for p in missing:
         run.issue('RUNTIME_SRC_MISSING', p)
     srcs = [p for p in srcs if os.path.isfile(p)]
-    jobs = [(p, os.path.join(objdir, os.path.basename(p).replace('.c', '.o')), a.sdk, a.repo, a.opt, env)
+    jobs = [(p, os.path.join(objdir, os.path.basename(p).replace('.c', '.o')), a.sdk, a.repo, a.opt, env, git_hash)
             for p in srcs]
     results = []
     with ThreadPoolExecutor(max_workers=a.jobs) as pool:
@@ -244,9 +260,10 @@ def stage_runtime(run, a, env, objdir):
             groups[normalise(ln)] = groups.get(normalise(ln), 0) + 1
     ok = [r['obj'] for r in results if r['rc'] == 0]
     run.data['runtime'] = dict(sources=len(srcs), ok=len(ok), failed=len(srcs) - len(ok),
+                               git_hash=git_hash,
                                error_groups=sorted(groups.items(), key=lambda x: -x[1]),
                                per_file=[r for r in results if r['rc']])
-    run.log('INFO', 'runtime: %d/%d objects compiled, %d error shapes' % (len(ok), len(srcs), len(groups)))
+    run.log('INFO', 'runtime: %d/%d objects compiled (git=%s), %d error shapes' % (len(ok), len(srcs), git_hash, len(groups)))
     if not ok:
         run.issue('RUNTIME_NO_OBJECTS', 'no runtime object compiled', severity='ERROR')
         return []
@@ -263,9 +280,10 @@ def link_pie(run, a, env, envinfo, rt_objs, extra_objs, archive, outpath):
     s = 'link'
     lld = os.path.join(a.sdk, 'bin', 'prospero-lld')
     stubs = sorted(glob.glob(os.path.join(a.sdk, 'target', 'lib', '*.so')))
+    lld_opt_flags = ['--icf=all', '--gc-sections']
     cmd = [lld, '-T', envinfo['linker_script'], '--eh-frame-hdr',
-           '--version-script', envinfo['symbol_map'], '-e', '_start', '-o', outpath,
-           '--exclude-libs', 'ALL', ZSTD_LIB]
+           '--version-script', envinfo['symbol_map'], '-e', '_start'] + lld_opt_flags + [
+           '-o', outpath, '--exclude-libs', 'ALL', ZSTD_LIB]
     cmd += ['-u', 'swr_module_static']   # force the static hook even if archive-only
     cmd += list(extra_objs) + list(rt_objs)
     if archive:
@@ -278,7 +296,8 @@ def link_pie(run, a, env, envinfo, rt_objs, extra_objs, archive, outpath):
         if rsp and os.path.isfile(rsp):
             run.log('WARN', 'retrying link with direct object list from %s' % rsp)
             cmd2 = [lld, '-T', envinfo['linker_script'], '--eh-frame-hdr',
-                    '--version-script', envinfo['symbol_map'], '-e', '_start', '-o', outpath]
+                    '--version-script', envinfo['symbol_map'], '-e', '_start'] + lld_opt_flags + [
+                    '-o', outpath, '-u', 'swr_module_static']
             # objects.rsp already contains every game object (including
             # module.o), so extra_objs must not be repeated here. Its entries
             # are relative to the build dir -> run lld with that cwd.
@@ -292,7 +311,8 @@ def link_pie(run, a, env, envinfo, rt_objs, extra_objs, archive, outpath):
         return None
     run.data['link'] = dict(elf=outpath, size=os.path.getsize(outpath),
                             runtime_objects=len(rt_objs), extra_objects=len(extra_objs),
-                            archive=archive, stub_count=len(stubs))
+                            archive=archive, stub_count=len(stubs),
+                            lld_opt_flags=lld_opt_flags)
     return outpath
 
 
@@ -383,6 +403,26 @@ def stage_package(run, a, env, envinfo, fself):
 def stage_verify(run, a, env, envinfo, pie, fself):
     s = 'verify'
     v = {}
+    # 1. Verify code_*.c vs code_*.o completeness in full builds
+    if not getattr(a, 'smoke', False) and not getattr(a, 'probe', False):
+        bdir = getattr(a, 'build', '')
+        if bdir and os.path.isdir(bdir):
+            code_c = sorted(glob.glob(os.path.join(bdir, 'code_*.c')))
+            rsp = getattr(a, 'objects_rsp', '')
+            rsp_code_o = []
+            if rsp and os.path.isfile(rsp):
+                with open(rsp, encoding='utf-8', errors='replace') as rf:
+                    for ln in rf:
+                        tok = ln.strip().strip('"').strip("'")
+                        if tok.startswith('code_') and tok.endswith('.o'):
+                            rsp_code_o.append(tok)
+            v['code_c_count'] = len(code_c)
+            v['rsp_code_o_count'] = len(rsp_code_o)
+            if code_c and rsp_code_o and len(code_c) != len(rsp_code_o):
+                run.issue('GAME_OBJECTS_INCOMPLETE',
+                          'code_*.c count (%d) != objects.rsp code_*.o count (%d)' % (
+                              len(code_c), len(rsp_code_o)))
+
     if pie and os.path.isfile(pie):
         nm = os.path.join(a.sdk, 'bin', 'prospero-nm')
         r = run.cmd([nm, '--defined-only', pie], env=env, label='nm-defined')
@@ -400,6 +440,16 @@ def stage_verify(run, a, env, envinfo, pie, fself):
         if v['dlopen_undefined']:
             run.issue('DLOPEN_STILL_UNDEFINED', 'dlopen unresolved; static link path not taken', severity='WARN')
     if fself and os.path.isfile(fself) and envinfo['signer']:
+        fself_sz = os.path.getsize(fself)
+        max_mb = getattr(a, 'max_eboot_mb', 500)
+        v['fself_size'] = fself_sz
+        v['fself_size_mb'] = round(fself_sz / (1 << 20), 2)
+        v['max_eboot_mb'] = max_mb
+        if max_mb > 0 and fself_sz > (max_mb << 20):
+            run.issue('EBOOT_TOO_LARGE',
+                      'eboot.bin is %.1f MiB (> %d MiB OrbisOS FSELF loader safety limit; '
+                      'use --game-opt z or check for macro bloat in cpu.h)' % (
+                          fself_sz / (1 << 20), max_mb))
         r = run.cmd([envinfo['signer'], 'self', '--inspect', '--file', fself], env=env, label='self-inspect')
         v['inspect_rc'] = r['rc']
         v['inspect'] = (r['out'] + r['err'])[:2000]
@@ -408,9 +458,11 @@ def stage_verify(run, a, env, envinfo, pie, fself):
         if r['rc']:
             run.issue('SELF_INSPECT_FAILED', (r['err'] or r['out'])[-600:], severity='WARN')
     run.data['verify'] = v
-    run.log('INFO', 'verify: static_hook=%s swr_module=%s start=%s dlopen_undef=%s' % (
+    run.log('INFO', 'verify: static_hook=%s swr_module=%s start=%s dlopen_undef=%s eboot=%.1fMiB/%dMiB code_c=%s/%s' % (
         v.get('swr_module_static_defined'), v.get('swr_module_defined'),
-        v.get('_start_defined'), v.get('dlopen_undefined')))
+        v.get('_start_defined'), v.get('dlopen_undefined'),
+        v.get('fself_size_mb', 0.0), v.get('max_eboot_mb', 0),
+        v.get('rsp_code_o_count', '-'), v.get('code_c_count', '-')))
     return v
 
 
@@ -429,18 +481,20 @@ def report(run, a):
         d = run.data.get(k)
         if not d: continue
         if k == 'runtime':
-            lines.append('  runtime    : %d/%d objects, %d error shapes' % (d['ok'], d['sources'], len(d['error_groups'])))
+            lines.append('  runtime    : %d/%d objects (git=%s), %d error shapes' % (
+                d['ok'], d['sources'], d.get('git_hash', '?'), len(d['error_groups'])))
         elif k == 'link':
             lines.append('  PIE        : %s (%.1f MiB)' % (d['elf'], d['size'] / (1 << 20)))
         elif k == 'convert':
-            lines.append('  eboot.elf  : %d bytes' % d.get('converted_size', 0))
-            lines.append('  eboot.bin  : %d bytes' % d.get('fself_size', 0))
+            lines.append('  eboot.elf  : %d bytes (%.1f MiB)' % (d.get('converted_size', 0), d.get('converted_size', 0) / (1 << 20)))
+            lines.append('  eboot.bin  : %d bytes (%.1f MiB)' % (d.get('fself_size', 0), d.get('fself_size', 0) / (1 << 20)))
         elif k == 'package':
             lines.append('  app        : %s (%d items)' % (d['appdir'], len(d['items'])))
         elif k == 'verify':
-            lines.append('  symbols    : swr_module_static=%s swr_module=%s _start=%s dlopen_undef=%s' % (
+            lines.append('  symbols    : swr_module_static=%s swr_module=%s _start=%s dlopen_undef=%s eboot=%.1f/%d MiB' % (
                 d.get('swr_module_static_defined'), d.get('swr_module_defined'),
-                d.get('_start_defined'), d.get('dlopen_undefined')))
+                d.get('_start_defined'), d.get('dlopen_undefined'),
+                d.get('fself_size_mb', 0.0), d.get('max_eboot_mb', 0)))
         elif k == 'env':
             lines.append('  clang      : %s' % ' / '.join(d['clang']))
     lines.append('')
@@ -472,9 +526,13 @@ def main():
     ap.add_argument('--outdir', default='')
     ap.add_argument('--run-dir', default='')
     ap.add_argument('--opt', default='2')
+    ap.add_argument('--game-opt', default='',
+                    help='optimization level when recompiling game code_*.c (e.g. z for -Oz, s for -Os, defaults to --opt)')
+    ap.add_argument('--max-eboot-mb', type=int, default=500,
+                    help='maximum allowed eboot.bin size in MiB before verify fails (default: 500)')
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--backend', default='ps5')
-    ap.add_argument('--title-id', default='PPSA99201')
+    ap.add_argument('--title-id', default=ps5_env.PS5_TITLE_ID)
     ap.add_argument('--smoke', action='store_true')
     ap.add_argument('--probe', action='store_true',
                     help='build a tiny boot-probe title (same CRT/link/sign chain, ~MB eboot)')
@@ -486,7 +544,8 @@ def main():
     a = ap.parse_args()
 
     cfg = dict(repo=os.path.abspath(a.repo), sdk=a.sdk, llvm_config=a.llvm_config,
-               boilerplate=a.boilerplate, opt=a.opt, jobs=a.jobs, title='', ps5_title_id=a.title_id,
+               boilerplate=a.boilerplate, opt=a.opt, game_opt=a.game_opt or a.opt,
+               max_eboot_mb=a.max_eboot_mb, jobs=a.jobs, title='', ps5_title_id=a.title_id,
                display_title=a.display_title or '',
                appdir='', datadir='', archive='', module_obj='', objects_rsp='', smoke=a.smoke,
                probe=a.probe or a.va_probe, va_probe=a.va_probe,
@@ -500,6 +559,8 @@ def main():
         cfg['build'] = m.get('build', os.path.dirname(a.manifest))
     else:
         cfg['build'] = os.path.abspath(a.outdir or os.path.join('/data/switchrecomp', 'ps5build'))
+    if a.game_opt:
+        cfg['game_opt'] = a.game_opt
     cfg['run_dir'] = a.run_dir or os.path.join(cfg['build'], 'ps5')
     if not cfg['appdir']:
         cfg['appdir'] = os.path.join(cfg['run_dir'], 'app', cfg['ps5_title_id'])
@@ -507,10 +568,11 @@ def main():
     for k, v in cfg.items(): setattr(c, k, v)
     run = Run(c.run_dir)
     env = build_env(c.sdk, c.llvm_config)
+    git_hash = get_git_hash(c.repo)
     try:
-        run.log('INFO', 'ps5build start mode=%s repo=%s' % (
+        run.log('INFO', 'ps5build start mode=%s repo=%s git=%s' % (
             'probe' if c.probe else 'smoke' if c.smoke
-            else 'runtime-only' if c.runtime_only else 'full', c.repo))
+            else 'runtime-only' if c.runtime_only else 'full', c.repo, git_hash))
         envinfo = stage_env(run, c, env); run.stage['env'] = 'OK'
         objdir = os.path.join(c.run_dir, 'objects'); os.makedirs(objdir, exist_ok=True)
         rt_objs = stage_runtime(run, c, env, objdir)
@@ -536,7 +598,7 @@ def main():
                 probe_c = PROBE_C
             with open(probe, 'w') as f:
                 f.write(probe_c)
-            r = compile_one((probe, os.path.join(objdir, 'probe.o'), c.sdk, c.repo, c.opt, env))
+            r = compile_one((probe, os.path.join(objdir, 'probe.o'), c.sdk, c.repo, c.opt, env, git_hash))
             if r['rc']:
                 run.issue('PROBE_COMPILE_FAILED', r['tail'])
                 report(run, c); return 1
@@ -550,7 +612,7 @@ def main():
                 f.write('/* toolchain smoke: strong definitions of the static module hook */\n'
                         'const void* swr_module(void){ return (void*)0; }\n'
                         'const void* swr_module_static(void){ return (void*)0; }\n')
-            r = compile_one((smoke, os.path.join(objdir, 'smoke.o'), c.sdk, c.repo, c.opt, env))
+            r = compile_one((smoke, os.path.join(objdir, 'smoke.o'), c.sdk, c.repo, c.opt, env, git_hash))
             if r['rc']:
                 run.issue('SMOKE_COMPILE_FAILED', r['tail'])
                 report(run, c); return 1
@@ -559,43 +621,43 @@ def main():
         else:
             # Guard against the 1.27 GB eboot.bin bloat caused by inlining swr_mp
             # into every RD/WR macro across code_*.c (commit 5e0f3b8). If the
-            # existing libgame_code.a is > 900 MiB, restore from a pre-existing
-            # unbloated .o set in c.build (or recompile code_*.c with clean cpu.h).
-            # NOTE: the unbloated game archive is ~508 MiB; a 500 MiB threshold was
-            # too tight and deleted a good archive (GAME_ARCHIVE_MISSING). 900 MiB
-            # still catches the real ~1.9 GiB swr_mp-bloated archive.
+            # existing libgame_code.a is > 900 MiB (or --game-opt is explicitly requested),
+            # restore from a pre-existing unbloated .o set in c.build (or recompile code_*.c).
             arc = c.archive
-            if arc and os.path.isfile(arc) and os.path.getsize(arc) > (900 << 20):
+            force_game_recomp = bool(a.game_opt)
+            if arc and os.path.isfile(arc) and (os.path.getsize(arc) > (900 << 20) or force_game_recomp):
                 bdir = os.path.dirname(os.path.abspath(arc))
-                run.log('WARN', 'libgame_code.a is bloated (%.1f MiB > 500 MiB); rebuilding unbloated archive in %s' % (
-                    os.path.getsize(arc) / (1 << 20), bdir))
+                run.log('WARN', 'rebuilding game archive in %s (current size %.1f MiB, game_opt=-O%s)' % (
+                    bdir, os.path.getsize(arc) / (1 << 20), c.game_opt))
                 c_files = sorted(glob.glob(os.path.join(bdir, 'code_*.c')))
                 mod_c = os.path.join(bdir, 'module.c')
                 if os.path.isfile(mod_c):
                     c_files = [mod_c] + c_files
                 cand_sigs = []
-                for mo in glob.glob(os.path.join(bdir, 'module.*.o')):
-                    m_sig = re.match(r'^module\.([0-9a-f]{10})\.o$', os.path.basename(mo))
-                    if not m_sig:
-                        continue
-                    sig = m_sig.group(1)
-                    objs_for_sig = [os.path.splitext(cf)[0] + '.' + sig + '.o' for cf in c_files]
-                    if all(os.path.isfile(p) for p in objs_for_sig):
-                        tot_sz = sum(os.path.getsize(p) for p in objs_for_sig)
-                        if tot_sz < (450 << 20):
-                            cand_sigs.append((tot_sz, sig, objs_for_sig))
+                if not force_game_recomp:
+                    for mo in glob.glob(os.path.join(bdir, 'module.*.o')):
+                        m_sig = re.match(r'^module\.([0-9a-f]{10})\.o$', os.path.basename(mo))
+                        if not m_sig:
+                            continue
+                        sig = m_sig.group(1)
+                        objs_for_sig = [os.path.splitext(cf)[0] + '.' + sig + '.o' for cf in c_files]
+                        if all(os.path.isfile(p) for p in objs_for_sig):
+                            tot_sz = sum(os.path.getsize(p) for p in objs_for_sig)
+                            if tot_sz < (450 << 20):
+                                cand_sigs.append((tot_sz, sig, objs_for_sig))
                 if cand_sigs:
                     cand_sigs.sort(key=lambda x: x[0])
                     tot_sz, sig, clean_objs = cand_sigs[0]
                     run.log('INFO', 'restoring unbloated object set sig=%s (%d objects, %.1f MiB)' % (
                         sig, len(clean_objs), tot_sz / (1 << 20)))
                 else:
-                    sig = 'clean'
-                    run.log('INFO', 'recompiling %d game C files with restored cpu.h...' % len(c_files))
+                    sig = 'opt_' + str(c.game_opt)
+                    run.log('INFO', 'recompiling %d game C files with -O%s...' % (len(c_files), c.game_opt))
                     cc = os.path.join(c.sdk, 'bin', 'prospero-clang')
-                    flags = ['-O' + str(c.opt), '-fno-strict-aliasing', '-fwrapv', '-w',
+                    flags = ['-O' + str(c.game_opt), '-fno-strict-aliasing', '-fwrapv', '-w',
                              '-I', os.path.join(c.repo, 'runtime'),
                              '-foptimize-sibling-calls', '-fno-semantic-interposition',
+                             '-ffunction-sections', '-fdata-sections',
                              '-fPIC', '-fvisibility=hidden', '-fno-jump-tables',
                              '-DSWR_PS5', '-DSWR_NO_H264', '-DSWR_NO_OPUS']
                     def _comp_game(cf):

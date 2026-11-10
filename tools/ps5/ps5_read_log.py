@@ -11,12 +11,17 @@ import argparse
 import datetime
 import json
 import os
+import sys
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ps5_env   # host/port settings come from <repo>/.env (see .env.example)
+
 DIRS = (
     '/data/switchrecomp', '/devlog/system/sce_coredumps.0',
-    '/user/appmeta/PPSA99201', '/mnt/usb1/PPSA99201',
+    '/user/appmeta/' + ps5_env.PS5_TITLE_ID,
+    '/mnt/usb1/' + ps5_env.PS5_TITLE_ID,
     '/devlog/system', '/data',
 )
 FILES = (
@@ -75,8 +80,8 @@ def wfm_download(op, base, path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--host', default='192.168.88.33')
-    ap.add_argument('--port', type=int, default=8888)
+    ap.add_argument('--host', default=ps5_env.PS5_HOST)
+    ap.add_argument('--port', type=int, default=ps5_env.PS5_WFM_PORT)
     ap.add_argument('--run-dir', required=True)
     a = ap.parse_args()
     os.makedirs(a.run_dir, exist_ok=True)
@@ -115,7 +120,7 @@ def main():
     with open(os.path.join(a.run_dir, 'timeline.json'), 'w', encoding='utf-8') as fo:
         json.dump(out, fo, indent=2, ensure_ascii=False)
 
-    app = out['dirs'].get('/mnt/usb1/PPSA99201')
+    app = out['dirs'].get('/mnt/usb1/' + ps5_env.PS5_TITLE_ID)
     eboot = None
     if isinstance(app, list):
         eboot = next((e for e in app if e.get('name') == 'eboot.bin'), None)

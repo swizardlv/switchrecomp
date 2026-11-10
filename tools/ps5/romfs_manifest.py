@@ -25,10 +25,12 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import ps5_env   # host/port settings come from <repo>/.env (see .env.example)
+
 GUEST_ROOT = '/app0/swr_data/romfs'
 # /data is read-only to the console's FTP server (STOR -> 550).  The package
 # root is writable (that is how eboot.bin gets replaced), and /app0 maps to it.
-REMOTE_DIR = '/mnt/usb1/PPSA99201'
+REMOTE_DIR = ps5_env.PS5_FTP_DIR
 REMOTE_NAME = 'romfs_manifest.txt'
 DEFAULT_NUP = '/data/dumps/bananza/Donkey Kong BananzaUpdate3.2.0DLC.nup'
 
@@ -174,8 +176,8 @@ def main():
     ap.add_argument('--run-dir', required=True)
     ap.add_argument('--out', default='')
     ap.add_argument('--upload', action='store_true')
-    ap.add_argument('--host', default='192.168.88.33')
-    ap.add_argument('--port', type=int, default=2121)
+    ap.add_argument('--host', default=ps5_env.PS5_HOST)
+    ap.add_argument('--port', type=int, default=ps5_env.PS5_FTP_PORT)
     ap.add_argument('--remote-dir', default=REMOTE_DIR)
     a = ap.parse_args()
     run = Run(a.run_dir)

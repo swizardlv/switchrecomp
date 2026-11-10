@@ -9,11 +9,14 @@ text + JSON so the state can be audited without touching the console again.
     python3 tools/ps5/ps5_deploy_eboot.py --mode probe  --local <probe.bin> --run-dir <dir>
     python3 tools/ps5/ps5_deploy_eboot.py --mode restore --run-dir <dir>
 """
-import argparse, ftplib, hashlib, io, json, os, time
+import argparse, ftplib, hashlib, io, json, os, sys, time
 
-DEFAULT_HOST = '192.168.88.33'
-DEFAULT_PORT = 2121
-DEFAULT_DIR = '/mnt/usb1/PPSA99201'
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ps5_env   # host/port settings come from <repo>/.env (see .env.example)
+
+DEFAULT_HOST = ps5_env.PS5_HOST
+DEFAULT_PORT = ps5_env.PS5_FTP_PORT
+DEFAULT_DIR = ps5_env.PS5_FTP_DIR
 GAME = 'eboot.bin.game'
 
 

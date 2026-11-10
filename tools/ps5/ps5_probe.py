@@ -9,9 +9,13 @@ be re-checked without the console.
 
     python3 tools/ps5/ps5_probe.py --run-dir /data/switchrecomp/runs/<id>
 """
-import argparse, ftplib, io, json, os, re, socket, time, urllib.parse, urllib.request
+import argparse, ftplib, io, json, os, re, socket, sys, time, urllib.parse, urllib.request
 
-PORTS = (2121, 8888, 8084, 9295, 9999, 41800, 9081, 21, 80, 8080)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ps5_env   # host/port settings come from <repo>/.env (see .env.example)
+
+PORTS = (ps5_env.PS5_FTP_PORT, ps5_env.PS5_WFM_PORT,
+         8084, 9295, 9999, 41800, 9081, 21, 80, 8080)
 # Observed layout: the USB drive mounts at /mnt/usb1, homebrew titles installed
 # internally live in /data/homebrew/PPSAxxxxx, Eglantine keeps klog-ish text in
 # /data/eglantineps5/user/log, and /app0 only exists while a title is running.
@@ -231,9 +235,9 @@ def probe_ftp(run, host, port):
 def main():
     global APP_EBOOT_SIZE
     ap = argparse.ArgumentParser()
-    ap.add_argument('--host', default='192.168.88.33')
-    ap.add_argument('--ftp-port', type=int, default=2121)
-    ap.add_argument('--http-port', type=int, default=8888)
+    ap.add_argument('--host', default=ps5_env.PS5_HOST)
+    ap.add_argument('--ftp-port', type=int, default=ps5_env.PS5_FTP_PORT)
+    ap.add_argument('--http-port', type=int, default=ps5_env.PS5_WFM_PORT)
     ap.add_argument('--expected-eboot-size', type=int, default=APP_EBOOT_SIZE,
                     help='expected eboot.bin byte count (change when a probe eboot is deployed)')
     ap.add_argument('--run-dir', required=True)

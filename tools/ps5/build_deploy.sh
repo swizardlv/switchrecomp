@@ -6,7 +6,7 @@
 #   ./tools/ps5/build_deploy.sh --deploy-only   # 跳过编译, 仅部署已有 eboot (PS5 离线后补部署)
 #
 # 约定:
-#   * 253 是编译/部署机, PS5(192.168.88.33)需开机连网才能完成部署。
+#   * 253 是编译/部署机, PS5($PS5_HOST, 见 <repo>/.env)需开机连网才能完成部署。
 #   * 253 的 ps5 分支会与远端分叉, 不能用 git pull (non-fast-forward 失败),
 #     故用 git fetch + git reset --hard origin/ps5 对齐, 符合项目约定。
 #   * 默认 runtime-only 构建: 复用 libgame_code.a (游戏代码), 只重编 23 个 runtime 对象。
@@ -14,15 +14,15 @@
 #           需全量 switchrecomp 重建才会生效 (另行处理, 不在本脚本)。
 set -euo pipefail
 
-# ---- 配置 (如需改 build 目录, 改这里) ----
-REMOTE="swizard@192.168.88.253"
-CODE_DIR="/data/code/switchrecomp"                       # 253 上的代码根
-BUILD_DIR="/data/switchrecomp/ps5o2_fixed"               # 复用 0eb06fa 那次 build
+# ---- 配置 (主机/端口统一从 <repo>/.env 读取, 见 .env.example) ----
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+eval "$(python3 "$SCRIPT_DIR/ps5_env.py" --shell)"
+REMOTE="$DEV_SSH"
+CODE_DIR="$DEV_CODE_DIR"                                 # 253 上的代码根
+BUILD_DIR="$DEV_WORK_ROOT/ps5o2_fixed"                   # 复用 0eb06fa 那次 build
 MANIFEST="$BUILD_DIR/swr_bananza_ps5_o2_fixed_build/ps5_build_manifest.json"
-EBOOT="$BUILD_DIR/PPSA99201/eboot.bin"
-RUNS="/data/switchrecomp/runs"                           # 253 上的 run 日志目录
-PS5_HOST="192.168.88.33"
-PS5_FTP_PORT="2121"
+EBOOT="$BUILD_DIR/$PS5_TITLE_ID/eboot.bin"
+RUNS="$DEV_WORK_ROOT/runs"                               # 253 上的 run 日志目录
 
 DEPLOY_ONLY=0
 if [ "${1:-}" = "--deploy-only" ]; then DEPLOY_ONLY=1; fi

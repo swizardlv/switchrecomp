@@ -17,16 +17,16 @@
 #       若游戏没点/没重启, 拉到的可能是上一次 run 的旧日志 —— 点完再跑即可。
 set -uo pipefail
 
-# ---- 配置 ----
-PS5_HOST="192.168.88.33"
-PS5_WFM_PORT="8888"
-REMOTE="swizard@192.168.88.253"
-CODE_DIR="/data/code/switchrecomp"               # 253 上的代码根
-REMOTE_RUNS="/data/switchrecomp/runs"            # 253 上的 run 目录
-
-# 项目根 (动态解析, 不依赖 $HOME 具体路径)
+# ---- 配置 (统一从 <repo>/.env 读取, 见 .env.example) ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJ_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+eval "$(python3 "$SCRIPT_DIR/ps5_env.py" --shell)"
+# 可用变量: PS5_HOST PS5_FTP_PORT PS5_WFM_PORT PS5_TITLE_ID
+#           DEV_HOST DEV_USER DEV_SSH DEV_CODE_DIR DEV_WORK_ROOT
+REMOTE="$DEV_SSH"                                 # ssh/scp 目标
+CODE_DIR="$DEV_CODE_DIR"                          # 253 上的代码根
+REMOTE_RUNS="$DEV_WORK_ROOT/runs"                 # 253 上的 run 目录
+
 LOCAL_RUNS="$PROJ_ROOT/runs"
 RUN_ID="ps5log_$(date +%Y%m%d_%H%M%S)"
 

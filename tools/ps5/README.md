@@ -7,16 +7,38 @@
 |------|------|
 | `build_deploy.sh` | 在 253 编译机上同步代码、编译、部署 `eboot.bin` 到 PS5 |
 | `fetch_log.sh`    | 从 PS5 拉取一次运行日志回 Mac 本地，便于分析崩溃 |
+| `ps5_set_strict.py` | 通过 FTP 开关 PS5 上 `swr.ini` 的 `strict=1`（严格调试模式） |
+| `ps5_env.py`     | 所有工具的主机/端口配置加载器（读 `<repo>/.env`） |
 
 两个脚本都在 **Mac 终端**执行（SSH 到 253 已配置免密）。
 
 ---
 
+## 网络配置（.env）
+
+**所有工具的 PS5 / 253 地址一律从仓库根 `.env` 读取，不在脚本里硬编码。**
+
+```bash
+cp .env.example .env    # 首次；按你的局域网修改
+python3 tools/ps5/ps5_env.py --show   # 查看当前生效值与读取的文件
+```
+
+优先级（高 → 低）：**环境变量** > `.env.local`（本地私有覆盖，git 忽略）> `.env`（提交，局域网默认值）> `.env.example`（模板兜底）。
+`.env` / `.env.example` 会提交，这样 253 通过 `git reset --hard origin/ps5` 也能拿到同一份配置；只放 LAN 地址，不要放密钥（密钥放 `.env.local`）。
+
+可用变量：`PS5_HOST`、`PS5_FTP_PORT`、`PS5_WFM_PORT`、`PS5_TITLE_ID`、
+`DEV_HOST`、`DEV_USER`、`DEV_CODE_DIR`、`DEV_WORK_ROOT`（派生 `DEV_SSH`、`PS5_FTP_DIR`）。
+
+Shell 脚本用 `eval "$(python3 tools/ps5/ps5_env.py --shell)"` 加载；Python 脚本 `import ps5_env`。
+临时覆盖：`PS5_HOST=10.0.0.9 ./tools/ps5/fetch_log.sh` 或 `--host 10.0.0.9`。
+
+---
+
 ## 环境前提
 
-- Mac 可免密 SSH 到 253：`swizard@192.168.88.253`
+- Mac 可免密 SSH 到 253（`DEV_USER@DEV_HOST`，见 `.env`）
 - 253 已就绪：PS5 工具链（prospero-clang 等）+ 已生成的 `libgame_code.a`
-- PS5（`192.168.88.33`）在部署 / 取日志时需**开机并接入同一局域网**
+- PS5（`PS5_HOST`）在部署 / 取日志时需**开机并接入同一局域网**
 - Mac 本地有 `python3`（`fetch_log.sh` 直连分支用；若没有会自动改走 253 中转）
 
 ---

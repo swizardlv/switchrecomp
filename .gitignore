@@ -33,3 +33,7 @@ __pycache__/
 
 # console log pulls / build runs (large, machine-specific)
 runs/
+
+# host settings: .env / .env.example are committed (LAN addresses, no secrets);
+# .env.local is a per-machine private override and must never be committed.
+.env.local
