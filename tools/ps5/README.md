@@ -8,9 +8,15 @@
 | `build_deploy.sh` | 在 253 编译机上同步代码、编译、部署 `eboot.bin` 到 PS5 |
 | `fetch_log.sh`    | 从 PS5 拉取一次运行日志回 Mac 本地，便于分析崩溃 |
 | `ps5_set_strict.py` | 通过 FTP 开关 PS5 上 `swr.ini` 的 `strict=1`（严格调试模式） |
+| `run_linux_strict.sh` | 在 253 上跑原生 x86_64 Linux headless + `SWR_STRICT=1`，用 gdb/ASan 秒级定位 NVN 空对象根因 |
 | `ps5_env.py`     | 所有工具的主机/端口配置加载器（读 `<repo>/.env`） |
 
-两个脚本都在 **Mac 终端**执行（SSH 到 253 已配置免密）。
+脚本都在 **Mac 终端**执行（SSH 到 253 已配置免密）；`run_linux_strict.sh` 也可直接在 253 上运行。
+
+**代码同步约定**：`build_deploy.sh` 与 `run_linux_strict.sh` 一律用
+`git fetch origin ps5 && git reset --hard origin/ps5` 对齐 253，**不用 `git pull`、不用 rsync**。
+因此 Mac 上的改动必须先 `git commit` + `git push origin ps5`；`run_linux_strict.sh` 会在同步前
+检查未提交改动 / 未推送提交并中止（确需跳过用 `SKIP_SYNC_CHECK=1`）。
 
 ---
 
