@@ -1006,6 +1006,7 @@ static void s2_nvn_heal_pool(CPU* c){
    instead of 0 and fault at `RD64(x21+0x18)` (0x10000000119).  Keep page 0
    scrubbed to all-zero on HLE/SVC boundaries. */
 static inline void s2_scrub_null_page(void){
+  if(g_strict) return;   /* strict: never scrub; let NULL(+off) stay faulting */
   if(g_mem) memset(g_mem,0,0x10000);
 }
 
@@ -1036,6 +1037,9 @@ static void hle_s2_nvn_zero(CPU* c,u64 pc){
     LOG("hle: [S2] nvn call ZERO  x0=%llx x1=%llx x2=%llx lr=%llx\n",
         (unsigned long long)c->x[0],(unsigned long long)c->x[1],
         (unsigned long long)c->x[2],(unsigned long long)c->x[30]);
+  if(g_strict)
+    LOG("STRICT nvn ZERO -> 0  (caller treats this as a NULL object; next NULL(+off) use will fault) x0=%llx x1=%llx lr=%llx\n",
+        (unsigned long long)c->x[0],(unsigned long long)c->x[1],(unsigned long long)c->x[30]);
   c->x[0]=0; c->pc=c->x[30]; }
 static void hle_s2_nvn_obj(CPU* c,u64 pc){
   (void)pc;
@@ -1437,7 +1441,7 @@ void swr_install_s2_hooks(void){
   /* Bananza Switch 2 nn::oe graphics scale mode helper at 0xa966700:
      verifies `cmp w0, #10` (0x7100281f) at +0x10 and `cmp w0, #30` (0x7100781f)
      at +0x18 before hooking to hle_s2_true (returns 1 = Docked / 20). */
-  if(0xa966700ull>=g_code_lo && 0xa966720ull<g_code_hi &&
+  if(!g_strict && 0xa966700ull>=g_code_lo && 0xa966720ull<g_code_hi &&
      s2_guest_ok(0xa966710ull,12) &&
      gr32(0xa966710ull)==0x7100281fu && gr32(0xa966718ull)==0x7100781fu){
     g_disp[(0xa966700ull-g_code_lo)/4]=hle_s2_true;
@@ -1446,7 +1450,7 @@ void swr_install_s2_hooks(void){
   /* Bananza Switch 2 nn::oe::SetupGpuErrorHandler worker callback at 0xa966600:
      SetupGpuErrorHandler (0xa966560) registers 0xa966600 with RegisterSystemWorkerHandler;
      when invoked via BLR (CALLDYN), 0xa966624 calls nn::diag::detail::AbortImpl (runs 085900/092227). */
-  if(0xa966600ull>=g_code_lo && 0xa966628ull<g_code_hi &&
+  if(!g_strict && 0xa966600ull>=g_code_lo && 0xa966628ull<g_code_hi &&
      gr32(0xa966600ull)==0xd503237fu && gr32(0xa966620ull)==0xd65f0fffu){
     g_disp[(0xa966600ull-g_code_lo)/4]=hle_s2_ok;
     LOG("hle: [S2] hooked nn::oe GPU error worker callback @ a966600 -> stub_ok\n");
@@ -1457,7 +1461,7 @@ void swr_install_s2_hooks(void){
      reads a material-stage reflection object from x0 and crashes on a null /
      sentinel pointer; we return -1 (not-found) instead and run the real fn when
      x0 is a valid mapping. */
-  if(0x884f2c0ull>=g_code_lo && 0x884f2c0ull<g_code_hi &&
+  if(!g_strict && 0x884f2c0ull>=g_code_lo && 0x884f2c0ull<g_code_hi &&
      gr32(0x884f2c0ull)==0xd503237fu && gr32(0x884f2c0ull+0x1c)==0xf9406c16u){
     u64 slot=(0x884f2c0ull-g_code_lo)/4;
     g_s2_orig_gfb=g_disp[slot];
@@ -1470,7 +1474,7 @@ void swr_install_s2_hooks(void){
      interpreter-trampoline prologue (adrp 0xf00041f0): only hook when this
      address is the un-recompiled trampoline that crashes, never a real
      recompiled function on a different build / dump. */
-  if(0x99a6350ull>=g_code_lo && 0x99a6350ull<g_code_hi &&
+  if(!g_strict && 0x99a6350ull>=g_code_lo && 0x99a6350ull<g_code_hi &&
      gr32(0x99a6350ull)==0xf00041f0u){
     u64 slot=(0x99a6350ull-g_code_lo)/4;
     g_s2_orig_refl=g_disp[slot];

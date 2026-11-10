@@ -279,6 +279,7 @@ static void ini_apply(const char* k, const char* v){
        zeroed page 0, so the log shows where the bad pointer gets used. mario kart 8 wrote -1.0f at 0x98 and
        crashed way later reading it back */
     else if(!strcmp(k,"null_trap")){ g_opt_null_trap=atoi(v)==1; if(g_opt_null_trap && g_mem) plat_vm_readonly(g_mem,0x10000); }
+    else if(!strcmp(k,"strict")){ g_strict=atoi(v); }   /* debug: keep guest page 0 PROT_NONE (see rt.h) */
     else if(!strcmp(k,"memory_gb")){ extern int g_opt_mem_gb; g_opt_mem_gb=atoi(v); }
     else if(!strcmp(k,"heap_max_mb")){ extern u64 g_heap_max; g_heap_max=(u64)atoi(v)<<20; }
     { extern void lsfg_ini(const char*, const char*); lsfg_ini(k,v); }
@@ -544,7 +545,7 @@ int swr_main(int argc, char** argv){
 #endif
   char ini[1400];
   snprintf(ini,sizeof ini,"%s%s.ini",g_exedir,g_exename); ini_open(ini);
-  for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-v")) g_verbose=2; else if(!strncmp(argv[i],"--",2) && strchr(argv[i],'=')){ char k[256]; snprintf(k,sizeof k,"%s",argv[i]+2); char* e=strchr(k,'='); if(!e) continue; *e=0; backend_ini(k,e+1); if(!strcmp(k,"docked")) g_opt_docked=atoi(e+1); if(!strcmp(k,"fps_limit")){ g_opt_fps=atoi(e+1); if(g_opt_fps!=30 && g_opt_fps<60 && g_opt_fps!=0) g_opt_fps=60; } } }
+  for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-v")) g_verbose=2; else if(!strncmp(argv[i],"--",2) && strchr(argv[i],'=')){ char k[256]; snprintf(k,sizeof k,"%s",argv[i]+2); char* e=strchr(k,'='); if(!e) continue; *e=0; backend_ini(k,e+1); if(!strcmp(k,"docked")) g_opt_docked=atoi(e+1); if(!strcmp(k,"strict")) g_strict=atoi(e+1); if(!strcmp(k,"fps_limit")){ g_opt_fps=atoi(e+1); if(g_opt_fps!=30 && g_opt_fps<60 && g_opt_fps!=0) g_opt_fps=60; } } }
 #ifdef SWR_PS5
   snprintf(g_datadir,sizeof g_datadir,"/app0/swr_data/");
 #else

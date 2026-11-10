@@ -345,6 +345,7 @@ extern int g_frames;
 extern volatile u64 g_gpu_submits;
 void ini_load(const char* path);
 extern int g_opt_docked, g_opt_lang, g_opt_res, g_opt_fps, g_opt_vsync;
+extern int g_strict;   /* SWR_STRICT=1 / --strict=1: keep guest page 0 PROT_NONE so the first NULL(+off) deref faults instead of being masked (debug builds only) */
 
 /* ======================================================= hid / vi / nv */
 void hid_update(void);

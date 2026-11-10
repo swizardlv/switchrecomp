@@ -3,9 +3,11 @@
    Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
 /* guest address space. one big host reservation, guest address == offset into it. the block list (kept sorted) is
    only there for svcQueryMemory and friends */
+#include <stdlib.h>   /* getenv (SWR_STRICT) */
 #include "rt.h"
 
 u8* g_mem;
+int g_strict;   /* set from SWR_STRICT env / --strict=N; see rt.h */
 u64 g_heap_size, g_heap_max = 0x180000000ull;   /* heap cap: 6 GB */
 u64 g_alias_size=0x1000000000ull, g_stack_base=0x1300000000ull, g_kern_base=0x1400000000ull, g_kern_end=0x1800000000ull;
 int g_as36;
@@ -16,10 +18,15 @@ static PMutex g_memlock;
 
 void mem_init(void){
   pm_init(&g_memlock);
+  if(!g_strict) g_strict = getenv("SWR_STRICT")!=NULL;   /* debug-only: expose first NULL deref (--strict=N or SWR_STRICT=1) */
   g_mem = plat_vm_reserve(AS_SIZE);
   if(!g_mem) fatal("Could not reserve %llu GB of virtual memory for the game.", (unsigned long long)(AS_SIZE>>30));
-  /* page 0 is mapped and zeroed so a NULL(+off) read gives 0 instead of a crash */
-  plat_vm_commit(g_mem,0x10000);
+  /* page 0 is mapped and zeroed so a NULL(+off) read gives 0 instead of a crash.
+     In strict mode we deliberately skip this so the FIRST stray NULL(+off)
+     access faults immediately, pointing the backtrace straight at the stub that
+     returned 0 (see docs/ps5_blackscreen_triage_and_debug_strategy.md §5.2). */
+  if(!g_strict) plat_vm_commit(g_mem,0x10000);
+  else LOG("mem: strict mode ON -- guest page 0 left PROT_NONE (NULL(+off) will fault)\n");
 #ifdef SWR_PS5
   /* shared read-only zero page for unbound GPU sparse ranges (avoids fatal GPU faults) */
   if(mem_zero_page_init()!=0) WARN("mem: zero page init failed; unbound sparse ranges may fault\n");
