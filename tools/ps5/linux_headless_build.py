@@ -42,19 +42,36 @@ def get_git_hash():
 
 def find_zstd_flags():
     inc_flags = []
-    lib_flags = []
     if os.path.isdir('/usr/include') and os.path.isfile('/usr/include/zstd.h'):
         pass
     elif os.path.isdir(DEFAULT_ZSTD_INC):
         inc_flags = ['-I', DEFAULT_ZSTD_INC]
-    for cand in ('/usr/lib/x86_64-linux-gnu/libzstd.so', '/usr/lib64/libzstd.so',
-                 '/usr/lib/x86_64-linux-gnu/libzstd.a', '/usr/local/lib/libzstd.a'):
-        if os.path.isfile(cand):
-            lib_flags = ['-lzstd']
+
+    # `-lzstd` only resolves when the *dev* symlink libzstd.so exists. Ubuntu
+    # boxes with just libzstd1 installed ship libzstd.so.1 only, so link the file
+    # we actually found by absolute path (ld accepts that directly).
+    dirs = ('/usr/lib/x86_64-linux-gnu', '/lib/x86_64-linux-gnu',
+            '/usr/lib64', '/usr/local/lib', '/lib64')
+    found = None
+    for d in dirs:
+        for name in ('libzstd.so', 'libzstd.a'):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                found = p
+                break
+        if found:
             break
-    if not lib_flags:
-        lib_flags = ['-lzstd']
-    return inc_flags, lib_flags
+    if not found:                       # versioned runtime lib, e.g. libzstd.so.1.4.8
+        for d in dirs:
+            cands = sorted(glob.glob(os.path.join(d, 'libzstd.so.*')))
+            if cands:
+                found = cands[-1]
+                break
+    if found:
+        print('[linux-headless] zstd: linking %s' % found, flush=True)
+        return inc_flags, [found]
+    print('[linux-headless] zstd: no library found, hoping -lzstd resolves', flush=True)
+    return inc_flags, ['-lzstd']
 
 
 def compile_game_objs(cc, build_dir, obj_dir, opt, jobs):
