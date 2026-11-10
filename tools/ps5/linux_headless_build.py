@@ -202,10 +202,16 @@ def build_runtime_exe(cc, out_exe, rt_obj_dir, so_path, mod_obj, opt, asan, jobs
                      '-Wl,-u,swr_module_static']
     if asan:
         link_cmd += ['-fsanitize=address,undefined']
-    link_cmd += rt_objs + [so_path] + zstd_lib + ['-lpthread', '-ldl', '-lm']
+    # mod_obj (module.o) defines swr_module_static. The game code lives in a
+    # shared library here, and `-Wl,-u,swr_module_static` only forces extraction
+    # from a *static* archive -- with --as-needed the .so does not satisfy that
+    # strong reference. Link module.o into the executable directly (the same
+    # symbol also exists in the .so, which is harmless: the exe definition wins).
+    link_cmd += rt_objs + [mod_obj, so_path] + zstd_lib + ['-lpthread', '-ldl', '-lm']
     r = subprocess.run(link_cmd, capture_output=True, text=True, errors='replace')
     if r.returncode != 0:
-        raise SystemExit('linking %s failed:\n%s' % (out_exe, (r.stderr or r.stdout)[-2000:]))
+        raise SystemExit('linking %s failed:\ncmd: %s\n%s' % (
+            out_exe, ' '.join(link_cmd), (r.stderr or r.stdout)[-2000:]))
     os.chmod(out_exe, 0o755)
     print('[linux-headless] built executable: %s' % out_exe, flush=True)
 
