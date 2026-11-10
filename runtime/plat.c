@@ -547,6 +547,23 @@ static volatile u32 g_ps5_pt_used;
 /* Read-only shared zero page: GPU sparse ranges with nothing bound are mapped to
    it so a GPU read never hits a fatal page fault. */
 static u8* g_zero_page;
+/* Writable 4 KiB page that backs the NVN "unbound object" sentinel guest page
+   (guest 0x10000000000, 1 TiB). The exact host address g_mem+1 TiB cannot be
+   mapped on PS5 (sceKernelReserve 0x80020016, plain mmap EINVAL), so the MP()
+   macro redirects that guest page here instead. Writable so a stray store to an
+   unbound object does not crash; it only dirties this throwaway page. */
+u8* g_sentinel_page;
+/* Total number of guest accesses redirected to the sentinel backing page. */
+u64 g_sentinel_hits;
+
+/* Decrement the page-table count with an underflow guard. A real underflow can
+   only happen if a caller bypasses g_memlock (the bug that produced the
+   0xFFFFFFF0 readings); the guard keeps the count honest and logs the source. */
+static inline void ps5_pt_dec(const void* why){
+  u32 cur=__atomic_load_n(&g_ps5_pt_used,__ATOMIC_SEQ_CST);
+  if(cur==0){ LOG("mem: pt_used underflow PREVENTED at %p\n",why); return; }
+  __atomic_sub_fetch(&g_ps5_pt_used,1,__ATOMIC_SEQ_CST);
+}
 
 /* High-address extension windows. The main 128 GiB window only covers guest
    addresses < 128 GiB, but Switch 2 titles keep fixed pointers above that --
@@ -603,6 +620,20 @@ int mem_zero_page_init(void){
   return 0;
 }
 u8* mem_zero_page(void){ return g_zero_page; }
+
+/* Allocate one writable 4 KiB page that backs the 1 TiB NVN sentinel guest
+   page via MP() redirection. Returns 0 on success. */
+int mem_sentinel_page_init(void){
+  const u64 P=0x1000;
+  void* p=mmap(NULL,(size_t)P,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+  if(p==MAP_FAILED){ LOG("mem: sentinel page mmap FAILED errno=%d\n",errno); return -1; }
+  memset(p,0,P);
+  g_sentinel_page=(u8*)p;
+  LOG("mem: sentinel backing page ready at %p (4 KiB, writable) -> guest 10000000000 redirects here\n",
+      (void*)g_sentinel_page);
+  return 0;
+}
+u8* mem_sentinel_page(void){ return g_sentinel_page; }
 
 static int ps5_commit_granule(void* a){
   u64 G=SWR_PS5_VA_GRANULE;
@@ -683,7 +714,7 @@ static int ps5_ext_release(Ps5Ext* e){
     LOG("mem: ext munmap(%p) FAILED errno=%d\n",(void*)g0,errno);
     return 0;
   }
-  __atomic_sub_fetch(&g_ps5_pt_used,1,__ATOMIC_SEQ_CST);
+  ps5_pt_dec((void*)g0);
   LOG("mem: ext window RELEASED at %p -> pt_used now %u\n",(void*)g0,(u32)g_ps5_pt_used);
   e->addr=0;
   return 1;
@@ -1015,7 +1046,7 @@ void plat_vm_decommit(u8* p, u64 size){
           LOG("mem: decommit munmap(%p) FAILED errno=%d, keeping mapping\n",(void*)a,errno);
           continue;
         }
-        __atomic_sub_fetch(&g_ps5_pt_used,1,__ATOMIC_SEQ_CST);
+        ps5_pt_dec((void*)a);
         void* again=(void*)a;
         int rr=ps5_reserve_at((void*)a,G,MAP_FIXED,&again);
         ++released;

@@ -23,6 +23,8 @@ void mem_init(void){
 #ifdef SWR_PS5
   /* shared read-only zero page for unbound GPU sparse ranges (avoids fatal GPU faults) */
   if(mem_zero_page_init()!=0) WARN("mem: zero page init failed; unbound sparse ranges may fault\n");
+  /* writable backing page for the 1 TiB NVN unbound-object sentinel (MP redirect) */
+  if(mem_sentinel_page_init()!=0) WARN("mem: sentinel page init failed; unbound NVN object derefs may fault\n");
   { u32 u,l,w; plat_ps5_pt_stats(&u,&l,&w);
     LOG("mem: PS5 page-table budget ready: used=%u watermark=%u limit=%u\n",u,w,l); }
 #endif

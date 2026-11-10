@@ -140,6 +140,8 @@ void plat_ps5_pt_stats(u32* used, u32* limit, u32* watermark);
 int  mem_reclaim_pt(u32 target_watermark);
 int  mem_zero_page_init(void);
 u8*  mem_zero_page(void);
+int  mem_sentinel_page_init(void);
+u8*  mem_sentinel_page(void);
 #endif
 #define GP(a) (g_mem+(u64)(a))
 static inline u32 gr32(u64 a){ u32 v; memcpy(&v,GP(a),4); return v; }

@@ -78,7 +78,30 @@ typedef struct CPU {
 } CPU;
 
 /* ---- memory: base + addr, no page tables ---- */
+#ifdef SWR_PS5
+/* The NVN "unbound object" sentinel lives at guest 0x10000000000 (1 TiB), whose
+   exact host address (g_mem + 1 TiB = 1088 GiB) cannot be mapped on PS5. Redirect
+   accesses on that guest page to a dedicated writable zero page instead. The branch
+   is almost never taken, so it predicts away and costs one compare on the hot path. */
+extern u8* g_sentinel_page;
+extern u64 g_sentinel_hits;
+void logf_(int lvl, const char* fmt, ...);
+#define SWR_SENTINEL_GUEST_PAGE 0x10000000000ull
+SWR_INLINE u8* swr_mp(u8* M, u64 a){
+  if((a & ~(u64)0xFFF) == SWR_SENTINEL_GUEST_PAGE){
+    u64 n = __atomic_add_fetch(&g_sentinel_hits, 1, __ATOMIC_RELAXED);
+    if(n <= 8 || (n & 0xFFFF) == 0)
+      logf_(1, "mem: MP sentinel redirect #%llu guest=0x%llx off=0x%llx\n",
+            (unsigned long long)n, (unsigned long long)a,
+            (unsigned long long)(a & 0xFFF));
+    return g_sentinel_page + (a & 0xFFF);
+  }
+  return M + a;
+}
+#define MP(a)    swr_mp(M, (u64)(a))
+#else
 #define MP(a)    (M + (u64)(a))
+#endif
 #define RD8(a)   (*(u8*)MP(a))
 #define RD16(a)  (*(u16*)MP(a))
 #define RD32(a)  (*(u32*)MP(a))

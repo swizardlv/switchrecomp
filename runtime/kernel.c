@@ -1443,11 +1443,17 @@ void swr_install_s2_hooks(void){
      in mem_init(). So we bypass the block-list check and commit the host granule
      directly, which is what makes the deref read 0 instead of SIGSEGV'ing. */
   {
-    u8* sp = GP(0x10000000000ull);
-    if(plat_vm_commit(sp, 0x2000ull)==0)
-      LOG("hle: [S2] committed unbound-NVN-sentinel page @ 10000000000 via high-address extension (zero)\n");
+    /* The host address g_mem + 1 TiB (1088 GiB) cannot be mapped on PS5:
+       sceKernelReserveVirtualRange returns 0x80020016 and a plain mmap returns
+       EINVAL (runs 092227 / 092829). Instead of mapping the exact address, the
+       MP() macro in cpu.h redirects every access on guest page 0x10000000000 to
+       the writable g_sentinel_page allocated in mem_sentinel_page_init(). Nothing
+       to commit here; just confirm the backing page is live. */
+    if(mem_sentinel_page()!=0)
+      LOG("hle: [S2] unbound-NVN-sentinel guest page 10000000000 served via MP redirect (backing %p)\n",
+          (void*)mem_sentinel_page());
     else
-      WARN("hle: [S2] could not commit unbound-NVN-sentinel page @ 10000000000 via extension\n");
+      WARN("hle: [S2] sentinel backing page missing; unbound NVN object derefs may fault\n");
   }
 }
 
