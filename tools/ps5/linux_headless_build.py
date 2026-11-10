@@ -14,7 +14,7 @@ Usage on 253:
       --out-dir   /data/switchrecomp/linux_strict
 """
 import argparse, glob, hashlib, os, shutil, subprocess, sys, time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 RT = os.path.join(REPO, 'runtime')
@@ -98,8 +98,14 @@ def compile_game_objs(cc, build_dir, obj_dir, opt, jobs):
             os.replace(tmp, obj)
             return obj
 
+        # pool.map() yields in *input* order: one slow translation unit (a 4 MB
+        # generated code_*.c can take ~40 min at -O1) stalls the progress counter
+        # while the other workers keep producing .o files. Count real completions
+        # with as_completed() so the log reflects actual progress.
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            for _ in pool.map(_one, to_build):
+            futs = [pool.submit(_one, item) for item in to_build]
+            for fut in as_completed(futs):
+                fut.result()          # propagate compile errors like pool.map did
                 done[0] += 1
                 if done[0] % 25 == 0 or done[0] == len(to_build):
                     print('  game objs: %d/%d (%.1fs)' % (done[0], len(to_build), time.time() - t0), flush=True)
