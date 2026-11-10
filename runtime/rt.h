@@ -134,6 +134,13 @@ u64  mem_find_free(u64 lo, u64 hi, u64 size, u64 align);
 u64  kmem_alloc(u64 size, u32 state, u32 perm);                   /* reserved for the kernel */
 u64  mem_heap_set(u64 size);
 extern u64 g_heap_size, g_heap_max;
+#ifdef SWR_PS5
+/* PS5 page-table budget + shared zero page (see plat.c, mem.c) */
+void plat_ps5_pt_stats(u32* used, u32* limit, u32* watermark);
+int  mem_reclaim_pt(u32 target_watermark);
+int  mem_zero_page_init(void);
+u8*  mem_zero_page(void);
+#endif
 #define GP(a) (g_mem+(u64)(a))
 static inline u32 gr32(u64 a){ u32 v; memcpy(&v,GP(a),4); return v; }
 

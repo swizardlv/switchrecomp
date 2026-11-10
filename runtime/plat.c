@@ -530,15 +530,55 @@ void ps5_free_large(void* p, u64 size){
    Track which granules already have a mapping so a later commit for a
    neighbouring guest page does not replace an existing mapping (which would
    silently reset its mprotect permissions). */
-#define SWR_PS5_MAX_GRANULES 65536u          /* 128 GiB / 2 MiB */
+#define SWR_PS5_MAX_GRANULES 65536u          /* VA window index cap: 128 GiB / 2 MiB */
+#define SWR_PS5_SUBPAGE      0x1000ull       /* 4 KiB guest subpage */
+#define SWR_PS5_SUBS_PER_G   (SWR_PS5_VA_GRANULE/SWR_PS5_SUBPAGE)  /* 512 subpages per granule */
+#define SWR_PS5_PT_LIMIT     16384u          /* hardware CPU page-table hard cap (one per 2 MiB map) */
+#define SWR_PS5_PT_WATERMARK 14336u          /* safety watermark, leaves headroom for GPU/JIT/system */
+
 static u8* g_ps5_win;
 static u64 g_ps5_win_size;
-static u8  g_ps5_commit[SWR_PS5_MAX_GRANULES/8];
+/* One 512-bit bitmap per granule: which 4 KiB subpages are currently backed.
+   65536 * 64 B = 4 MiB of BSS. Replaces the old 1-bit "ever committed" bitmap,
+   which could not tell a live granule from an empty one. */
+static u8  g_ps5_sub[SWR_PS5_MAX_GRANULES][SWR_PS5_SUBS_PER_G/8];
+/* Live count of granules that actually occupy a CPU page table (hardware-capped). */
+static volatile u32 g_ps5_pt_used;
+/* Read-only shared zero page: GPU sparse ranges with nothing bound are mapped to
+   it so a GPU read never hits a fatal page fault. */
+static u8* g_zero_page;
 
 static void ps5_window_set(u8* base, u64 size){
   g_ps5_win=base; g_ps5_win_size=size;
-  memset(g_ps5_commit,0,sizeof g_ps5_commit);
+  memset(g_ps5_sub,0,sizeof g_ps5_sub);
+  g_ps5_pt_used=0;
+  LOG("mem: window set base=%p size=%llu MiB; subpage bitmap %zu KiB, pt_used reset to 0\n",
+      (void*)base,(unsigned long long)(size>>20),(size_t)(sizeof g_ps5_sub>>10));
 }
+
+/* Stats entry for overlay/log: current page-table usage, hard limit, watermark. */
+void plat_ps5_pt_stats(u32* used, u32* limit, u32* wm){
+  if(used)  *used  = g_ps5_pt_used;
+  if(limit) *limit = SWR_PS5_PT_LIMIT;
+  if(wm)    *wm    = SWR_PS5_PT_WATERMARK;
+}
+
+/* Allocate one read-only 2 MiB shared zero page at startup. Returns 0 on success. */
+int mem_zero_page_init(void){
+  const u64 G=SWR_PS5_VA_GRANULE;
+  void* z=mmap(NULL,(size_t)G,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+  if(z==MAP_FAILED){ LOG("mem: zero page mmap FAILED errno=%d\n",errno); return -1; }
+  memset(z,0,G);
+  if(mprotect(z,(size_t)G,PROT_READ)){
+    LOG("mem: zero page mprotect(PROT_READ) FAILED errno=%d\n",errno);
+    munmap(z,(size_t)G); return -1;
+  }
+  g_zero_page=(u8*)z;
+  LOG("mem: shared zero page ready at %p (%llu KiB, read-only)\n",
+      (void*)g_zero_page,(unsigned long long)(G>>10));
+  return 0;
+}
+u8* mem_zero_page(void){ return g_zero_page; }
 
 static int ps5_commit_granule(void* a){
   u64 G=SWR_PS5_VA_GRANULE;
@@ -778,32 +818,67 @@ u8* plat_vm_reserve(u64 size){
 
 void plat_vm_readonly(u8* p, u64 size){ mprotect(p,size,PROT_READ); }
 
+#ifdef SWR_PS5
+static int ps5_granule_empty(u64 gi){
+  for(int b=0;b<SWR_PS5_SUBS_PER_G/8;++b)
+    if(g_ps5_sub[gi][b]) return 0;
+  return 1;
+}
+#endif
+
 int plat_vm_commit(u8* p, u64 size){
 #ifdef SWR_PS5
   if(!size) return 0;
-  const u64 G=SWR_PS5_VA_GRANULE;
+  const u64 G=SWR_PS5_VA_GRANULE, SP=SWR_PS5_SUBPAGE;
   u64 lo=(u64)(uintptr_t)p, hi=lo+size;
   u64 a0=lo & ~(G-1), a1=(hi+G-1)&~(G-1);
   u64 win=(u64)(uintptr_t)g_ps5_win;
   int made=0, reused=0, failed=0;
+  u32 pt_before=g_ps5_pt_used;
   for(u64 a=a0; a<a1; a+=G){
-    if(!win || a<win || a>=win+g_ps5_win_size){ ++failed; break; }
+    if(!win || a<win || a>=win+g_ps5_win_size){ ++failed; LOG("mem: commit OUT OF WINDOW at %p\n",(void*)a); break; }
     u64 idx=(a-win)/G;
-    if(idx>=SWR_PS5_MAX_GRANULES){ ++failed; break; }
-    if(g_ps5_commit[idx>>3] & (u8)(1u<<(idx&7))){ ++reused; continue; }
-    if(ps5_commit_granule((void*)a)){
-      if(!failed) LOG("mem: commit granule mmap(%p,%llu KiB) FAILED errno=%d\n",
-                      (void*)a,(unsigned long long)(G>>10),errno);
-      ++failed; break;
+    if(idx>=SWR_PS5_MAX_GRANULES){ ++failed; LOG("mem: commit granule index %llu >= cap\n",(unsigned long long)idx); break; }
+    int was_empty=ps5_granule_empty(idx);
+    if(was_empty){
+      u32 cur=__atomic_load_n(&g_ps5_pt_used,__ATOMIC_SEQ_CST);
+      if(cur>=SWR_PS5_PT_LIMIT){
+        ++failed;
+        LOG("mem: commit PT HARD LIMIT reached used=%u limit=%u at %p -> failing for OOM recovery\n",
+            cur,SWR_PS5_PT_LIMIT,(void*)a);
+        break;
+      }
+      if(cur>=SWR_PS5_PT_WATERMARK){
+        LOG("mem: commit at watermark used=%u wm=%u, invoking reclaim\n",cur,SWR_PS5_PT_WATERMARK);
+        if(mem_reclaim_pt(SWR_PS5_PT_WATERMARK)!=0)
+          LOG("mem: reclaim could not drop below watermark (used=%u), continuing while under hard limit\n",
+              (u32)g_ps5_pt_used);
+      }
+      if(ps5_commit_granule((void*)a)){
+        ++failed;
+        LOG("mem: commit granule mmap(%p,%llu KiB) FAILED errno=%d\n",
+            (void*)a,(unsigned long long)(G>>10),errno);
+        break;
+      }
+      __atomic_add_fetch(&g_ps5_pt_used,1,__ATOMIC_SEQ_CST);
+      ++made;
+      LOG("mem: commit NEW granule %p idx=%llu -> pt_used now %u\n",
+          (void*)a,(unsigned long long)idx,(u32)g_ps5_pt_used);
+    } else {
+      ++reused;
     }
-    g_ps5_commit[idx>>3]|=(u8)(1u<<(idx&7));
-    ++made;
+    /* mark the 4 KiB subpages this request covers inside the granule */
+    u64 s_lo=(a>lo?a:lo)-a, s_hi=(a+G<hi?a+G:hi)-a;
+    for(u64 s=s_lo;s<s_hi;s+=SP){
+      u32 bit=(u32)(s/SP);
+      g_ps5_sub[idx][bit>>3]|=(u8)(1u<<(bit&7));
+    }
   }
   { static u32 calls=0; ++calls;
     if(failed || made || calls<=32)
-      LOG("mem: commit %llu KiB at %p -> granules %llx..%llx made=%d reused=%d failed=%d\n",
+      LOG("mem: commit %llu KiB at %p -> granules %llx..%llx made=%d reused=%d failed=%d pt_used %u->%u\n",
           (unsigned long long)(size>>10),(void*)p,(unsigned long long)a0,
-          (unsigned long long)a1,made,reused,failed); }
+          (unsigned long long)a1,made,reused,pt_before,(u32)g_ps5_pt_used); }
   if(failed) return -1;
   /* Exact 4 KiB protection for just the requested slice. Newly mapped
      granules are already RW; this also restores previously PROT_NONE slices. */
@@ -821,14 +896,45 @@ int plat_vm_commit(u8* p, u64 size){
 void plat_vm_decommit(u8* p, u64 size){
 #ifdef SWR_PS5
   if(!size) return;
-  /* Keep the granule mapping: a neighbouring guest page may share that 2 MiB
-     block, and munmap()-ing it would destroy that page. Discard the backing
-     pages and drop protection instead; the next commit reuses the granule and
-     only mprotect()s the slice back to RW. */
-  int ma=madvise(p,(size_t)size,MADV_DONTNEED);
-  int mp=mprotect(p,(size_t)size,PROT_NONE);
-  LOG("mem: decommit %llu KiB at %p madvise=%d mprotect=%d errno=%d\n",
-      (unsigned long long)(size>>10),(void*)p,ma,mp,errno);
+  const u64 G=SWR_PS5_VA_GRANULE, SP=SWR_PS5_SUBPAGE;
+  u64 win=(u64)(uintptr_t)g_ps5_win;
+  u64 lo=(u64)(uintptr_t)p, hi=lo+size;
+  u64 a0=lo & ~(G-1), a1=(hi+G-1)&~(G-1);
+  int released=0, partial=0;
+  for(u64 a=a0;a<a1;a+=G){
+    if(!win || a<win || a>=win+g_ps5_win_size){ LOG("mem: decommit OUT OF WINDOW at %p\n",(void*)a); break; }
+    u64 idx=(a-win)/G;
+    if(idx>=SWR_PS5_MAX_GRANULES){ LOG("mem: decommit granule index %llu >= cap\n",(unsigned long long)idx); break; }
+    /* clear the 4 KiB subpages this release covers */
+    u64 s_lo=(a>lo?a:lo)-a, s_hi=(a+G<hi?a+G:hi)-a;
+    for(u64 s=s_lo;s<s_hi;s+=SP){
+      u32 bit=(u32)(s/SP);
+      g_ps5_sub[idx][bit>>3]&=(u8)~(1u<<(bit&7));
+    }
+    if(ps5_granule_empty(idx)){
+      /* whole granule empty: free the page table, then restore a PROT_NONE
+         reservation at the same address so the window stays contiguous. */
+      madvise((void*)a,G,MADV_DONTNEED);
+      if(munmap((void*)a,G)!=0){
+        LOG("mem: decommit munmap(%p) FAILED errno=%d, keeping mapping\n",(void*)a,errno);
+        continue;
+      }
+      __atomic_sub_fetch(&g_ps5_pt_used,1,__ATOMIC_SEQ_CST);
+      void* again=(void*)a;
+      int rr=ps5_reserve_at((void*)a,G,MAP_FIXED,&again);
+      ++released;
+      LOG("mem: decommit granule %p fully empty -> munmap+re-reserve rc=%d addr=%p, pt_used now %u\n",
+          (void*)a,rr,again,(u32)g_ps5_pt_used);
+    } else {
+      /* partial release: keep the granule mapped, discard backing, drop protection */
+      madvise(p,(size_t)size,MADV_DONTNEED);
+      mprotect(p,(size_t)size,PROT_NONE);
+      ++partial;
+    }
+  }
+  LOG("mem: decommit %llu KiB at %p -> granules %llx..%llx released=%d partial=%d pt_used now %u\n",
+      (unsigned long long)(size>>10),(void*)p,(unsigned long long)a0,
+      (unsigned long long)a1,released,partial,(u32)g_ps5_pt_used);
 #else
   madvise(p,size,MADV_DONTNEED); mprotect(p,size,PROT_NONE);
 #endif
