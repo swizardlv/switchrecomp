@@ -641,14 +641,24 @@ static Ps5Ext* ps5_ext_ensure(u64 a){
     if(g_ps5_ext[i].addr!=0) continue;
     void* want=(void*)g0;
     int rr=ps5_reserve_at((void*)g0,G,MAP_FIXED,&want);
-    if(rr || want!=(void*)g0){
-      LOG("mem: ext reserve(%p) FAILED rc=%d got=%p\n",(void*)g0,rr,want);
-      return NULL;
+    int mapped=0;
+    if(rr==0 && want==(void*)g0){
+      mapped=1;
+    } else {
+      /* sceKernelReserve rejected the high address (0x80020016 on 1088 GiB).
+         Try a plain mmap(MAP_FIXED) directly: x86_64 user VA reaches 48 bits,
+         so the address may be mappable even outside the reserve helper range. */
+      LOG("mem: ext reserve(%p) rc=%d, trying plain mmap MAP_FIXED\n",(void*)g0,rr);
+      void* m=mmap((void*)g0,G,PROT_READ|PROT_WRITE,
+                   MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+      if(m!=(void*)g0){
+        LOG("mem: ext plain mmap(%p) FAILED errno=%d\n",(void*)g0,errno);
+        return NULL;
+      }
+      mapped=1;
     }
-    if(ps5_commit_granule((void*)g0)){
-      LOG("mem: ext commit(%p) FAILED\n",(void*)g0);
-      void* again=(void*)g0;
-      ps5_reserve_at((void*)g0,G,MAP_FIXED,&again);   /* restore the empty reservation */
+    if(!mapped){
+      LOG("mem: ext could not map %p (reserve rc=%d)\n",(void*)g0,rr);
       return NULL;
     }
     g_ps5_ext[i].addr=g0;
