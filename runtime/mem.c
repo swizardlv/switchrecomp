@@ -27,11 +27,12 @@ void mem_init(void){
      returned 0 (see docs/ps5_blackscreen_triage_and_debug_strategy.md §5.2). */
   if(!g_strict) plat_vm_commit(g_mem,0x10000);
   else LOG("mem: strict mode ON -- guest page 0 left PROT_NONE (NULL(+off) will fault)\n");
+  /* writable backing page for the 1 TiB NVN unbound-object sentinel (MP redirect);
+     in strict mode, keep it PROT_NONE so dereferencing 0x10000000101 faults at the first use. */
+  if(mem_sentinel_page_init()!=0) WARN("mem: sentinel page init failed; unbound NVN object derefs may fault\n");
 #ifdef SWR_PS5
   /* shared read-only zero page for unbound GPU sparse ranges (avoids fatal GPU faults) */
   if(mem_zero_page_init()!=0) WARN("mem: zero page init failed; unbound sparse ranges may fault\n");
-  /* writable backing page for the 1 TiB NVN unbound-object sentinel (MP redirect) */
-  if(mem_sentinel_page_init()!=0) WARN("mem: sentinel page init failed; unbound NVN object derefs may fault\n");
   { u32 u,l,w; plat_ps5_pt_stats(&u,&l,&w);
     LOG("mem: PS5 page-table budget ready: used=%u watermark=%u limit=%u\n",u,w,l); }
 #endif

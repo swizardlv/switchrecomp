@@ -170,8 +170,11 @@ void kernel_run_main(u64 entry, u64 stack_size, int prio, int core){
   kthread_start(t);
 }
 
+void nvn_dump_census(void);
+
 void process_exit(int code){
   g_exiting=1; LOG("The game exited (code %d)\n",code);
+  nvn_dump_census();
   fflush(NULL); exit(code);
 }
 
@@ -1017,11 +1020,79 @@ static u64 s2_zero_obj_addr(void){
   return zva? zva : s2_nvn_scratch_addr();
 }
 
+/* NVN 2 lookup & call census: records every NVN function name requested via
+   nvnBootstrapLoader or nvnDeviceGetProcAddress, the slot kind it was mapped to
+   (TRUE/ZERO/PROC/OBJ/INT/SIZE/ACQ), how many times it was looked up, and the
+   caller LR, plus per-kind runtime call totals.  Dumped on crash, svcBreak,
+   process_exit, and the 12-second frontend census so a single run reveals the
+   complete NVN 2 surface and highlights every function returning ZERO/NULL. */
+typedef struct {
+  char nm[96];
+  const char* kind;
+  u64 slot;
+  u64 first_lr;
+  u32 lookups;
+} S2NvnCensusEnt;
+static S2NvnCensusEnt g_nvn_census[512];
+static u32 g_nvn_census_n;
+static u32 g_nvn_kind_calls[7]; /* 0:TRUE 1:ZERO 2:PROC 3:OBJ 4:INT 5:SIZE 6:ACQ */
+
+static const char* s2_nvn_slot_kind_name(u64 slot){
+  if(slot && slot==g_nvn_slot_true) return "TRUE";
+  if(slot && slot==g_nvn_slot_zero) return "ZERO";
+  if(slot && slot==g_nvn_slot_proc) return "PROC";
+  if(slot && slot==g_nvn_slot_obj)  return "OBJ";
+  if(slot && slot==g_nvn_slot_int)  return "INT";
+  if(slot && slot==g_nvn_slot_size) return "SIZE";
+  if(slot && slot==g_nvn_slot_acq)  return "ACQ";
+  return "TRUE";
+}
+
+static void s2_nvn_record_lookup(const char* nm, int ok, u64 slot, u64 lr){
+  const char* key = (ok && nm && nm[0]) ? nm : "<?>";
+  u32 n = __atomic_load_n(&g_nvn_census_n, __ATOMIC_RELAXED);
+  u32 lim = n < 512 ? n : 512;
+  for(u32 i=0; i<lim; i++){
+    if(!strncmp(g_nvn_census[i].nm, key, sizeof(g_nvn_census[i].nm)-1)){
+      __atomic_fetch_add(&g_nvn_census[i].lookups, 1, __ATOMIC_RELAXED);
+      return;
+    }
+  }
+  if(n >= 512) return;
+  u32 idx = __atomic_fetch_add(&g_nvn_census_n, 1, __ATOMIC_RELAXED);
+  if(idx < 512){
+    strncpy(g_nvn_census[idx].nm, key, sizeof(g_nvn_census[idx].nm)-1);
+    g_nvn_census[idx].nm[sizeof(g_nvn_census[idx].nm)-1] = 0;
+    g_nvn_census[idx].kind = s2_nvn_slot_kind_name(slot);
+    g_nvn_census[idx].slot = slot;
+    g_nvn_census[idx].first_lr = lr;
+    g_nvn_census[idx].lookups = 1;
+  }
+}
+
+void nvn_dump_census(void){
+  u32 n = __atomic_load_n(&g_nvn_census_n, __ATOMIC_RELAXED);
+  u32 lim = n < 512 ? n : 512;
+  LOG("nvn: census lookups=%u total_calls=%u (TRUE=%u ZERO=%u PROC=%u OBJ=%u INT=%u SIZE=%u ACQ=%u) distinct_procs=%u\n",
+      g_nvn_lookups, g_nvn_calls,
+      g_nvn_kind_calls[0], g_nvn_kind_calls[1], g_nvn_kind_calls[2],
+      g_nvn_kind_calls[3], g_nvn_kind_calls[4], g_nvn_kind_calls[5],
+      g_nvn_kind_calls[6], lim);
+  for(u32 i=0; i<lim; i++){
+    LOG("  nvn[%3u] %-5s x%-4u %-56s first_lr=%llx%s\n",
+        i, g_nvn_census[i].kind ? g_nvn_census[i].kind : "?",
+        g_nvn_census[i].lookups, g_nvn_census[i].nm,
+        (unsigned long long)g_nvn_census[i].first_lr,
+        gsym(g_nvn_census[i].first_lr));
+  }
+}
+
 static void hle_s2_nvn_true(CPU* c,u64 pc){
   (void)pc;
   s2_scrub_null_page();
   s2_nvn_heal_pool(c);
   s2_nvn_track_init(c);
+  __atomic_fetch_add(&g_nvn_kind_calls[0],1,__ATOMIC_RELAXED);
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
   if(k<64 || !s2_nvn_lr_seen(c->x[30]))
     LOG("hle: [S2] nvn call TRUE  x0=%llx x1=%llx x2=%llx lr=%llx\n",
@@ -1032,6 +1103,7 @@ static void hle_s2_nvn_zero(CPU* c,u64 pc){
   (void)pc;
   s2_scrub_null_page();
   s2_nvn_track_set_storage(c);
+  __atomic_fetch_add(&g_nvn_kind_calls[1],1,__ATOMIC_RELAXED);
   u32 k=__atomic_fetch_add(&g_nvn_calls,1,__ATOMIC_RELAXED);
   if(k<64 || !s2_nvn_lr_seen(c->x[30]))
     LOG("hle: [S2] nvn call ZERO  x0=%llx x1=%llx x2=%llx lr=%llx\n",
@@ -1044,6 +1116,7 @@ static void hle_s2_nvn_zero(CPU* c,u64 pc){
 static void hle_s2_nvn_obj(CPU* c,u64 pc){
   (void)pc;
   s2_scrub_null_page();
+  __atomic_fetch_add(&g_nvn_kind_calls[3],1,__ATOMIC_RELAXED);
   u64 a=0, sz=0;
   if(!s2_nvn_lookup_obj(c->x[0],&a,&sz)) a=s2_nvn_scratch_addr();
   /* Defense-in-depth for the 6x-unrolled shader stage loop at 0x847da60..0x847db98:
@@ -1075,6 +1148,7 @@ static void hle_s2_nvn_obj(CPU* c,u64 pc){
    microseconds. */
 static void hle_s2_nvn_size(CPU* c,u64 pc){
   (void)pc;
+  __atomic_fetch_add(&g_nvn_kind_calls[5],1,__ATOMIC_RELAXED);
   u64 sz=4096;
   static u32 nsz; u32 k=__atomic_fetch_add(&nsz,1,__ATOMIC_RELAXED);
   if(k<64 || !s2_nvn_lr_seen(c->x[30]))
@@ -1088,6 +1162,7 @@ static void hle_s2_nvn_size(CPU* c,u64 pc){
    pool/descriptor size calculations and ring loops to spin or divide by 0. */
 static void hle_s2_nvn_int(CPU* c,u64 pc){
   (void)pc;
+  __atomic_fetch_add(&g_nvn_kind_calls[4],1,__ATOMIC_RELAXED);
   u32 pname=(u32)c->x[1]; u64 out=c->x[2];
   if(!s2_guest_ok(out,4) && s2_guest_ok(c->x[1],4)){ pname=(u32)c->x[0]; out=c->x[1]; }
   i32 val=256;
@@ -1108,6 +1183,7 @@ static void hle_s2_nvn_int(CPU* c,u64 pc){
 /* nvnWindowAcquireTexture(NVNwindow *window, NVNsync * presentSync, int *idx) -> 0 (SUCCESS) */
 static void hle_s2_nvn_acq(CPU* c,u64 pc){
   (void)pc;
+  __atomic_fetch_add(&g_nvn_kind_calls[6],1,__ATOMIC_RELAXED);
   i32 idx=0;
   if(s2_guest_ok(c->x[2],4)) memcpy(GP(c->x[2]),&idx,4);
   else if(s2_guest_ok(c->x[1],4)) memcpy(GP(c->x[1]),&idx,4);
@@ -1157,22 +1233,26 @@ static void hle_s2_nvn_proc(CPU* c,u64 pc){
   /* nvnDeviceGetProcAddress(const NVNdevice *device, const char *name):
      x0 is `device` (often NULL or a guest struct ptr), x1 is `name`.
      Check x1 first, then x0 in case a single-arg loader calls through here. */
+  __atomic_fetch_add(&g_nvn_kind_calls[2],1,__ATOMIC_RELAXED);
   char nm[128];
   int ok=s2_cstr(c->x[1],nm,sizeof nm);
   if(!ok) ok=s2_cstr(c->x[0],nm,sizeof nm);
   u32 k=__atomic_fetch_add(&g_nvn_lookups,1,__ATOMIC_RELAXED);
   u64 slot=s2_nvn_resolve(nm,ok);
-  if(k<600) LOG("hle: [S2] nvn lookup #%u %-58s -> %llx (via GetProcAddress)%s\n",
-                k,ok?nm:"<?>",(unsigned long long)slot,gsym(pc));
+  s2_nvn_record_lookup(nm,ok,slot,c->x[30]);
+  if(k<600) LOG("hle: [S2] nvn lookup #%u %-58s -> %llx (%s via GetProcAddress)%s\n",
+                k,ok?nm:"<?>",(unsigned long long)slot,s2_nvn_slot_kind_name(slot),gsym(pc));
   c->x[0]=slot; c->pc=c->x[30]; }
 
 static void hle_s2_nvn_bootstrap(CPU* c,u64 pc){
+  __atomic_fetch_add(&g_nvn_kind_calls[2],1,__ATOMIC_RELAXED);
   char nm[128]; int ok=s2_cstr(c->x[0],nm,sizeof nm);
   if(!ok) ok=s2_cstr(c->x[1],nm,sizeof nm);
   u32 k=__atomic_fetch_add(&g_nvn_lookups,1,__ATOMIC_RELAXED);
   u64 slot=s2_nvn_resolve(nm,ok);
-  if(k<600) LOG("hle: [S2] nvn lookup #%u %-58s -> %llx%s\n",
-                k,ok?nm:"<?>",(unsigned long long)slot,gsym(pc));
+  s2_nvn_record_lookup(nm,ok,slot,c->x[30]);
+  if(k<600) LOG("hle: [S2] nvn lookup #%u %-58s -> %llx (%s)%s\n",
+                k,ok?nm:"<?>",(unsigned long long)slot,s2_nvn_slot_kind_name(slot),gsym(pc));
   c->x[0]=slot; c->pc=c->x[30]; }
 
 /* NV driver glue: the host has no nvdrv.  nxnative's dm/host/hle_nvdrv.c
@@ -1615,6 +1695,7 @@ static void kernel_dump_code(u64 ra);
 void kernel_crash_census(void){
   svc_dump_census();
   ipc_dump_stats();
+  nvn_dump_census();
   dump_unresolved();
 }
 
@@ -1773,6 +1854,7 @@ static void swr_svc_(CPU* c, u32 imm){
        is what makes nnSdk panic later, far away from the actual gap */
     svc_dump_census();
     ipc_dump_stats();
+    nvn_dump_census();
     kernel_dump_regs(c);
     /* strings pointed to by regs, often the abort message */
     for(int r=0;r<31;r++){ u64 a=c->x[r]; if(a<0x10000 || a>=AS_SIZE-256) continue; MemBlock b; mem_query(a,&b);

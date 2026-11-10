@@ -530,6 +530,21 @@ static void split_path(const char* argv0){
   if(s){ s[1]=0; strncpy(g_exedir,p,1023); } else g_exedir[0]=0;
 }
 
+#ifndef SWR_GIT_HASH
+#define SWR_GIT_HASH "unknown"
+#endif
+
+static void swr_stage_crumb(const char* stg){
+  char p[1200]; snprintf(p,sizeof p,"%sstage.txt",g_exedir);
+  FILE* f=fopen(p,"w");
+  if(f){
+    fprintf(f,"stage=%s git=%s strict=%d\n",stg,SWR_GIT_HASH,g_strict);
+    fflush(f);
+    fclose(f);
+  }
+  LOG("stage: %s\n",stg);
+}
+
 int swr_main(int argc, char** argv){
 #ifdef SWR_PS5
   /* Native title layout (stage 1): /app0 is the read-only app mount and /data is
@@ -555,8 +570,8 @@ int swr_main(int argc, char** argv){
   pm_init(&g_hint_lock); pm_init(&g_flock);
   plat_install_crash_handler();
   g_t0=plat_ns();
-  LOG("SwitchRecomp - %s (runtime %s, built %s)\n",g_exename,SWR_RUNTIME_VERSION,__DATE__);
-  LOG("stage: load_code\n");
+  LOG("SwitchRecomp - %s (runtime %s, git %s, built %s, strict=%d)\n",g_exename,SWR_RUNTIME_VERSION,SWR_GIT_HASH,__DATE__,g_strict);
+  swr_stage_crumb("load_code");
   if(load_code()) fatal("Could not load the game's recompiled code.");
   if(g_mod->abi!=1) fatal("The recompiled code is from another SwitchRecomp version.");
   g_title_id=g_mod->title_id;
@@ -564,31 +579,31 @@ int swr_main(int argc, char** argv){
   { /* npdm MMU flags: bits 1-3 = address space type, 1 = the old 36-bit one */
     char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");
     if(f){ u8 h[0x10]; if(fread(h,1,0x10,f)==0x10 && !memcmp(h,"META",4) && ((h[0x0C]>>1)&7)==1){ mem_layout_36bit(); LOG("npdm: 36-bit address space (stack and TLS kept below 64 GB)\n"); } fclose(f); } }
-  LOG("stage: mem_init\n");
+  swr_stage_crumb("mem_init");
   mem_init(); if(g_opt_null_trap){ plat_vm_readonly(g_mem,0x10000); LOG("null_trap: writes to page 0 crash with a log\n"); }
-  LOG("stage: kernel_init\n"); kernel_init();
-  LOG("stage: build_dispatch\n"); build_dispatch();
-  LOG("stage: mod_init\n"); if(g_mod->init) g_mod->init(&g_rtapi);
-  LOG("stage: load_hints\n"); load_hints();
-  LOG("stage: loader_load\n");
+  swr_stage_crumb("kernel_init"); kernel_init();
+  swr_stage_crumb("build_dispatch"); build_dispatch();
+  swr_stage_crumb("mod_init"); if(g_mod->init) g_mod->init(&g_rtapi);
+  swr_stage_crumb("load_hints"); load_hints();
+  swr_stage_crumb("loader_load");
   if(loader_load()) fatal("Could not load the game executables from %sexefs/",g_datadir);
-  LOG("stage: npdm_sysres\n");
+  swr_stage_crumb("npdm_sysres");
   { /* npdm SystemResourceSize; newer SDKs only init their VM allocator when > 0 */
     extern u64 g_sysres_size; char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");
     if(f){ u8 h[0x20]; if(fread(h,1,0x20,f)==0x20 && !memcmp(h,"META",4)){ u32 v; memcpy(&v,h+0x14,4); g_sysres_size=v; } fclose(f); }
     LOG("npdm: system resource %.1f MB\n",g_sysres_size/1048576.0); }
-  LOG("stage: services_init\n"); services_init();
-  LOG("stage: romfs_init\n"); romfs_init();
-  LOG("stage: gpu_init\n"); gpu_init();
-  LOG("stage: snxvk_gpu_init\n"); { extern void snxvk_gpu_init(void); snxvk_gpu_init(); }
-  LOG("stage: hle_install\n"); { extern void hle_install(void); hle_install(); }
+  swr_stage_crumb("services_init"); services_init();
+  swr_stage_crumb("romfs_init"); romfs_init();
+  swr_stage_crumb("gpu_init"); gpu_init();
+  swr_stage_crumb("snxvk_gpu_init"); { extern void snxvk_gpu_init(void); snxvk_gpu_init(); }
+  swr_stage_crumb("hle_install"); { extern void hle_install(void); hle_install(); }
   /* [S2] replace the GPU driver's boot chain at the SDK-function level.
      Must run after loader_load() (guest .dynsym) and after hle_install() so
      nothing overwrites our dispatch slots afterwards. */
-  LOG("stage: s2_hle_hooks\n"); { extern void swr_install_s2_hooks(void); swr_install_s2_hooks(); }
-  LOG("stage: video_init\n"); video_init(g_mod->title? g_mod->title : g_exename);
+  swr_stage_crumb("s2_hle_hooks"); { extern void swr_install_s2_hooks(void); swr_install_s2_hooks(); }
+  swr_stage_crumb("video_init"); video_init(g_mod->title? g_mod->title : g_exename);
   { extern void plat_prof_start(int); if(g_opt_prof){ plat_prof_start(0); LOG("profile: active (profile.txt every 10 s)\n"); } }
-  LOG("stage: kernel_run_main\n");
+  swr_stage_crumb("kernel_run_main");
   kernel_run_main(g_mod->mods[0].base+g_mod->mods[0].text_off,g_mod->main_stack?g_mod->main_stack:0x100000,(int)g_mod->main_prio,(int)g_mod->main_core);
   /* startup is done: stop fsync'ing every log line (it would stall gameplay once
      the guest starts hammering the romfs "romfs: <file>" tracer). */
@@ -611,7 +626,7 @@ int swr_main(int argc, char** argv){
        path this covers both outcomes: the game panics (early dump) or it hangs /
        runs without ever reaching the crash handler (this dump). Either way one
        console run leaves behind the full list of services the title asked for. */
-    { static int censused; if(!censused && tick>=60*12){ censused=1; ipc_dump_stats(); } }
+    { static int censused; if(!censused && tick>=60*12){ censused=1; ipc_dump_stats(); { extern void nvn_dump_census(void); nvn_dump_census(); } } }
     { extern void snxvk_tick(int); snxvk_tick(tick); }   /* vulkan_native saves its pipeline cache now and then */
     /* dump thread states to threads.txt every 15s, useful when something hangs */
     if(tick%900==0){ extern __thread FILE* g_log_redirect; extern void kernel_dump_threads(void); char p[1200]; snprintf(p,sizeof p,"%sthreads.txt",g_exedir);

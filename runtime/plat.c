@@ -621,16 +621,18 @@ int mem_zero_page_init(void){
 }
 u8* mem_zero_page(void){ return g_zero_page; }
 
-/* Allocate one writable 4 KiB page that backs the 1 TiB NVN sentinel guest
-   page via MP() redirection. Returns 0 on success. */
+/* Allocate one 4 KiB page that backs the 1 TiB NVN sentinel guest page via
+   MP() redirection (writable in normal mode, PROT_NONE in strict mode so the
+   first deref of 0x10000000101 faults with a backtrace). Returns 0 on success. */
 int mem_sentinel_page_init(void){
   const u64 P=0x1000;
-  void* p=mmap(NULL,(size_t)P,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+  int prot = g_strict ? PROT_NONE : (PROT_READ|PROT_WRITE);
+  void* p=mmap(NULL,(size_t)P,prot,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
   if(p==MAP_FAILED){ LOG("mem: sentinel page mmap FAILED errno=%d\n",errno); return -1; }
-  memset(p,0,P);
+  if(!g_strict) memset(p,0,P);
   g_sentinel_page=(u8*)p;
-  LOG("mem: sentinel backing page ready at %p (4 KiB, writable) -> guest 10000000000 redirects here\n",
-      (void*)g_sentinel_page);
+  LOG("mem: sentinel backing page ready at %p (4 KiB, %s) -> guest 10000000000 redirects here\n",
+      (void*)g_sentinel_page, g_strict ? "PROT_NONE (strict)" : "writable");
   return 0;
 }
 u8* mem_sentinel_page(void){ return g_sentinel_page; }
@@ -803,7 +805,13 @@ void pm_lock(PMutex* m){ pthread_mutex_lock(&m->l); }
 
 void pm_unlock(PMutex* m){ pthread_mutex_unlock(&m->l); }
 
-void pc_init(PCond* c){ pthread_condattr_t a; pthread_condattr_init(&a); pthread_condattr_setclock(&a,CLOCK_MONOTONIC); pthread_cond_init(&c->c,&a); }
+void pc_init(PCond* c){
+  pthread_condattr_t a; pthread_condattr_init(&a);
+#if !defined(__APPLE__)
+  pthread_condattr_setclock(&a,CLOCK_MONOTONIC);
+#endif
+  pthread_cond_init(&c->c,&a);
+}
 
 void pc_signal(PCond* c){ pthread_cond_signal(&c->c); }
 
@@ -811,7 +819,13 @@ void pc_broadcast(PCond* c){ pthread_cond_broadcast(&c->c); }
 
 int pc_wait(PCond* c, PMutex* m, i64 ns){
   if(ns<0){ pthread_cond_wait(&c->c,&m->l); return 0; }
-  struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); u64 t=(u64)ts.tv_sec*1000000000ull+ts.tv_nsec+(u64)ns;
+  struct timespec ts;
+#if defined(__APPLE__)
+  clock_gettime(CLOCK_REALTIME,&ts);
+#else
+  clock_gettime(CLOCK_MONOTONIC,&ts);
+#endif
+  u64 t=(u64)ts.tv_sec*1000000000ull+ts.tv_nsec+(u64)ns;
   ts.tv_sec=t/1000000000ull; ts.tv_nsec=t%1000000000ull;
   return pthread_cond_timedwait(&c->c,&m->l,&ts)==ETIMEDOUT; }
 
@@ -1280,6 +1294,8 @@ static void sighandler(int sig, siginfo_t* si, void* uc_){
 #elif defined(__x86_64__)
   #include <ucontext.h>
   ucontext_t* uc=(ucontext_t*)uc_; pc=(void*)uc->uc_mcontext.gregs[REG_RIP];
+#elif defined(__APPLE__) && defined(__aarch64__)
+  (void)uc_;
 #elif defined(__aarch64__)
   #include <ucontext.h>
   ucontext_t* uc=(ucontext_t*)uc_; pc=(void*)uc->uc_mcontext.pc;
@@ -1309,6 +1325,50 @@ void plat_install_crash_handler(void){
   static char altstack[65536]; stack_t ss; ss.ss_sp=altstack; ss.ss_size=sizeof altstack; ss.ss_flags=0; sigaltstack(&ss,NULL);
   sigaction(SIGSEGV,&sa,NULL); sigaction(SIGBUS,&sa,NULL); sigaction(SIGILL,&sa,NULL); sigaction(SIGFPE,&sa,NULL); }
 #endif
+#if !defined(SWR_PS5) && !defined(_WIN32)
+u8* g_sentinel_page;
+u64 g_sentinel_hits;
+char g_diag_manopen_dir[2048];
+
+void* ps5_alloc_large(u64 size){
+  u64 bytes = size ? size : 1;
+  u64 aligned = (bytes + 0xFFFull) & ~0xFFFull;
+  void* p = mmap(NULL, (size_t)aligned, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  if(p != MAP_FAILED) return p;
+  return calloc(1, (size_t)bytes);
+}
+
+void ps5_free_large(void* p, u64 size){
+  if(!p || p==MAP_FAILED) return;
+  u64 bytes = size ? size : 1;
+  u64 aligned = (bytes + 0xFFFull) & ~0xFFFull;
+  munmap(p, (size_t)aligned);
+}
+
+int mem_sentinel_page_init(void){
+  const u64 P = 0x1000;
+  int prot = g_strict ? PROT_NONE : (PROT_READ|PROT_WRITE);
+  void* p = mmap(NULL, (size_t)P, prot, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  if(p == MAP_FAILED) return -1;
+  if(!g_strict) memset(p, 0, P);
+  g_sentinel_page = (u8*)p;
+  LOG("mem: host sentinel page ready at %p (4 KiB, %s) -> guest 10000000000 redirects here\n",
+      (void*)g_sentinel_page, g_strict ? "PROT_NONE (strict)" : "writable");
+  return 0;
+}
+
+u8* mem_sentinel_page(void){ return g_sentinel_page; }
+
+void romfs_diag(const char* m){
+  static int first=1;
+  char p[1200];
+  snprintf(p, sizeof p, "%sromfs_diag.log", g_exedir[0] ? g_exedir : "./");
+  FILE* f=fopen(p, first? "w":"a");
+  first=0;
+  if(f){ fwrite(m,1,strlen(m),f); fflush(f); fclose(f); }
+}
+#endif
+
 #ifndef _WIN32
 void plat_prof_start(int boot){ (void)boot; }
 
