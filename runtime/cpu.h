@@ -78,15 +78,30 @@ typedef struct CPU {
 } CPU;
 
 /* ---- memory: base + addr, no page tables ---- */
-/* Keep MP(a) as a pure pointer addition `(M + (u64)(a))`!
-   Adding an inline branch/atomic/log function inside MP(a) gets inlined into
-   millions of RD/WR operations across 280+ generated C files, bloating
-   eboot.bin from 214 MB to 1.27 GB and causing OrbisOS FSELF loader to freeze
-   on game launch before _start even executes. */
+/* MP(a) is normally a pure pointer addition `(M + (u64)(a))`.  We add ONE
+   exception: the NVN "unbound object" sentinel.  The game keeps a FIXED
+   sentinel pointer (0x10000000101, identical every run) for NVN objects it
+   never created, and dereferences it directly (e.g. [x+0x18]).  That guest
+   address lives on guest page 0x10000000000 (1 TiB), which is 1 TiB ABOVE the
+   128 GiB g_mem reservation and cannot be mapped on PS5
+   (sceKernelReserveVirtualRange 0x80020016, plain mmap MAP_FIXED EINVAL), so it
+   would SIGSEGV.  Redirect every access on that single 4 KiB guest page to the
+   throwaway writable g_sentinel_page (allocated in mem_sentinel_page_init).
+
+   THE TRAP (learned the hard way): do NOT implement this as a function call
+   (swr_mp()) or by bumping an atomic hit-counter inside MP(a) -- inlining a
+   call / a lock-prefixed RMW into millions of RD/WR sites across 280+ generated
+   C files bloated eboot.bin from 214 MB to 1.27 GB and froze the OrbisOS FSELF
+   loader before _start.  A bare `?:` compare/cmov, however, is ONE
+   predict-not-taken instruction pair per guest load/store -- it does NOT bloat
+   eboot and adds ~zero cost (the branch is almost never taken).  That is what
+   we use here.  Keep it that way. */
 extern u8* g_sentinel_page;
 extern u64 g_sentinel_hits;
 #define SWR_SENTINEL_GUEST_PAGE 0x10000000000ull
-#define MP(a)    (M + (u64)(a))
+#define MP(a)    (((u64)(a) & ~(u64)0xFFFu) == SWR_SENTINEL_GUEST_PAGE \
+                    ? (g_sentinel_page + ((u64)(a) & 0xFFFu)) \
+                    : (M + (u64)(a)))
 #define RD8(a)   (*(u8*)MP(a))
 #define RD16(a)  (*(u16*)MP(a))
 #define RD32(a)  (*(u32*)MP(a))
