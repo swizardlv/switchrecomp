@@ -196,18 +196,24 @@ def build_runtime_exe(cc, out_exe, rt_obj_dir, so_path, mod_obj, opt, asan, jobs
     print('[linux-headless] compiled %d runtime files in %.2fs (git=%s, asan=%s)' % (
         len(rt_objs), time.time() - t0, git_hash, asan), flush=True)
 
-    link_cmd = [cc, '-g', '-o', out_exe]
+    link_cmd = [cc]
+    # The game .so is ~1.3 GB (577 huge translation units with debug info).
+    # bfd ld spends 20+ min on it; gold finishes in well under a second.
+    if not is_macos and shutil.which('ld.gold'):
+        link_cmd.append('-fuse-ld=gold')
+    link_cmd += ['-g', '-o', out_exe]
     if not is_macos:
         link_cmd += ['-rdynamic', '-Wl,-rpath,' + os.path.dirname(os.path.abspath(so_path)),
                      '-Wl,-u,swr_module_static']
     if asan:
         link_cmd += ['-fsanitize=address,undefined']
-    # mod_obj (module.o) defines swr_module_static. The game code lives in a
-    # shared library here, and `-Wl,-u,swr_module_static` only forces extraction
-    # from a *static* archive -- with --as-needed the .so does not satisfy that
-    # strong reference. Link module.o into the executable directly (the same
-    # symbol also exists in the .so, which is harmless: the exe definition wins).
-    link_cmd += rt_objs + [mod_obj, so_path] + zstd_lib + ['-lpthread', '-ldl', '-lm']
+    # Deliberately do NOT link mod_obj (module.o) into the exe: its FNS table
+    # references tens of thousands of F_<addr> game functions which are hidden
+    # (-fvisibility=hidden) inside the game .so, so they only resolve while the
+    # .so itself is being linked. Instead keep that .so with --no-as-needed so
+    # the strong -u ref is satisfied by its exported swr_module_static.
+    _ = mod_obj   # intentionally unused; kept in the signature for the call site
+    link_cmd += rt_objs + ['-Wl,--no-as-needed', so_path] + zstd_lib + ['-lpthread', '-ldl', '-lm']
     r = subprocess.run(link_cmd, capture_output=True, text=True, errors='replace')
     if r.returncode != 0:
         raise SystemExit('linking %s failed:\ncmd: %s\n%s' % (
