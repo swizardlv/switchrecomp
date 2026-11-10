@@ -16,7 +16,7 @@ DEPS = {k: os.path.join(V, 'deps', d) for k, d in (('volk', 'volk-vulkan-sdk-1.4
 SRC = ('gpu/gpu.c gpu/maxwell/engines.c gpu/maxwell/mme.c gpu/maxwell/mme_hle.c gpu/maxwell/mme_jit_stub.c '
        'gpu/maxwell/compute.c gpu/maxwell/fermi2d.c gpu/maxwell/dma.c gpu/maxwell/write_pages.c gpu/maxwell/maxwell3d.c '
        'gpu/renderer.c gpu/nvn_trace.c gpu/shipped_pass.c '
-       'gpu/shader/shader.c gpu/shader/decode.c gpu/shader/corpus.c gpu/shader/shipped.c gpu/shader/spirv_translate.c '
+       'gpu/shader/shader.c gpu/shader/decode.c gpu/shader/ampere_lower.c gpu/shader/corpus.c gpu/shader/shipped.c gpu/shader/spirv_translate.c '
        'gpu/shader/spirv_compute.c gpu/shader/spirv_emit.c '
        'gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c '
        'gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c '

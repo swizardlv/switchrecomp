@@ -3,6 +3,8 @@
 /* Compute shaders are decoded directly to SPIR-V. Unsupported encodings reject the whole program. */
 #include "nx/gpu/shader/spirv_emit.h"
 #include "nx/gpu/shader/translator.h"
+#include "nx/gpu/shader/ampere_lower.h"
+#include "nx/runtime/platform/log.h"
 
 typedef struct {
     SpvEmitter e;
@@ -423,10 +425,27 @@ u32* shader_compute_to_spirv(const u8* code, u32 max_bytes, ShaderInfo* si, size
     u64* copy;
     const u64* words;
     u32* r;
+    u8* lowered_code = NULL;
+    u32 lowered_bytes = 0;
     if (!code) return NULL;
+    if (ampere_is_sm86_shader(code, max_bytes, ST_CS)) {
+        LOG("[AMPERE->CS-SPIRV] Lowering Ampere SM86 compute shader (max_bytes=%u) to Maxwell IR", max_bytes);
+        lowered_code = ampere_lower_to_maxwell(code, max_bytes, ST_CS, &lowered_bytes, NULL, NULL, 0);
+        if (lowered_code && lowered_bytes >= 96) {
+            code = lowered_code;
+            max_bytes = lowered_bytes;
+        } else {
+            free(lowered_code);
+            return NULL;
+        }
+    }
     words = shader_words(code, max_bytes, &copy);
-    if (!words) return NULL;
+    if (!words) {
+        free(lowered_code);
+        return NULL;
+    }
     r = compute_to_spirv(code, words, max_bytes, si, word_count, can_flush, can_preserve);
     free(copy);
+    free(lowered_code);
     return r;
 }

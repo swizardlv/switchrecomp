@@ -12,6 +12,7 @@
 #include "nx/runtime/options.h"
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/shader/shader.h"
+#include "nx/gpu/shader/ampere_lower.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/gpu/vk/vk.h"
@@ -440,9 +441,15 @@ static VkSh* sh_make(const u8* code, u64 h, int stage, const u32 mask[20], u32 l
     size_t nw;
     VkSh* s = calloc(1, sizeof *s);
     if (!s) return NULL;
-    swr_vk_crumb("shader %016llx stage %d: translating (%u bytes)", (unsigned long long)h, stage, len);
+    int is_amp = ampere_is_sm86_shader(code, len > 0x50 ? len : SH_CODE, stage);
+    swr_vk_crumb("shader %016llx stage %d (%s): translating (%u bytes)", (unsigned long long)h, stage,
+                 is_amp ? "Ampere-SM86" : "Maxwell-SM53", len);
     u32* spv = sh_spirv(s, code, h, stage, mask, len, qh, len_a, qh_a, xfb, read, 0, &nw);
-    swr_vk_crumb("shader %016llx: %s, %u SPIR-V words", (unsigned long long)h, spv ? "translated" : "failed", spv ? (unsigned)nw : 0);
+    swr_vk_crumb("shader %016llx (%s): %s, %u SPIR-V words", (unsigned long long)h,
+                 is_amp ? "Ampere-SM86" : "Maxwell-SM53", spv ? "translated" : "failed", spv ? (unsigned)nw : 0);
+    LOG("vulkan: [SHADER-MAKE] hash=0x%016llx stage=%d arch=%s code_len=%u spv_words=%zu status=%s reason='%s'\n",
+        (unsigned long long)h, stage, is_amp ? "Ampere-SM86" : "Maxwell-SM53", len, spv ? nw : 0,
+        spv ? "OK" : "FAILED", s->si.first_unsupported[0] ? s->si.first_unsupported : "none");
     if (spv) {
         VkShaderModuleCreateInfo mi = {
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = spv};

@@ -3,7 +3,10 @@
 /* Direct Maxwell to SPIR-V translation. Unsupported instructions reject the entire module. */
 #include "nx/gpu/shader/spirv_emit.h"
 #include "nx/gpu/shader/translator.h"
+#include "nx/gpu/shader/ampere_lower.h"
+#include "nx/runtime/platform/log.h"
 #include <assert.h>
+#include <inttypes.h>
 #include <stdlib.h>
 
 typedef struct {
@@ -3055,6 +3058,11 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
             tag = gbuf_tag(stage, B(w, 34, 5), B(w, 20, 14) * 4);
         else if (op == O_LEA_LR && !B(w, 45, 2) && b < 255)
             tag = gtags[b];
+        else if ((op == O_IMAD_R || op == O_IMAD_I || op == O_IMAD_CR) && !B(w, 54, 1) && !B(w, 51, 2)) {
+            u32 cr = B(w, 39, 8);
+            tag = cr < 255 ? gtags[cr] : 0;
+        } else if (op == O_IMAD_RC && !B(w, 54, 1) && !B(w, 51, 2))
+            tag = gbuf_tag(stage, B(w, 34, 5), B(w, 20, 14) * 4);
         if (tag == 0xb1 && op != O_MOV_C && op != O_LDC && op != O_MOV_R) tag = 0;
         if (op == O_LDG || op == O_STG || op == O_RED || op == O_ATOM || op == O_ATOM_CAS) {
             int current = a < 255 ? gtags[a] : 0, slot = 0;
@@ -6730,11 +6738,45 @@ u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, s
     u64* copy;
     const u64* insn;
     u32* r;
+    u8* lowered_code = NULL;
+    u32 lowered_bytes = 0;
+    AmpereLowerStats amp_stats;
     if (!code) return NULL;
+
+    if (ampere_is_sm86_shader(code, max_bytes, (ShaderStage)stage)) {
+        LOG("[AMPERE->SPIRV] Detected Ampere SM86 shader (stage=%d, max_bytes=%u) -> invoking Ampere->Maxwell IR lowering",
+            stage, max_bytes);
+        lowered_code = ampere_lower_to_maxwell(code, max_bytes, (ShaderStage)stage, &lowered_bytes, &amp_stats, NULL, 0);
+        if (lowered_code && lowered_bytes >= 96) {
+            code = lowered_code;
+            max_bytes = lowered_bytes;
+        } else {
+            LOG("[AMPERE->SPIRV] ERROR: ampere_lower_to_maxwell failed for stage=%d", stage);
+            free(lowered_code);
+            return NULL;
+        }
+    }
+
     insn = shader_words(code, max_bytes, &copy);
-    if (!insn) return NULL;
+    if (!insn) {
+        free(lowered_code);
+        return NULL;
+    }
     r = to_spirv(code, insn, max_bytes, stage, si, word_count, can_flush, can_preserve, can_preserve_f64,
                  can_subgroup);
+    if (lowered_code) {
+        if (r) {
+            LOG("[AMPERE->SPIRV] SUCCESS: stage=%d, %u SM86 insts -> %u MInsts -> %u Maxwell words -> %zu SPIR-V words "
+                "(in_mask=0x%x out_mask=0x%x cbuf_mask=0x%x ntex=%d ngbuf=%d)",
+                stage, amp_stats.ampere_inst_count, amp_stats.minst_count, amp_stats.maxwell_word_count,
+                word_count ? *word_count : 0, si ? si->in_mask : 0, si ? si->out_mask : 0,
+                si ? si->cbuf_mask : 0, si ? si->ntex : 0, si ? si->ngbuf : 0);
+        } else {
+            LOG("[AMPERE->SPIRV] REJECTED in Maxwell->SPIR-V backend: stage=%d reason='%s'",
+                stage, (si && si->first_unsupported[0]) ? si->first_unsupported : "unknown");
+        }
+    }
     free(copy);
+    free(lowered_code);
     return r;
 }

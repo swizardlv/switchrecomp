@@ -8,6 +8,8 @@
 /* Maxwell program structure: length and hash, branch targets and jump tables, the CRS stack resolved statically,
    and VertexA + VertexB merged into one program. */
 #include "nx/gpu/shader/translator.h"
+#include "nx/gpu/shader/ampere_lower.h"
+#include "nx/runtime/platform/log.h"
 
 /* Instruction words are 64-bit. Words 0-9 hold the 80-byte SPH, word 10 is the first scheduling word, and every
    fourth word after it is another one (IDX_OK). */
@@ -327,6 +329,29 @@ u64 shader_hash(const u8* code, u32 max_bytes, u32* out_len) {
     u32 n = max_bytes / 8, i, last = 10, furthest = 0, len;
     int resolved = 1, calls = 0;
     u64 h = 1469598103934665603ull;
+    if (code && max_bytes >= 96 && ampere_is_sm86_shader(code, max_bytes, ST_VS)) {
+        u32 sph0 = snx_ld_le32(code);
+        u32 sph_type = sph0 & 0x1fu, sph_stg = (sph0 >> 10) & 0xfu;
+        u32 code_off = (sph0 == 0x36384d53u || (sph_type <= 2 && sph_stg <= 6 && sph0 != 0)) ? 80u : 0u;
+        u32 max_pairs = (max_bytes - code_off) / 16u;
+        u32 last_pair = 0;
+        if (max_pairs > 4096) max_pairs = 4096;
+        for (i = 0; i < max_pairs; i++) {
+            u64 lo = snx_ld_le64(code + code_off + (size_t)i * 16);
+            u64 hi = snx_ld_le64(code + code_off + (size_t)i * 16 + 8);
+            if (!lo && !hi) break;
+            last_pair = i;
+            if ((lo & 0x1ffu) == 0x14du && ((lo >> 12) & 0xfu) == 7u) break; /* unconditional AMP_OP_EXIT */
+        }
+        len = code_off + (last_pair + 1) * 16u;
+        if (len > max_bytes) len = max_bytes;
+        for (i = 0; i < len; i++) {
+            h ^= code[i];
+            h *= 1099511628211ull;
+        }
+        if (out_len) *out_len = len;
+        return h;
+    }
     if (n > SH_SCAN_WORDS) n = SH_SCAN_WORDS;
     words = shader_words(code, n * 8, &copy);
     if (!words) n = 0; /* no memory for the words (a big-endian host): the length is the header's */
@@ -558,13 +583,27 @@ int shader_resolve_crs(const u64* words, u32 count, u32* pop_targets) {
    so both halves keep working where they land. Returns 0 when the result doesn't fit in max_bytes. */
 int shader_merge_dual(const u8* a, const u8* b, u8* out, u32 max_bytes) {
     u32 len_a, len_b, words_a, start, i;
+    u8* low_a = NULL;
+    u8* low_b = NULL;
+    u32 low_a_bytes = max_bytes, low_b_bytes = max_bytes;
+    int rc = 0;
     if (!a || !b || !out || max_bytes < 96) return 0;
-    shader_hash(a, max_bytes, &len_a);
-    shader_hash(b, max_bytes, &len_b);
-    if (len_a < 88 || len_b < 88) return 0;
+    if (ampere_is_sm86_shader(a, max_bytes, ST_VS)) {
+        LOG("[AMPERE->MERGE] Lowering VertexA SM86 shader before dual-vertex merge");
+        low_a = ampere_lower_to_maxwell(a, max_bytes, ST_VS, &low_a_bytes, NULL, NULL, 0);
+        if (low_a) a = low_a;
+    }
+    if (ampere_is_sm86_shader(b, max_bytes, ST_VS)) {
+        LOG("[AMPERE->MERGE] Lowering VertexB SM86 shader before dual-vertex merge");
+        low_b = ampere_lower_to_maxwell(b, max_bytes, ST_VS, &low_b_bytes, NULL, NULL, 0);
+        if (low_b) b = low_b;
+    }
+    shader_hash(a, low_a_bytes, &len_a);
+    shader_hash(b, low_b_bytes, &len_b);
+    if (len_a < 88 || len_b < 88) goto cleanup;
     words_a = len_a / 8;
     start = 10 + ((words_a - 10 + 3) & ~3u);
-    if ((unsigned long long)start * 8 + (len_b - 80) > max_bytes) return 0;
+    if ((unsigned long long)start * 8 + (len_b - 80) > max_bytes) goto cleanup;
     memset(out, 0, max_bytes);
     memcpy(out, b, 80);
     /* A's last bundle whole: its length ends at the instruction that ends it, and the bundle's later words, zeros
@@ -582,5 +621,9 @@ int shader_merge_dual(const u8* a, const u8* b, u8* out, u32 max_bytes) {
         /* BRA (opcode 0xE24) to B's first instruction, keeping the EXIT's predicate (16-19) and condition (0-4) */
         snx_st_le64(out + (size_t)i * 8, 0xE24ull << 52 | (u64)((start - i) * 8 & 0xFFFFFF) << 20 | (w & 0xF001Full));
     }
-    return 1;
+    rc = 1;
+cleanup:
+    free(low_a);
+    free(low_b);
+    return rc;
 }
