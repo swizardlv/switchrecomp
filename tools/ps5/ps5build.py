@@ -559,10 +559,13 @@ def main():
         else:
             # Guard against the 1.27 GB eboot.bin bloat caused by inlining swr_mp
             # into every RD/WR macro across code_*.c (commit 5e0f3b8). If the
-            # existing libgame_code.a is > 500 MiB, restore from a pre-existing
+            # existing libgame_code.a is > 900 MiB, restore from a pre-existing
             # unbloated .o set in c.build (or recompile code_*.c with clean cpu.h).
+            # NOTE: the unbloated game archive is ~508 MiB; a 500 MiB threshold was
+            # too tight and deleted a good archive (GAME_ARCHIVE_MISSING). 900 MiB
+            # still catches the real ~1.9 GiB swr_mp-bloated archive.
             arc = c.archive
-            if arc and os.path.isfile(arc) and os.path.getsize(arc) > (500 << 20):
+            if arc and os.path.isfile(arc) and os.path.getsize(arc) > (900 << 20):
                 bdir = os.path.dirname(os.path.abspath(arc))
                 run.log('WARN', 'libgame_code.a is bloated (%.1f MiB > 500 MiB); rebuilding unbloated archive in %s' % (
                     os.path.getsize(arc) / (1 << 20), bdir))

@@ -32,7 +32,15 @@ if [ "$DEPLOY_ONLY" -eq 0 ]; then
   ssh "$REMOTE" "cd $CODE_DIR && git fetch origin ps5 && git reset --hard origin/ps5"
 
   echo "==> [2/4] 编译 (ps5build.py, 复用 libgame_code.a, 重编 runtime 对象)"
-  ssh "$REMOTE" "cd $CODE_DIR && python3 tools/ps5/ps5build.py --manifest $MANIFEST"
+  # ps5build 即便报告了非致命 issue (如历史遗留的 GAME_ARCHIVE_MISSING) 也可能已产出
+  # 可用的 eboot.bin。只要 eboot 真正产出就继续部署; 未产出才视为编译失败。
+  if ! ssh "$REMOTE" "cd $CODE_DIR && python3 tools/ps5/ps5build.py --manifest $MANIFEST"; then
+    echo "    [警告] ps5build 退出码非 0 (上方报告可能有 ERROR/WARN)。若 eboot 已产出仍会继续部署。"
+  fi
+  if ! ssh "$REMOTE" "test -f '$EBOOT' && test \$(stat -c%s '$EBOOT') -gt 100000000"; then
+    echo "!! eboot 未产出或过小 (<100MB), 编译失败。中止部署。"
+    exit 1
+  fi
 else
   echo "==> [deploy-only] 跳过 git 同步与编译"
 fi
